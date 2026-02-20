@@ -75,6 +75,7 @@ DEFAULT_RCON_PORT = 27020
 DOWNLOAD_TIMEOUT_SEC = 180
 AUTOSAVE_DEBOUNCE_MS = 700
 INI_APPLY_DEBOUNCE_MS = 500
+INI_VISUAL_DEBOUNCE_MS = 400
 DEFAULT_SCHEDULE_TIME = "03:00"
 
 MAP_PRESETS = [
@@ -1656,6 +1657,173 @@ def steamcmd_app_update(
             # --------- HARD FAIL ----------
             tail = "\n".join((out or "").splitlines()[-35:])
             raise RuntimeError(f"SteamCMD failed (exit={code}). Last output:\n{tail}")
+
+# =============================================================================
+# INI Visual Editor – ASA Setting Definitions
+# =============================================================================
+# Each tuple: (ini_file, section, key, label, description, value_type, default, min, max)
+# ini_file: "gus" = GameUserSettings.ini, "game" = Game.ini
+# value_type: "bool", "float", "int"
+# min/max only used for float/int sliders
+
+_STAT_NAMES = [
+    "Health", "Stamina", "Torpidity", "Oxygen", "Food",
+    "Water", "Temperature", "Weight", "Damage", "Speed",
+]
+
+_SS = "ServerSettings"
+_GM = "/script/shootergame.shootergamemode"
+
+INI_SETTINGS_GENERAL: list = [
+    ("gus", _SS, "serverPVE", "PvE Mode", "Enable Player vs Environment mode.", "bool", "False", 0, 1),
+    ("gus", _SS, "DifficultyOffset", "Difficulty Offset", "Base difficulty (0.0–1.0). Affects creature levels.", "float", "1.0", 0.0, 1.0),
+    ("gus", _SS, "OverrideOfficialDifficulty", "Override Official Difficulty", "Set to 5.0 to allow wild creatures up to level 150.", "float", "0.0", 0.0, 15.0),
+    ("gus", _SS, "AllowCaveBuildingPvE", "Allow Cave Building (PvE)", "Allow structures inside caves in PvE.", "bool", "False", 0, 1),
+    ("gus", _SS, "AllowCaveBuildingPvP", "Allow Cave Building (PvP)", "Allow structures inside caves in PvP.", "bool", "True", 0, 1),
+    ("gus", _SS, "DayCycleSpeedScale", "Day Cycle Speed", "Overall day/night cycle speed. Lower = longer days.", "float", "1.0", 0.01, 10.0),
+    ("gus", _SS, "DayTimeSpeedScale", "Daytime Speed", "Speed of daytime relative to night.", "float", "1.0", 0.01, 10.0),
+    ("gus", _SS, "NightTimeSpeedScale", "Nighttime Speed", "Speed of nighttime relative to day.", "float", "1.0", 0.01, 10.0),
+    ("gus", _SS, "ShowMapPlayerLocation", "Show Map Player Location", "Show player position on the in-game map.", "bool", "True", 0, 1),
+    ("gus", _SS, "AllowThirdPersonPlayer", "Allow Third Person", "Let players use 3rd-person camera.", "bool", "True", 0, 1),
+    ("gus", _SS, "ServerCrosshair", "Server Crosshair", "Show crosshair for all players.", "bool", "True", 0, 1),
+    ("gus", _SS, "AllowHitMarkers", "Allow Hit Markers", "Show hit markers on damage.", "bool", "True", 0, 1),
+    ("gus", _SS, "AllowFlyerCarryPvE", "Flyer Carry (PvE)", "Allow flyers to pick up wild creatures in PvE.", "bool", "False", 0, 1),
+    ("gus", _SS, "PreventOfflinePvP", "Offline Raid Prevention", "Tribes offline become invulnerable.", "bool", "False", 0, 1),
+    ("gus", _SS, "ForceAllStructureLocking", "Force Structure Locking", "Default-lock all placed structures.", "bool", "False", 0, 1),
+    ("gus", _SS, "EnablePvPGamma", "Enable PvP Gamma", "Allow gamma adjustment in PvP.", "bool", "False", 0, 1),
+    ("gus", _SS, "DisablePvEGamma", "Disable PvE Gamma", "Prevent gamma command in PvE.", "bool", "False", 0, 1),
+    ("gus", _SS, "PreventTribeAlliances", "Prevent Tribe Alliances", "Block tribes from creating alliances.", "bool", "False", 0, 1),
+    ("gus", _SS, "PreventSpawnAnimations", "Skip Spawn Animations", "Skip wake-up animation on respawn.", "bool", "False", 0, 1),
+    ("gus", _SS, "RandomSupplyCratePoints", "Random Supply Drops", "Randomise supply drop locations.", "bool", "False", 0, 1),
+    ("gus", _SS, "DisableWeatherFog", "Disable Fog", "Remove weather fog effects.", "bool", "False", 0, 1),
+    ("gus", _SS, "NonPermanentDiseases", "Non-Permanent Diseases", "Diseases are lost on respawn.", "bool", "False", 0, 1),
+    ("gus", _SS, "globalVoiceChat", "Global Voice Chat", "Voice chat is heard server-wide.", "bool", "False", 0, 1),
+    ("gus", _SS, "ProximityChat", "Proximity Chat", "Only nearby players see text chat.", "bool", "False", 0, 1),
+    ("gus", _SS, "AutoSavePeriodMinutes", "Auto-Save Interval (min)", "Minutes between automatic world saves.", "float", "15.0", 1.0, 120.0),
+    ("gus", _SS, "MaxTamedDinos", "Max Tamed Dinos (Server)", "Global cap on tamed creatures.", "int", "5000", 0, 20000),
+    ("gus", _SS, "MaxPersonalTamedDinos", "Max Tamed Dinos (Tribe)", "Per-tribe creature cap (0 = unlimited).", "int", "0", 0, 5000),
+    ("game", _GM, "bUseSingleplayerSettings", "Use Singleplayer Settings", "Apply boosted SP multipliers (breeding, XP, etc.).", "bool", "False", 0, 1),
+    ("game", _GM, "bDisableFriendlyFire", "Disable Friendly Fire", "Prevent damage to tribemates/tames/structures.", "bool", "False", 0, 1),
+]
+
+INI_SETTINGS_CROPS: list = [
+    ("game", _GM, "CropGrowthSpeedMultiplier", "Crop Growth Speed", "Scales speed of crop growth in plots.", "float", "1.0", 0.01, 20.0),
+    ("game", _GM, "CropDecaySpeedMultiplier", "Crop Decay Speed", "Scales speed of crop decay (higher = faster decay).", "float", "1.0", 0.01, 10.0),
+    ("game", _GM, "GlobalSpoilingTimeMultiplier", "Global Spoiling Time", "Scales spoiling of perishables (higher = longer).", "float", "1.0", 0.01, 20.0),
+    ("game", _GM, "GlobalItemDecompositionTimeMultiplier", "Item Decomposition Time", "Scales decomp time of dropped items/loot bags.", "float", "1.0", 0.01, 20.0),
+]
+
+INI_SETTINGS_DINOS: list = [
+    # -- Combat & General --
+    ("gus", _SS, "DinoDamageMultiplier", "Wild Dino Damage", "Scales damage dealt by wild creatures.", "float", "1.0", 0.01, 10.0),
+    ("gus", _SS, "DinoResistanceMultiplier", "Wild Dino Resistance", "Scales damage resistance of wild creatures.", "float", "1.0", 0.01, 10.0),
+    ("gus", _SS, "DinoCharacterFoodDrainMultiplier", "Dino Food Drain", "Scales how fast dinos consume food.", "float", "1.0", 0.01, 10.0),
+    ("gus", _SS, "DinoCharacterHealthRecoveryMultiplier", "Dino Health Recovery", "Scales passive health regen speed.", "float", "1.0", 0.01, 10.0),
+    ("gus", _SS, "DinoCharacterStaminaDrainMultiplier", "Dino Stamina Drain", "Scales stamina consumption rate.", "float", "1.0", 0.01, 10.0),
+    ("gus", _SS, "TamingSpeedMultiplier", "Taming Speed", "Higher = faster taming.", "float", "1.0", 0.1, 100.0),
+    ("gus", _SS, "PreventMateBoost", "Prevent Mate Boost", "Disable creature mate-boost buff.", "bool", "False", 0, 1),
+    ("gus", _SS, "AllowAnyoneBabyImprintCuddle", "Anyone Can Imprint", "Any player can cuddle/imprint babies.", "bool", "False", 0, 1),
+    ("gus", _SS, "DisableImprintDinoBuff", "Disable Imprint Buff", "Remove rider imprint stat bonus.", "bool", "False", 0, 1),
+    ("gus", _SS, "AllowRaidDinoFeeding", "Allow Raid Dino Feeding", "Titanosaurs can be permanently fed.", "bool", "False", 0, 1),
+    # -- Breeding --
+    ("game", _GM, "MatingIntervalMultiplier", "Mating Interval", "Scales time between matings (lower = faster).", "float", "1.0", 0.01, 10.0),
+    ("game", _GM, "MatingSpeedMultiplier", "Mating Speed", "Scales how fast mating completes.", "float", "1.0", 0.1, 50.0),
+    ("game", _GM, "EggHatchSpeedMultiplier", "Egg Hatch Speed", "Higher = eggs hatch faster.", "float", "1.0", 0.1, 100.0),
+    ("game", _GM, "BabyMatureSpeedMultiplier", "Baby Mature Speed", "Higher = babies grow faster.", "float", "1.0", 0.1, 200.0),
+    ("game", _GM, "BabyCuddleIntervalMultiplier", "Cuddle Interval", "Scales time between imprint requests.", "float", "1.0", 0.01, 10.0),
+    ("game", _GM, "BabyFoodConsumptionSpeedMultiplier", "Baby Food Consumption", "Scales how fast babies eat.", "float", "1.0", 0.01, 10.0),
+    ("game", _GM, "BabyImprintingStatScaleMultiplier", "Imprinting Stat Scale", "Scales stat bonus from imprinting.", "float", "1.0", 0.0, 10.0),
+    ("game", _GM, "BabyImprintAmountMultiplier", "Imprint Amount", "Scales % gained per cuddle.", "float", "1.0", 0.1, 50.0),
+    ("game", _GM, "BabyCuddleGracePeriodMultiplier", "Cuddle Grace Period", "Time before imprint quality degrades.", "float", "1.0", 0.01, 10.0),
+    ("game", _GM, "BabyCuddleLoseImprintQualitySpeedMultiplier", "Imprint Loss Speed", "Speed imprint quality drops after grace.", "float", "1.0", 0.01, 10.0),
+    ("game", _GM, "LayEggIntervalMultiplier", "Lay Egg Interval", "Scales egg-laying frequency.", "float", "1.0", 0.01, 10.0),
+    # -- Speed Leveling --
+    ("game", _GM, "bAllowSpeedLeveling", "Allow Speed Leveling", "Let players/dinos level movement speed (ASA).", "bool", "False", 0, 1),
+    ("game", _GM, "bAllowFlyerSpeedLeveling", "Allow Flyer Speed Leveling", "Let flyers level movement speed.", "bool", "False", 0, 1),
+    ("game", _GM, "bUseDinoLevelUpAnimations", "Dino Level-Up Animation", "Play an animation on dino level-up.", "bool", "True", 0, 1),
+    ("game", _GM, "DestroyTamesOverLevelClamp", "Destroy Tames Over Level", "Delete tames above this level on restart (0 = off).", "int", "0", 0, 1000),
+]
+
+INI_SETTINGS_DINO_STATS: list = []
+for _si, _sn in enumerate(_STAT_NAMES):
+    INI_SETTINGS_DINO_STATS.append(
+        ("game", _GM, f"PerLevelStatsMultiplier_DinoWild[{_si}]",
+         f"Wild {_sn}", f"Wild dino {_sn} gain per level.", "float",
+         "1.0", 0.0, 10.0))
+    INI_SETTINGS_DINO_STATS.append(
+        ("game", _GM, f"PerLevelStatsMultiplier_DinoTamed[{_si}]",
+         f"Tamed {_sn}", f"Tamed dino {_sn} gain per level.", "float",
+         "1.0" if _si != 0 else "0.2", 0.0, 10.0))
+    INI_SETTINGS_DINO_STATS.append(
+        ("game", _GM, f"PerLevelStatsMultiplier_DinoTamed_Add[{_si}]",
+         f"Tamed Add {_sn}", f"Additive {_sn} bonus on tame.", "float",
+         "1.0" if _si != 0 else "0.14", 0.0, 10.0))
+    INI_SETTINGS_DINO_STATS.append(
+        ("game", _GM, f"PerLevelStatsMultiplier_DinoTamed_Affinity[{_si}]",
+         f"Affinity {_sn}", f"Taming effectiveness {_sn} bonus.", "float",
+         "1.0" if _si != 0 else "0.44", 0.0, 10.0))
+
+INI_SETTINGS_PLAYERS: list = [
+    ("gus", _SS, "PlayerDamageMultiplier", "Player Damage", "Scales damage dealt by players.", "float", "1.0", 0.01, 10.0),
+    ("gus", _SS, "PlayerResistanceMultiplier", "Player Resistance", "Scales damage resistance (higher = more damage taken).", "float", "1.0", 0.01, 10.0),
+    ("gus", _SS, "PlayerCharacterFoodDrainMultiplier", "Food Drain", "Scales food consumption rate.", "float", "1.0", 0.01, 10.0),
+    ("gus", _SS, "PlayerCharacterHealthRecoveryMultiplier", "Health Recovery", "Scales passive health regen.", "float", "1.0", 0.01, 10.0),
+    ("gus", _SS, "PlayerCharacterStaminaDrainMultiplier", "Stamina Drain", "Scales stamina consumption.", "float", "1.0", 0.01, 10.0),
+    ("gus", _SS, "PlayerCharacterWaterDrainMultiplier", "Water Drain", "Scales water consumption.", "float", "1.0", 0.01, 10.0),
+    ("gus", _SS, "XPMultiplier", "XP Multiplier", "Scales all experience gain.", "float", "1.0", 0.1, 100.0),
+    ("gus", _SS, "HarvestAmountMultiplier", "Harvest Amount", "Scales resources gained per hit.", "float", "1.0", 0.1, 100.0),
+    ("gus", _SS, "HarvestHealthMultiplier", "Harvest Health", "Scales health of harvestables (more hits = more yield).", "float", "1.0", 0.1, 20.0),
+    ("gus", _SS, "OxygenSwimSpeedStatMultiplier", "Oxygen Swim Speed", "Scales swim speed gained from Oxygen stat.", "float", "1.0", 0.0, 10.0),
+    ("game", _GM, "KillXPMultiplier", "Kill XP", "Scales XP from kills.", "float", "1.0", 0.1, 50.0),
+    ("game", _GM, "HarvestXPMultiplier", "Harvest XP", "Scales XP from harvesting.", "float", "1.0", 0.1, 50.0),
+    ("game", _GM, "CraftXPMultiplier", "Craft XP", "Scales XP from crafting.", "float", "1.0", 0.1, 50.0),
+    ("game", _GM, "GenericXPMultiplier", "Generic XP", "Scales XP from passive/time gain.", "float", "1.0", 0.1, 50.0),
+    ("game", _GM, "SpecialXPMultiplier", "Special XP", "Scales XP from special events.", "float", "1.0", 0.1, 50.0),
+    ("game", _GM, "bAllowUnlimitedRespecs", "Unlimited Respecs", "Allow Mindwipe Tonic without cooldown.", "bool", "False", 0, 1),
+]
+
+INI_SETTINGS_PLAYER_STATS: list = []
+for _si, _sn in enumerate(_STAT_NAMES):
+    INI_SETTINGS_PLAYER_STATS.append(
+        ("game", _GM, f"PerLevelStatsMultiplier_Player[{_si}]",
+         f"Player {_sn}", f"Player {_sn} gain per level.", "float",
+         "1.0", 0.0, 10.0))
+
+INI_SETTINGS_MISC: list = [
+    ("gus", _SS, "ItemStackSizeMultiplier", "Item Stack Size", "Scales default stack sizes.", "float", "1.0", 0.1, 50.0),
+    ("gus", _SS, "ResourcesRespawnPeriodMultiplier", "Resource Respawn Period", "Scales resource respawn timer.", "float", "1.0", 0.01, 10.0),
+    ("gus", _SS, "StructureResistanceMultiplier", "Structure Resistance", "Scales structure damage resistance.", "float", "1.0", 0.01, 10.0),
+    ("gus", _SS, "StructurePickupHoldDuration", "Pickup Hold Duration", "Seconds to hold for quick-pickup (0 = instant).", "float", "0.5", 0.0, 5.0),
+    ("gus", _SS, "StructurePickupTimeAfterPlacement", "Pickup Time After Place", "Seconds after placement pickup is available.", "float", "30.0", 0.0, 600.0),
+    ("gus", _SS, "TheMaxStructuresInRange", "Max Structures In Range", "Cap on structures in a coded radius.", "int", "10500", 100, 50000),
+    ("gus", _SS, "PerPlatformMaxStructuresMultiplier", "Platform Struct Multiplier", "Scales max items on saddles/rafts.", "float", "1.0", 0.1, 10.0),
+    ("gus", _SS, "PlatformSaddleBuildAreaBoundsMultiplier", "Platform Build Area", "Scales platform saddle build range.", "float", "1.0", 0.1, 10.0),
+    ("gus", _SS, "AlwaysAllowStructurePickup", "Always Allow Pickup", "Structures can always be picked up.", "bool", "False", 0, 1),
+    ("gus", _SS, "ClampResourceHarvestDamage", "Clamp Harvest Damage", "Clamp harvest damage to resource health.", "bool", "False", 0, 1),
+    ("gus", _SS, "ClampItemSpoilingTimes", "Clamp Item Spoiling", "Prevent spoil timers going below base.", "bool", "False", 0, 1),
+    ("gus", _SS, "AllowMultipleAttachedC4", "Multiple C4 Attach", "Allow more than one C4 per creature.", "bool", "False", 0, 1),
+    ("gus", _SS, "DisableDinoDecayPvE", "Disable Dino Decay (PvE)", "Prevent tame auto-decay in PvE.", "bool", "False", 0, 1),
+    ("gus", _SS, "DisableStructureDecayPvE", "Disable Structure Decay (PvE)", "Prevent structure auto-decay in PvE.", "bool", "False", 0, 1),
+    ("gus", _SS, "DisableCryopodEnemyCheck", "Cryopod No Enemy Check", "Use cryopods when enemies nearby (ASA).", "bool", "False", 0, 1),
+    ("gus", _SS, "DisableCryopodFridgeRequirement", "Cryopod No Fridge", "Use cryopods without a cryofridge (ASA).", "bool", "False", 0, 1),
+    ("gus", _SS, "AllowCryoFridgeOnSaddle", "Cryofridge On Saddle", "Allow cryofridge on platform saddles (ASA).", "bool", "False", 0, 1),
+    ("gus", _SS, "MaxTrainCars", "Max Train Cars", "Max carts per train (ASA).", "int", "8", 1, 50),
+    ("game", _GM, "HairGrowthSpeedMultiplier", "Hair Growth Speed", "Scales hair growth.", "float", "1.0", 0.0, 10.0),
+    ("game", _GM, "PoopIntervalMultiplier", "Poop Interval", "Scales poop frequency (higher = less often).", "float", "1.0", 0.01, 10.0),
+    ("game", _GM, "CustomRecipeEffectivenessMultiplier", "Custom Recipe Effectiveness", "Scales custom recipe results.", "float", "1.0", 0.1, 10.0),
+    ("game", _GM, "CustomRecipeSkillMultiplier", "Custom Recipe Skill", "Scales crafting skill effect on recipes.", "float", "1.0", 0.1, 10.0),
+    ("game", _GM, "ResourceNoReplenishRadiusPlayers", "No-Replenish Radius (Players)", "Distance from players resources won't regrow.", "float", "1.0", 0.0, 5.0),
+    ("game", _GM, "ResourceNoReplenishRadiusStructures", "No-Replenish Radius (Structures)", "Distance from structures resources won't regrow.", "float", "1.0", 0.0, 5.0),
+    ("game", _GM, "LimitGeneratorsNum", "Generator Limit (Count)", "Max generators in range (ASA).", "int", "3", 0, 50),
+    ("game", _GM, "LimitGeneratorsRange", "Generator Limit (Range)", "Range in UE units for generator limit (ASA).", "int", "15000", 0, 100000),
+    ("game", _GM, "BaseHexagonRewardMultiplier", "Hexagon Reward Multiplier", "Scales mission/club hex rewards.", "float", "1.0", 0.1, 50.0),
+    ("game", _GM, "HexagonCostMultiplier", "Hexagon Cost Multiplier", "Scales hex store/club item costs.", "float", "1.0", 0.1, 50.0),
+    ("game", _GM, "PhotoModeRangeLimit", "Photo Mode Range", "Max camera distance in photo mode (ASA).", "int", "3000", 0, 50000),
+    ("game", _GM, "bDisablePhotoMode", "Disable Photo Mode", "Completely disable photo mode (ASA).", "bool", "False", 0, 1),
+    ("gus", _SS, "TribeNameChangeCooldown", "Tribe Rename Cooldown (min)", "Minutes between tribe name changes.", "float", "15.0", 0.0, 10080.0),
+    ("gus", _SS, "ImplantSuicideCD", "Implant Respawn Cooldown (s)", "Seconds between implant respawns (ASA).", "float", "28800.0", 0.0, 86400.0),
+    ("gus", _SS, "RCONServerGameLogBuffer", "RCON Log Buffer", "Lines kept in RCON game log buffer.", "int", "600", 0, 5000),
+]
 
 # =============================================================================
 # INI (order-preserving, duplicate-key aware)
@@ -3752,6 +3920,11 @@ class ServerManagerApp:
         self.var_ini_add_key = tk.StringVar(master=m)
         self.var_ini_add_value = tk.StringVar(master=m)
 
+        # Visual INI editor controls – populated at build time
+        self._ini_visual_vars: Dict[str, tk.Variable] = {}   # "gus|section|key" -> Variable
+        self._ini_visual_debounce_id: Optional[str] = None
+        self._ini_visual_loading: bool = False                # guard against feedback loops
+
     # ---------------------------------------------------------------------
     # Layout
     # ---------------------------------------------------------------------
@@ -4176,11 +4349,20 @@ class ServerManagerApp:
         ttk.Button(discord_btns, text="Open State Folder", command=self._discord_open_state_folder).grid(row=0, column=1)
 
         # ---------------- INI Editor tab ----------------
-        self.tab_ini.columnconfigure(0, weight=2)
-        self.tab_ini.columnconfigure(1, weight=1)
-        self.tab_ini.rowconfigure(2, weight=1)
+        self.tab_ini.columnconfigure(0, weight=1)
+        self.tab_ini.rowconfigure(0, weight=1)
 
-        ini_top = ttk.Frame(self.tab_ini)
+        self.ini_sub_nb = ttk.Notebook(self.tab_ini)
+        self.ini_sub_nb.grid(row=0, column=0, sticky="nsew")
+
+        # -- Sub-tab: Raw Editor --
+        raw_tab = ttk.Frame(self.ini_sub_nb, padding=6)
+        self.ini_sub_nb.add(raw_tab, text="Raw Editor")
+        raw_tab.columnconfigure(0, weight=2)
+        raw_tab.columnconfigure(1, weight=1)
+        raw_tab.rowconfigure(2, weight=1)
+
+        ini_top = ttk.Frame(raw_tab)
         ini_top.grid(row=0, column=0, columnspan=2, sticky="ew")
         ini_top.columnconfigure(1, weight=1)
 
@@ -4198,7 +4380,7 @@ class ServerManagerApp:
         ent_filter.grid(row=1, column=1, sticky="ew", padx=6, pady=(6, 0))
         ent_filter.bind("<KeyRelease>", lambda e: self._ini_refresh_tree())
 
-        tree_frame = ttk.Frame(self.tab_ini)
+        tree_frame = ttk.Frame(raw_tab)
         tree_frame.grid(row=2, column=0, sticky="nsew", padx=(0, 10))
         tree_frame.columnconfigure(0, weight=1)
         tree_frame.rowconfigure(0, weight=1)
@@ -4215,7 +4397,7 @@ class ServerManagerApp:
 
         self.tree_ini.bind("<<TreeviewSelect>>", lambda e: self._ini_on_select())
 
-        editor = ttk.LabelFrame(self.tab_ini, text="Edit Selected Line", padding=10)
+        editor = ttk.LabelFrame(raw_tab, text="Edit Selected Line", padding=10)
         editor.grid(row=2, column=1, sticky="nsew")
         editor.columnconfigure(1, weight=1)
 
@@ -4254,7 +4436,7 @@ class ServerManagerApp:
         self.ent_ini_value.bind("<KeyRelease>", lambda e: self._ini_schedule_apply())
         self.cmb_ini_bool.bind("<<ComboboxSelected>>", lambda e: self._ini_schedule_apply())
 
-        add_box = ttk.LabelFrame(self.tab_ini, text="Add / Append Line", padding=10)
+        add_box = ttk.LabelFrame(raw_tab, text="Add / Append Line", padding=10)
         add_box.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(10, 0))
         add_box.columnconfigure(1, weight=1)
         add_box.columnconfigure(3, weight=1)
@@ -4272,6 +4454,71 @@ class ServerManagerApp:
         add_btns.grid(row=2, column=1, columnspan=3, sticky="w", pady=(8, 0))
         ttk.Button(add_btns, text="Append Line (duplicate keys allowed)", command=self._ini_append_line).grid(row=0, column=0, padx=(0, 8))
         ttk.Button(add_btns, text="Set/Replace First Occurrence", command=self._ini_set_line).grid(row=0, column=1)
+
+        # -- Sub-tab: Visual config sections (General, Crops, Dinosaurs, Players, Misc) --
+        visual_sections = [
+            ("General", INI_SETTINGS_GENERAL, None),
+            ("Crops & Spoiling", INI_SETTINGS_CROPS, None),
+            ("Dinosaurs", INI_SETTINGS_DINOS, INI_SETTINGS_DINO_STATS),
+            ("Players", INI_SETTINGS_PLAYERS, INI_SETTINGS_PLAYER_STATS),
+            ("Misc / Structures", INI_SETTINGS_MISC, None),
+        ]
+
+        for tab_label, settings_list, stats_list in visual_sections:
+            vtab = ttk.Frame(self.ini_sub_nb, padding=4)
+            self.ini_sub_nb.add(vtab, text=tab_label)
+            vtab.columnconfigure(0, weight=1)
+            vtab.rowconfigure(1, weight=1)
+
+            # Load / status bar at top
+            vbar = ttk.Frame(vtab)
+            vbar.grid(row=0, column=0, sticky="ew", pady=(0, 4))
+            vbar.columnconfigure(2, weight=1)
+            ttk.Button(vbar, text="Load GameUserSettings.ini",
+                       command=lambda: self._ini_visual_load("gus")).grid(row=0, column=0, padx=(0, 4))
+            ttk.Button(vbar, text="Load Game.ini",
+                       command=lambda: self._ini_visual_load("game")).grid(row=0, column=1, padx=(0, 4))
+            ttk.Label(vbar, text="Load both INI files to enable all settings. Changes auto-save to staging.",
+                      foreground=theme["muted"]).grid(row=0, column=2, sticky="w", padx=6)
+
+            # Scrollable content area
+            canvas = tk.Canvas(vtab, highlightthickness=0, background=theme["bg"])
+            vscroll = ttk.Scrollbar(vtab, orient="vertical", command=canvas.yview)
+            inner = ttk.Frame(canvas, padding=6)
+            inner.columnconfigure(0, weight=1)
+
+            inner.bind("<Configure>", lambda e, c=canvas: c.configure(scrollregion=c.bbox("all")))
+            canvas.create_window((0, 0), window=inner, anchor="nw", tags="inner_win")
+            canvas.bind("<Configure>", lambda e, c=canvas: c.itemconfigure("inner_win", width=e.width))
+            canvas.configure(yscrollcommand=vscroll.set)
+
+            canvas.grid(row=1, column=0, sticky="nsew")
+            vscroll.grid(row=1, column=1, sticky="ns")
+
+            # Bind mouse wheel to canvas scrolling
+            def _on_mousewheel(event, c=canvas):
+                c.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+            def _bind_wheel(event, c=canvas, handler=_on_mousewheel):
+                c.bind_all("<MouseWheel>", handler)
+
+            def _unbind_wheel(event, c=canvas):
+                c.unbind_all("<MouseWheel>")
+
+            canvas.bind("<Enter>", _bind_wheel)
+            canvas.bind("<Leave>", _unbind_wheel)
+
+            row_i = 0
+
+            # Build controls for main settings
+            row_i = self._ini_visual_build_settings(inner, settings_list, row_i, theme)
+
+            # Build per-level stat tables if present
+            if stats_list:
+                row_i = self._ini_visual_build_stats_table(inner, stats_list, row_i, theme)
+
+        # Wire sub-notebook tab changes to refresh visual controls
+        self.ini_sub_nb.bind("<<NotebookTabChanged>>", lambda e: self._ini_visual_refresh_all())
 
         # ---------------- Console (bottom) ----------------
         bottom.columnconfigure(0, weight=1)
@@ -5256,6 +5503,295 @@ class ServerManagerApp:
 
             self.logger.info("Auto update trigger reached -> Update & Restart (Safe).")
             self._ui(self.update_and_restart_safe)
+
+    # ---------------------------------------------------------------------
+    # INI Visual Editor – helpers
+    # ---------------------------------------------------------------------
+    def _ini_visual_var_key(self, ini_file: str, section: str, key: str) -> str:
+        """Build a unique dict key for a visual control variable."""
+        return f"{ini_file}|{section}|{key}"
+
+    def _ini_visual_build_settings(self, parent: ttk.Frame, settings: list, start_row: int, theme: dict) -> int:
+        """Create labelled controls for a list of setting definitions and return next row index."""
+        m = self.root
+        row = start_row
+        for s in settings:
+            ini_file, section, key, label, desc, vtype, default, lo, hi = s
+            vk = self._ini_visual_var_key(ini_file, section, key)
+
+            frm = ttk.Frame(parent)
+            frm.grid(row=row, column=0, sticky="ew", pady=2, padx=2)
+            frm.columnconfigure(1, weight=1)
+
+            if vtype == "bool":
+                var = tk.BooleanVar(master=m, value=(default.lower() == "true"))
+                self._ini_visual_vars[vk] = var
+                cb = ttk.Checkbutton(frm, text=label, variable=var,
+                                     command=lambda _vk=vk: self._ini_visual_on_change(_vk))
+                cb.grid(row=0, column=0, columnspan=2, sticky="w")
+                ttk.Label(frm, text=desc, foreground=theme["muted"],
+                          wraplength=600).grid(row=1, column=0, columnspan=2, sticky="w", padx=(20, 0))
+            elif vtype == "float":
+                var = tk.StringVar(master=m, value=default)
+                self._ini_visual_vars[vk] = var
+                ttk.Label(frm, text=label, width=28, anchor="w").grid(row=0, column=0, sticky="w")
+                entry = ttk.Entry(frm, textvariable=var, width=14)
+                entry.grid(row=0, column=1, sticky="w", padx=(4, 4))
+                scale_var = tk.DoubleVar(master=m, value=float(default))
+                scale = ttk.Scale(frm, variable=scale_var, from_=lo, to=hi,
+                                  command=lambda v, sv=scale_var, tv=var, _vk=vk:
+                                  self._ini_visual_scale_to_entry(sv, tv, _vk, "float"))
+                scale.grid(row=0, column=2, sticky="ew", padx=(0, 4))
+                frm.columnconfigure(2, weight=1)
+                # Keep a ref to the scale var for reverse sync
+                self._ini_visual_vars[vk + "|scale"] = scale_var
+                entry.bind("<KeyRelease>", lambda e, sv=scale_var, tv=var, _vk=vk:
+                           self._ini_visual_entry_to_scale(tv, sv, _vk))
+                ttk.Label(frm, text=desc, foreground=theme["muted"],
+                          wraplength=600).grid(row=1, column=0, columnspan=3, sticky="w", padx=(4, 0))
+            elif vtype == "int":
+                var = tk.StringVar(master=m, value=default)
+                self._ini_visual_vars[vk] = var
+                ttk.Label(frm, text=label, width=28, anchor="w").grid(row=0, column=0, sticky="w")
+                entry = ttk.Entry(frm, textvariable=var, width=14)
+                entry.grid(row=0, column=1, sticky="w", padx=(4, 4))
+                scale_var = tk.DoubleVar(master=m, value=float(default))
+                scale = ttk.Scale(frm, variable=scale_var, from_=lo, to=hi,
+                                  command=lambda v, sv=scale_var, tv=var, _vk=vk:
+                                  self._ini_visual_scale_to_entry(sv, tv, _vk, "int"))
+                scale.grid(row=0, column=2, sticky="ew", padx=(0, 4))
+                frm.columnconfigure(2, weight=1)
+                self._ini_visual_vars[vk + "|scale"] = scale_var
+                entry.bind("<KeyRelease>", lambda e, sv=scale_var, tv=var, _vk=vk:
+                           self._ini_visual_entry_to_scale(tv, sv, _vk))
+                ttk.Label(frm, text=desc, foreground=theme["muted"],
+                          wraplength=600).grid(row=1, column=0, columnspan=3, sticky="w", padx=(4, 0))
+
+            row += 1
+
+        return row
+
+    def _ini_visual_build_stats_table(self, parent: ttk.Frame, stats: list, start_row: int, theme: dict) -> int:
+        """Build a compact grid of per-level stat multipliers."""
+        m = self.root
+        sep = ttk.Separator(parent, orient="horizontal")
+        sep.grid(row=start_row, column=0, sticky="ew", pady=(10, 4))
+        start_row += 1
+
+        lbl = ttk.Label(parent, text="Per-Level Stat Multipliers", font=("", 10, "bold"))
+        lbl.grid(row=start_row, column=0, sticky="w", padx=4)
+        start_row += 1
+
+        grid_frame = ttk.Frame(parent)
+        grid_frame.grid(row=start_row, column=0, sticky="ew", padx=4, pady=4)
+
+        # Settings are already in repeating groups of 4 per stat (wild/tamed/add/affinity)
+        # or 1 per stat (player). Determine mode by checking key patterns.
+        per_stat_count = 0
+        for s in stats:
+            if "[0]" in s[2]:
+                per_stat_count += 1
+        # If 4 entries per stat -> dino table; if 1 -> player table
+        is_dino = per_stat_count >= 4
+
+        if is_dino:
+            headers = ["Stat", "Wild", "Tamed", "Tamed Add", "Affinity"]
+            for ci, h in enumerate(headers):
+                ttk.Label(grid_frame, text=h, font=("", 9, "bold")).grid(
+                    row=0, column=ci, sticky="w", padx=4, pady=2)
+
+            for si, sn in enumerate(_STAT_NAMES):
+                ttk.Label(grid_frame, text=sn).grid(row=si + 1, column=0, sticky="w", padx=4, pady=1)
+                for gi, suffix in enumerate(["DinoWild", "DinoTamed", "DinoTamed_Add", "DinoTamed_Affinity"]):
+                    key = f"PerLevelStatsMultiplier_{suffix}[{si}]"
+                    sd = next((x for x in stats if x[2] == key), None)
+                    if sd is None:
+                        continue
+                    ini_file, section = sd[0], sd[1]
+                    default = sd[6]
+                    vk = self._ini_visual_var_key(ini_file, section, key)
+                    var = tk.StringVar(master=m, value=default)
+                    self._ini_visual_vars[vk] = var
+                    ent = ttk.Entry(grid_frame, textvariable=var, width=8)
+                    ent.grid(row=si + 1, column=gi + 1, padx=2, pady=1)
+                    ent.bind("<KeyRelease>", lambda e, _vk=vk: self._ini_visual_schedule_write(_vk))
+        else:
+            # Player stats – 2-column layout
+            headers = ["Stat", "Multiplier"]
+            for ci, h in enumerate(headers):
+                ttk.Label(grid_frame, text=h, font=("", 9, "bold")).grid(
+                    row=0, column=ci, sticky="w", padx=4, pady=2)
+
+            for si, sn in enumerate(_STAT_NAMES):
+                key = f"PerLevelStatsMultiplier_Player[{si}]"
+                sd = next((x for x in stats if x[2] == key), None)
+                if sd is None:
+                    continue
+                ini_file, section = sd[0], sd[1]
+                default = sd[6]
+                vk = self._ini_visual_var_key(ini_file, section, key)
+                var = tk.StringVar(master=m, value=default)
+                self._ini_visual_vars[vk] = var
+                ttk.Label(grid_frame, text=sn).grid(row=si + 1, column=0, sticky="w", padx=4, pady=1)
+                ent = ttk.Entry(grid_frame, textvariable=var, width=10)
+                ent.grid(row=si + 1, column=1, padx=2, pady=1)
+                ent.bind("<KeyRelease>", lambda e, _vk=vk: self._ini_visual_schedule_write(_vk))
+
+        start_row += 1
+        return start_row
+
+    def _ini_visual_scale_to_entry(self, scale_var: tk.DoubleVar, text_var: tk.StringVar,
+                                   vk: str, vtype: str) -> None:
+        """Scale slider changed -> update entry and schedule INI write."""
+        if self._ini_visual_loading:
+            return
+        val = scale_var.get()
+        if vtype == "int":
+            text_var.set(str(int(round(val))))
+        else:
+            text_var.set(f"{val:.6f}".rstrip("0").rstrip("."))
+        self._ini_visual_schedule_write(vk)
+
+    def _ini_visual_entry_to_scale(self, text_var: tk.StringVar, scale_var: tk.DoubleVar,
+                                   vk: str) -> None:
+        """Entry changed -> update scale and schedule INI write."""
+        if self._ini_visual_loading:
+            return
+        try:
+            scale_var.set(float(text_var.get()))
+        except (ValueError, tk.TclError):
+            pass
+        self._ini_visual_schedule_write(vk)
+
+    def _ini_visual_on_change(self, vk: str) -> None:
+        """Checkbox toggles directly schedule write."""
+        if self._ini_visual_loading:
+            return
+        self._ini_visual_schedule_write(vk)
+
+    def _ini_visual_schedule_write(self, _vk: str) -> None:
+        """Debounced write of all dirty visual settings to staged INI."""
+        if self._ini_visual_debounce_id:
+            try:
+                self.root.after_cancel(self._ini_visual_debounce_id)
+            except Exception:
+                pass
+        self._ini_visual_debounce_id = self.root.after(INI_VISUAL_DEBOUNCE_MS, self._ini_visual_write_all)
+
+    def _ini_visual_load(self, target: str) -> None:
+        """Load an INI file and keep both docs available for visual editor."""
+        self._ini_load_target(target)
+        self._ini_visual_refresh_all()
+
+    def _ini_visual_get_doc(self, ini_file: str) -> Optional["IniDocument"]:
+        """Return the staged IniDocument for gus or game, loading if needed."""
+        self.cfg = self._collect_vars_to_cfg()
+        self._save_active_server_config(self.cfg)
+        server_dir = Path(self.cfg.server_dir)
+        ensure_dir(server_root(self.app_base, self.active_server_id) / BASELINE_DIR_NAME)
+        paths = ini_stage_paths(self.app_base, self.active_server_id, server_dir, ini_file)
+        if not paths.stage.exists() and not paths.live.exists():
+            return None
+        ensure_ini_staging_synced(paths, server_running=self._is_server_running(), logger=self.logger)
+        return read_ini(paths.stage)
+
+    def _ini_visual_refresh_all(self) -> None:
+        """Read current INI values and populate all visual controls."""
+        self._ini_visual_loading = True
+        try:
+            gus_doc = self._ini_visual_get_doc("gus")
+            game_doc = self._ini_visual_get_doc("game")
+
+            gus_map = gus_doc.get_last_value_map() if gus_doc else {}
+            game_map = game_doc.get_last_value_map() if game_doc else {}
+
+            for vk, var in self._ini_visual_vars.items():
+                if "|scale" in vk:
+                    continue
+                parts = vk.split("|", 2)
+                if len(parts) != 3:
+                    continue
+                ini_file, section, key = parts
+
+                val_map = gus_map if ini_file == "gus" else game_map
+                current = val_map.get(section, {}).get(key, None)
+
+                if current is None:
+                    continue  # leave default
+
+                if isinstance(var, tk.BooleanVar):
+                    var.set(current.strip().lower() == "true")
+                elif isinstance(var, tk.StringVar):
+                    var.set(current)
+                    # Also update scale var if exists
+                    sk = vk + "|scale"
+                    if sk in self._ini_visual_vars:
+                        try:
+                            self._ini_visual_vars[sk].set(float(current))
+                        except (ValueError, tk.TclError):
+                            pass
+        except Exception:
+            pass
+        finally:
+            self._ini_visual_loading = False
+
+    def _ini_visual_write_all(self) -> None:
+        """Write all visual control values to staged INI files."""
+        self._ini_visual_debounce_id = None
+
+        self.cfg = self._collect_vars_to_cfg()
+        self._save_active_server_config(self.cfg)
+        server_dir = Path(self.cfg.server_dir)
+        ensure_dir(server_root(self.app_base, self.active_server_id) / BASELINE_DIR_NAME)
+
+        gus_paths = ini_stage_paths(self.app_base, self.active_server_id, server_dir, "gus")
+        game_paths = ini_stage_paths(self.app_base, self.active_server_id, server_dir, "game")
+
+        ensure_ini_staging_synced(gus_paths, server_running=self._is_server_running(), logger=self.logger)
+        ensure_ini_staging_synced(game_paths, server_running=self._is_server_running(), logger=self.logger)
+
+        gus_doc = read_ini(gus_paths.stage)
+        game_doc = read_ini(game_paths.stage)
+
+        gus_dirty = False
+        game_dirty = False
+
+        for vk, var in self._ini_visual_vars.items():
+            if "|scale" in vk:
+                continue
+            parts = vk.split("|", 2)
+            if len(parts) != 3:
+                continue
+            ini_file, section, key = parts
+
+            if isinstance(var, tk.BooleanVar):
+                val = "True" if var.get() else "False"
+            elif isinstance(var, tk.StringVar):
+                val = var.get()
+            else:
+                continue
+
+            doc = gus_doc if ini_file == "gus" else game_doc
+            doc.set(section, key, val)
+            if ini_file == "gus":
+                gus_dirty = True
+            else:
+                game_dirty = True
+
+        if gus_dirty:
+            write_ini(gus_paths.stage, gus_doc)
+        if game_dirty:
+            write_ini(game_paths.stage, game_doc)
+
+        # If the raw editor has one of these targets loaded, reload it
+        if self._ini_loaded_target == "gus" and gus_dirty:
+            self._ini_doc = read_ini(gus_paths.stage)
+            self._ini_refresh_tree()
+        elif self._ini_loaded_target == "game" and game_dirty:
+            self._ini_doc = read_ini(game_paths.stage)
+            self._ini_refresh_tree()
+
+        self._set_status("INI settings staged")
 
     # ---------------------------------------------------------------------
     # INI Editor
