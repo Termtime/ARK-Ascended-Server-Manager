@@ -1661,10 +1661,11 @@ def steamcmd_app_update(
 # =============================================================================
 # INI Visual Editor – ASA Setting Definitions
 # =============================================================================
-# Each tuple: (ini_file, section, key, label, description, value_type, default, min, max)
+# Each tuple: (ini_file, section, key, label, description, value_type, default, min, max[, step])
 # ini_file: "gus" = GameUserSettings.ini, "game" = Game.ini
 # value_type: "bool", "float", "int"
 # min/max only used for float/int sliders
+# step (optional 10th element): slider increment; defaults to 0.25 for float, 1 for int
 
 _STAT_NAMES = [
     "Health", "Stamina", "Torpidity", "Oxygen", "Food",
@@ -1672,12 +1673,12 @@ _STAT_NAMES = [
 ]
 
 _SS = "ServerSettings"
-_GM = "/script/shootergame.shootergamemode"
+_GM = "/Script/ShooterGame.ShooterGameMode"
 
 INI_SETTINGS_GENERAL: list = [
     ("gus", _SS, "serverPVE", "PvE Mode", "Enable Player vs Environment mode.", "bool", "False", 0, 1),
-    ("gus", _SS, "DifficultyOffset", "Difficulty Offset", "Base difficulty (0.0–1.0). Affects creature levels.", "float", "1.0", 0.0, 1.0),
-    ("gus", _SS, "OverrideOfficialDifficulty", "Override Official Difficulty", "Set to 5.0 to allow wild creatures up to level 150.", "float", "0.0", 0.0, 15.0),
+    ("gus", _SS, "DifficultyOffset", "Difficulty Offset", "Base difficulty (0.0–1.0). Affects creature levels.", "float", "1.0", 0.0, 1.0, 0.1),
+    ("gus", _SS, "OverrideOfficialDifficulty", "Override Official Difficulty", "Set to 5.0 to allow wild creatures up to level 150.", "float", "0.0", 0.0, 15.0, 0.5),
     ("gus", _SS, "AllowCaveBuildingPvE", "Allow Cave Building (PvE)", "Allow structures inside caves in PvE.", "bool", "False", 0, 1),
     ("gus", _SS, "AllowCaveBuildingPvP", "Allow Cave Building (PvP)", "Allow structures inside caves in PvP.", "bool", "True", 0, 1),
     ("gus", _SS, "DayCycleSpeedScale", "Day Cycle Speed", "Overall day/night cycle speed. Lower = longer days.", "float", "1.0", 0.01, 10.0),
@@ -1699,9 +1700,9 @@ INI_SETTINGS_GENERAL: list = [
     ("gus", _SS, "NonPermanentDiseases", "Non-Permanent Diseases", "Diseases are lost on respawn.", "bool", "False", 0, 1),
     ("gus", _SS, "globalVoiceChat", "Global Voice Chat", "Voice chat is heard server-wide.", "bool", "False", 0, 1),
     ("gus", _SS, "ProximityChat", "Proximity Chat", "Only nearby players see text chat.", "bool", "False", 0, 1),
-    ("gus", _SS, "AutoSavePeriodMinutes", "Auto-Save Interval (min)", "Minutes between automatic world saves.", "float", "15.0", 1.0, 120.0),
-    ("gus", _SS, "MaxTamedDinos", "Max Tamed Dinos (Server)", "Global cap on tamed creatures.", "int", "5000", 0, 20000),
-    ("gus", _SS, "MaxPersonalTamedDinos", "Max Tamed Dinos (Tribe)", "Per-tribe creature cap (0 = unlimited).", "int", "0", 0, 5000),
+    ("gus", _SS, "AutoSavePeriodMinutes", "Auto-Save Interval (min)", "Minutes between automatic world saves.", "float", "15.0", 1.0, 120.0, 1.0),
+    ("gus", _SS, "MaxTamedDinos", "Max Tamed Dinos (Server)", "Global cap on tamed creatures.", "int", "5000", 0, 20000, 100),
+    ("gus", _SS, "MaxPersonalTamedDinos", "Max Tamed Dinos (Tribe)", "Per-tribe creature cap (0 = unlimited).", "int", "0", 0, 5000, 50),
     ("game", _GM, "bUseSingleplayerSettings", "Use Singleplayer Settings", "Apply boosted SP multipliers (breeding, XP, etc.).", "bool", "False", 0, 1),
     ("game", _GM, "bDisableFriendlyFire", "Disable Friendly Fire", "Prevent damage to tribemates/tames/structures.", "bool", "False", 0, 1),
 ]
@@ -1720,20 +1721,32 @@ INI_SETTINGS_DINOS: list = [
     ("gus", _SS, "DinoCharacterFoodDrainMultiplier", "Dino Food Drain", "Scales how fast dinos consume food.", "float", "1.0", 0.01, 10.0),
     ("gus", _SS, "DinoCharacterHealthRecoveryMultiplier", "Dino Health Recovery", "Scales passive health regen speed.", "float", "1.0", 0.01, 10.0),
     ("gus", _SS, "DinoCharacterStaminaDrainMultiplier", "Dino Stamina Drain", "Scales stamina consumption rate.", "float", "1.0", 0.01, 10.0),
-    ("gus", _SS, "TamingSpeedMultiplier", "Taming Speed", "Higher = faster taming.", "float", "1.0", 0.1, 100.0),
+    ("gus", _SS, "TamingSpeedMultiplier", "Taming Speed", "Higher = faster taming.", "float", "1.0", 0.1, 100.0, 1.0),
     ("gus", _SS, "PreventMateBoost", "Prevent Mate Boost", "Disable creature mate-boost buff.", "bool", "False", 0, 1),
     ("gus", _SS, "AllowAnyoneBabyImprintCuddle", "Anyone Can Imprint", "Any player can cuddle/imprint babies.", "bool", "False", 0, 1),
     ("gus", _SS, "DisableImprintDinoBuff", "Disable Imprint Buff", "Remove rider imprint stat bonus.", "bool", "False", 0, 1),
     ("gus", _SS, "AllowRaidDinoFeeding", "Allow Raid Dino Feeding", "Titanosaurs can be permanently fed.", "bool", "False", 0, 1),
+    # -- Respawn & Population --
+    ("gus", _SS, "DinoCountMultiplier", "Dino Count Multiplier",
+     "Scales the number of wild dinos that spawn on the map. Higher = more wild creatures.", "float", "1.0", 0.01, 5.0),
+    ("gus", _SS, "ServerAutoForceRespawnWildDinosInterval", "Auto Respawn Wild Dinos (s)",
+     "Seconds between automatic forced respawns of all wild dinos. 0 = disabled. "
+     "Helps refresh population on long-running servers.", "float", "0.0", 0.0, 86400.0, 60.0),
     # -- Breeding --
     ("game", _GM, "MatingIntervalMultiplier", "Mating Interval", "Scales time between matings (lower = faster).", "float", "1.0", 0.01, 10.0),
     ("game", _GM, "MatingSpeedMultiplier", "Mating Speed", "Scales how fast mating completes.", "float", "1.0", 0.1, 50.0),
-    ("game", _GM, "EggHatchSpeedMultiplier", "Egg Hatch Speed", "Higher = eggs hatch faster.", "float", "1.0", 0.1, 100.0),
-    ("game", _GM, "BabyMatureSpeedMultiplier", "Baby Mature Speed", "Higher = babies grow faster.", "float", "1.0", 0.1, 200.0),
-    ("game", _GM, "BabyCuddleIntervalMultiplier", "Cuddle Interval", "Scales time between imprint requests.", "float", "1.0", 0.01, 10.0),
-    ("game", _GM, "BabyFoodConsumptionSpeedMultiplier", "Baby Food Consumption", "Scales how fast babies eat.", "float", "1.0", 0.01, 10.0),
+    ("game", _GM, "EggHatchSpeedMultiplier", "Egg Hatch Speed", "Higher = eggs hatch faster.", "float", "1.0", 0.1, 100.0, 1.0),
+    ("game", _GM, "BabyMatureSpeedMultiplier", "Baby Mature Speed", "Higher = babies grow faster.", "float", "1.0", 0.1, 200.0, 1.0),
+    ("game", _GM, "BabyCuddleIntervalMultiplier", "Cuddle Interval",
+     "Scales time between imprint care requests (cuddle, walk, food). "
+     "Lower values = more frequent requests, faster imprinting.", "float", "1.0", 0.01, 10.0),
+    ("game", _GM, "BabyFoodConsumptionSpeedMultiplier", "Baby Food Consumption",
+     "Scales how fast baby dinos consume food from their inventory. "
+     "Higher values = faster drain, requiring more food during raising.", "float", "1.0", 0.01, 10.0),
     ("game", _GM, "BabyImprintingStatScaleMultiplier", "Imprinting Stat Scale", "Scales stat bonus from imprinting.", "float", "1.0", 0.0, 10.0),
-    ("game", _GM, "BabyImprintAmountMultiplier", "Imprint Amount", "Scales % gained per cuddle.", "float", "1.0", 0.1, 50.0),
+    ("game", _GM, "BabyImprintAmountMultiplier", "Imprint Amount",
+     "Scales the imprint percentage gained per care event. Higher values mean fewer "
+     "cuddle/care events needed for 100% imprint.", "float", "1.0", 0.1, 50.0, 1.0),
     ("game", _GM, "BabyCuddleGracePeriodMultiplier", "Cuddle Grace Period", "Time before imprint quality degrades.", "float", "1.0", 0.01, 10.0),
     ("game", _GM, "BabyCuddleLoseImprintQualitySpeedMultiplier", "Imprint Loss Speed", "Speed imprint quality drops after grace.", "float", "1.0", 0.01, 10.0),
     ("game", _GM, "LayEggIntervalMultiplier", "Lay Egg Interval", "Scales egg-laying frequency.", "float", "1.0", 0.01, 10.0),
@@ -1741,27 +1754,39 @@ INI_SETTINGS_DINOS: list = [
     ("game", _GM, "bAllowSpeedLeveling", "Allow Speed Leveling", "Let players/dinos level movement speed (ASA).", "bool", "False", 0, 1),
     ("game", _GM, "bAllowFlyerSpeedLeveling", "Allow Flyer Speed Leveling", "Let flyers level movement speed.", "bool", "False", 0, 1),
     ("game", _GM, "bUseDinoLevelUpAnimations", "Dino Level-Up Animation", "Play an animation on dino level-up.", "bool", "True", 0, 1),
-    ("game", _GM, "DestroyTamesOverLevelClamp", "Destroy Tames Over Level", "Delete tames above this level on restart (0 = off).", "int", "0", 0, 1000),
+    ("game", _GM, "DestroyTamesOverLevelClamp", "Destroy Tames Over Level", "Delete tames above this level on restart (0 = off).", "int", "0", 0, 1000, 10),
 ]
+
+# Defaults per the official wiki – stats 0 (Health) and 8 (Damage) differ.
+_DINO_STAT_DEFAULTS = {
+    #            Wild  Tamed  Add    Affinity
+    0:          (1.0,  0.2,   0.14,  0.44),   # Health
+    8:          (1.0,  0.17,  0.14,  0.44),   # Damage
+}
 
 INI_SETTINGS_DINO_STATS: list = []
 for _si, _sn in enumerate(_STAT_NAMES):
+    _wd, _td, _ad, _fd = _DINO_STAT_DEFAULTS.get(_si, (1.0, 1.0, 1.0, 1.0))
     INI_SETTINGS_DINO_STATS.append(
         ("game", _GM, f"PerLevelStatsMultiplier_DinoWild[{_si}]",
          f"Wild {_sn}", f"Wild dino {_sn} gain per level.", "float",
-         "1.0", 0.0, 10.0))
+         str(_wd), 0.0, 10.0))
     INI_SETTINGS_DINO_STATS.append(
         ("game", _GM, f"PerLevelStatsMultiplier_DinoTamed[{_si}]",
          f"Tamed {_sn}", f"Tamed dino {_sn} gain per level.", "float",
-         "1.0" if _si != 0 else "0.2", 0.0, 10.0))
+         str(_td), 0.0, 10.0))
     INI_SETTINGS_DINO_STATS.append(
         ("game", _GM, f"PerLevelStatsMultiplier_DinoTamed_Add[{_si}]",
-         f"Tamed Add {_sn}", f"Additive {_sn} bonus on tame.", "float",
-         "1.0" if _si != 0 else "0.14", 0.0, 10.0))
+         f"Tamed Add {_sn}",
+         f"Flat {_sn} bonus applied once when a wild creature is first tamed "
+         f"(additive, independent of taming effectiveness).", "float",
+         str(_ad), 0.0, 10.0))
     INI_SETTINGS_DINO_STATS.append(
         ("game", _GM, f"PerLevelStatsMultiplier_DinoTamed_Affinity[{_si}]",
-         f"Affinity {_sn}", f"Taming effectiveness {_sn} bonus.", "float",
-         "1.0" if _si != 0 else "0.44", 0.0, 10.0))
+         f"Affinity {_sn}",
+         f"{_sn} bonus that scales with Taming Effectiveness (TE) \u2014 "
+         f"higher TE yields a larger bonus; this multiplier adjusts that bonus.", "float",
+         str(_fd), 0.0, 10.0))
 
 INI_SETTINGS_PLAYERS: list = [
     ("gus", _SS, "PlayerDamageMultiplier", "Player Damage", "Scales damage dealt by players.", "float", "1.0", 0.01, 10.0),
@@ -1770,8 +1795,8 @@ INI_SETTINGS_PLAYERS: list = [
     ("gus", _SS, "PlayerCharacterHealthRecoveryMultiplier", "Health Recovery", "Scales passive health regen.", "float", "1.0", 0.01, 10.0),
     ("gus", _SS, "PlayerCharacterStaminaDrainMultiplier", "Stamina Drain", "Scales stamina consumption.", "float", "1.0", 0.01, 10.0),
     ("gus", _SS, "PlayerCharacterWaterDrainMultiplier", "Water Drain", "Scales water consumption.", "float", "1.0", 0.01, 10.0),
-    ("gus", _SS, "XPMultiplier", "XP Multiplier", "Scales all experience gain.", "float", "1.0", 0.1, 100.0),
-    ("gus", _SS, "HarvestAmountMultiplier", "Harvest Amount", "Scales resources gained per hit.", "float", "1.0", 0.1, 100.0),
+    ("gus", _SS, "XPMultiplier", "XP Multiplier", "Scales all experience gain.", "float", "1.0", 0.1, 100.0, 1.0),
+    ("gus", _SS, "HarvestAmountMultiplier", "Harvest Amount", "Scales resources gained per hit.", "float", "1.0", 0.1, 100.0, 1.0),
     ("gus", _SS, "HarvestHealthMultiplier", "Harvest Health", "Scales health of harvestables (more hits = more yield).", "float", "1.0", 0.1, 20.0),
     ("gus", _SS, "OxygenSwimSpeedStatMultiplier", "Oxygen Swim Speed", "Scales swim speed gained from Oxygen stat.", "float", "1.0", 0.0, 10.0),
     ("game", _GM, "KillXPMultiplier", "Kill XP", "Scales XP from kills.", "float", "1.0", 0.1, 50.0),
@@ -1794,8 +1819,11 @@ INI_SETTINGS_MISC: list = [
     ("gus", _SS, "ResourcesRespawnPeriodMultiplier", "Resource Respawn Period", "Scales resource respawn timer.", "float", "1.0", 0.01, 10.0),
     ("gus", _SS, "StructureResistanceMultiplier", "Structure Resistance", "Scales structure damage resistance.", "float", "1.0", 0.01, 10.0),
     ("gus", _SS, "StructurePickupHoldDuration", "Pickup Hold Duration", "Seconds to hold for quick-pickup (0 = instant).", "float", "0.5", 0.0, 5.0),
-    ("gus", _SS, "StructurePickupTimeAfterPlacement", "Pickup Time After Place", "Seconds after placement pickup is available.", "float", "30.0", 0.0, 600.0),
-    ("gus", _SS, "TheMaxStructuresInRange", "Max Structures In Range", "Cap on structures in a coded radius.", "int", "10500", 100, 50000),
+    ("gus", _SS, "StructurePickupTimeAfterPlacement", "Pickup Time After Place",
+     "Seconds after placing a structure during which pickup is still allowed. "
+     "After this window closes, the structure becomes permanent "
+     "(unless Always Allow Pickup is on). 0 = no pickup window.", "float", "30.0", 0.0, 600.0, 5.0),
+    ("gus", _SS, "TheMaxStructuresInRange", "Max Structures In Range", "Cap on structures in a coded radius.", "int", "10500", 100, 50000, 500),
     ("gus", _SS, "PerPlatformMaxStructuresMultiplier", "Platform Struct Multiplier", "Scales max items on saddles/rafts.", "float", "1.0", 0.1, 10.0),
     ("gus", _SS, "PlatformSaddleBuildAreaBoundsMultiplier", "Platform Build Area", "Scales platform saddle build range.", "float", "1.0", 0.1, 10.0),
     ("gus", _SS, "AlwaysAllowStructurePickup", "Always Allow Pickup", "Structures can always be picked up.", "bool", "False", 0, 1),
@@ -1815,14 +1843,47 @@ INI_SETTINGS_MISC: list = [
     ("game", _GM, "ResourceNoReplenishRadiusPlayers", "No-Replenish Radius (Players)", "Distance from players resources won't regrow.", "float", "1.0", 0.0, 5.0),
     ("game", _GM, "ResourceNoReplenishRadiusStructures", "No-Replenish Radius (Structures)", "Distance from structures resources won't regrow.", "float", "1.0", 0.0, 5.0),
     ("game", _GM, "LimitGeneratorsNum", "Generator Limit (Count)", "Max generators in range (ASA).", "int", "3", 0, 50),
-    ("game", _GM, "LimitGeneratorsRange", "Generator Limit (Range)", "Range in UE units for generator limit (ASA).", "int", "15000", 0, 100000),
+    ("game", _GM, "LimitGeneratorsRange", "Generator Limit (Range)", "Range in UE units for generator limit (ASA).", "int", "15000", 0, 100000, 1000),
     ("game", _GM, "BaseHexagonRewardMultiplier", "Hexagon Reward Multiplier", "Scales mission/club hex rewards.", "float", "1.0", 0.1, 50.0),
     ("game", _GM, "HexagonCostMultiplier", "Hexagon Cost Multiplier", "Scales hex store/club item costs.", "float", "1.0", 0.1, 50.0),
-    ("game", _GM, "PhotoModeRangeLimit", "Photo Mode Range", "Max camera distance in photo mode (ASA).", "int", "3000", 0, 50000),
+    ("game", _GM, "PhotoModeRangeLimit", "Photo Mode Range", "Max camera distance in photo mode (ASA).", "int", "3000", 0, 50000, 500),
     ("game", _GM, "bDisablePhotoMode", "Disable Photo Mode", "Completely disable photo mode (ASA).", "bool", "False", 0, 1),
-    ("gus", _SS, "TribeNameChangeCooldown", "Tribe Rename Cooldown (min)", "Minutes between tribe name changes.", "float", "15.0", 0.0, 10080.0),
-    ("gus", _SS, "ImplantSuicideCD", "Implant Respawn Cooldown (s)", "Seconds between implant respawns (ASA).", "float", "28800.0", 0.0, 86400.0),
-    ("gus", _SS, "RCONServerGameLogBuffer", "RCON Log Buffer", "Lines kept in RCON game log buffer.", "int", "600", 0, 5000),
+    ("gus", _SS, "TribeNameChangeCooldown", "Tribe Rename Cooldown (min)", "Minutes between tribe name changes.", "float", "15.0", 0.0, 10080.0, 5.0),
+    ("gus", _SS, "ImplantSuicideCD", "Implant Respawn Cooldown (s)", "Seconds between implant respawns (ASA).", "float", "28800.0", 0.0, 86400.0, 300.0),
+    ("gus", _SS, "RCONServerGameLogBuffer", "RCON Log Buffer", "Lines kept in RCON game log buffer.", "int", "600", 0, 5000, 50),
+]
+
+# Spawn customization keys – complex multi-value entries edited via text areas.
+# Each tuple: (ini_file, section, key, title, description)
+_SPAWN_ENTRY_KEYS: list = [
+    ("game", _GM, "NPCReplacements",
+     "NPC Replacements",
+     "Replace one dino species with another (or disable it with an empty ToClassName).\n"
+     "Syntax: (FromClassName=\"Dino_Character_BP_C\",ToClassName=\"NewDino_Character_BP_C\")\n"
+     "To disable a dino: (FromClassName=\"Dino_Character_BP_C\",ToClassName=\"\")"),
+    ("game", _GM, "DinoSpawnWeightMultipliers",
+     "Dino Spawn Weight Multipliers",
+     "Adjust spawn rates and caps for specific dinos.\n"
+     "Syntax: (DinoNameTag=<Tag>,SpawnWeightMultiplier=<X>,OverrideSpawnLimitPercentage=true,"
+     "SpawnLimitPercentage=<Y>)"),
+    ("game", _GM, "ConfigSubtractNPCSpawnEntriesContainer",
+     "Remove NPC Spawn Entries",
+     "Remove specific dinos from a spawn container.\n"
+     "Syntax: (NPCSpawnEntriesContainerClassString=\"<ContainerID>\","
+     "NPCSpawnEntries=((AnEntryName=\"Remove\",EntryWeight=1.0,"
+     "NPCsToSpawnStrings=(\"Dino_Character_BP_C\"))))"),
+    ("game", _GM, "ConfigAddNPCSpawnEntriesContainer",
+     "Add NPC Spawn Entries",
+     "Add custom dinos to an existing spawn container.\n"
+     "Syntax: (NPCSpawnEntriesContainerClassString=\"<ContainerID>\","
+     "NPCSpawnEntries=((AnEntryName=\"Add\",EntryWeight=1.0,"
+     "NPCsToSpawnStrings=(\"Dino_Character_BP_C\"))))"),
+    ("game", _GM, "ConfigOverrideNPCSpawnEntriesContainer",
+     "Override NPC Spawn Entries",
+     "Completely replace all spawn entries of a container.\n"
+     "Syntax: (NPCSpawnEntriesContainerClassString=\"<ContainerID>\","
+     "NPCSpawnEntries=((AnEntryName=\"Override\",EntryWeight=1.0,"
+     "NPCsToSpawnStrings=(\"Dino_Character_BP_C\"))))"),
 ]
 
 # =============================================================================
@@ -1885,6 +1946,24 @@ class IniDocument:
             if line.kind == "kv":
                 data.setdefault(line.section, {})[line.key] = line.value
         return data
+
+    def get_all_values(self, section: str, key: str) -> List[str]:
+        """Return all values for a key in a section (handles duplicate keys)."""
+        key_lower = key.lower()
+        return [
+            line.value for line in self.lines
+            if line.kind == "kv" and line.section == section and line.key.lower() == key_lower
+        ]
+
+    def remove_all_kv(self, section: str, key: str) -> int:
+        """Remove all kv entries matching section+key. Returns count removed."""
+        key_lower = key.lower()
+        before = len(self.lines)
+        self.lines = [
+            line for line in self.lines
+            if not (line.kind == "kv" and line.section == section and line.key.lower() == key_lower)
+        ]
+        return before - len(self.lines)
 
     def ensure_section(self, section: str) -> None:
         section = section.strip()
@@ -4457,14 +4536,14 @@ class ServerManagerApp:
 
         # -- Sub-tab: Visual config sections (General, Crops, Dinosaurs, Players, Misc) --
         visual_sections = [
-            ("General", INI_SETTINGS_GENERAL, None),
-            ("Crops & Spoiling", INI_SETTINGS_CROPS, None),
-            ("Dinosaurs", INI_SETTINGS_DINOS, INI_SETTINGS_DINO_STATS),
-            ("Players", INI_SETTINGS_PLAYERS, INI_SETTINGS_PLAYER_STATS),
-            ("Misc / Structures", INI_SETTINGS_MISC, None),
+            ("General", INI_SETTINGS_GENERAL, None, None),
+            ("Crops & Spoiling", INI_SETTINGS_CROPS, None, None),
+            ("Dinosaurs", INI_SETTINGS_DINOS, INI_SETTINGS_DINO_STATS, _SPAWN_ENTRY_KEYS),
+            ("Players", INI_SETTINGS_PLAYERS, INI_SETTINGS_PLAYER_STATS, None),
+            ("Misc / Structures", INI_SETTINGS_MISC, None, None),
         ]
 
-        for tab_label, settings_list, stats_list in visual_sections:
+        for tab_label, settings_list, stats_list, spawn_keys in visual_sections:
             vtab = ttk.Frame(self.ini_sub_nb, padding=4)
             self.ini_sub_nb.add(vtab, text=tab_label)
             vtab.columnconfigure(0, weight=1)
@@ -4516,6 +4595,10 @@ class ServerManagerApp:
             # Build per-level stat tables if present
             if stats_list:
                 row_i = self._ini_visual_build_stats_table(inner, stats_list, row_i, theme)
+
+            # Build spawn customization text areas if present
+            if spawn_keys:
+                row_i = self._ini_visual_build_spawn_section(inner, spawn_keys, row_i, theme)
 
         # Wire sub-notebook tab changes to refresh visual controls
         self.ini_sub_nb.bind("<<NotebookTabChanged>>", lambda e: self._ini_visual_refresh_all())
@@ -5516,7 +5599,8 @@ class ServerManagerApp:
         m = self.root
         row = start_row
         for s in settings:
-            ini_file, section, key, label, desc, vtype, default, lo, hi = s
+            ini_file, section, key, label, desc, vtype, default, lo, hi = s[:9]
+            step = s[9] if len(s) > 9 else (0.25 if vtype == "float" else 1)
             vk = self._ini_visual_var_key(ini_file, section, key)
 
             frm = ttk.Frame(parent)
@@ -5539,8 +5623,8 @@ class ServerManagerApp:
                 entry.grid(row=0, column=1, sticky="w", padx=(4, 4))
                 scale_var = tk.DoubleVar(master=m, value=float(default))
                 scale = ttk.Scale(frm, variable=scale_var, from_=lo, to=hi,
-                                  command=lambda v, sv=scale_var, tv=var, _vk=vk:
-                                  self._ini_visual_scale_to_entry(sv, tv, _vk, "float"))
+                                  command=lambda v, sv=scale_var, tv=var, _vk=vk, _st=step:
+                                  self._ini_visual_scale_to_entry(sv, tv, _vk, "float", _st))
                 scale.grid(row=0, column=2, sticky="ew", padx=(0, 4))
                 frm.columnconfigure(2, weight=1)
                 # Keep a ref to the scale var for reverse sync
@@ -5557,8 +5641,8 @@ class ServerManagerApp:
                 entry.grid(row=0, column=1, sticky="w", padx=(4, 4))
                 scale_var = tk.DoubleVar(master=m, value=float(default))
                 scale = ttk.Scale(frm, variable=scale_var, from_=lo, to=hi,
-                                  command=lambda v, sv=scale_var, tv=var, _vk=vk:
-                                  self._ini_visual_scale_to_entry(sv, tv, _vk, "int"))
+                                  command=lambda v, sv=scale_var, tv=var, _vk=vk, _st=step:
+                                  self._ini_visual_scale_to_entry(sv, tv, _vk, "int", _st))
                 scale.grid(row=0, column=2, sticky="ew", padx=(0, 4))
                 frm.columnconfigure(2, weight=1)
                 self._ini_visual_vars[vk + "|scale"] = scale_var
@@ -5640,12 +5724,56 @@ class ServerManagerApp:
         start_row += 1
         return start_row
 
+    def _ini_visual_build_spawn_section(self, parent: ttk.Frame, spawn_keys: list,
+                                        start_row: int, theme: dict) -> int:
+        """Build text-area editors for complex spawn customization INI entries."""
+        sep = ttk.Separator(parent, orient="horizontal")
+        sep.grid(row=start_row, column=0, sticky="ew", pady=(10, 4))
+        start_row += 1
+
+        lbl = ttk.Label(parent, text="Spawn Customization", font=("", 10, "bold"))
+        lbl.grid(row=start_row, column=0, sticky="w", padx=4)
+        start_row += 1
+
+        note = ttk.Label(
+            parent,
+            text="Each line below is one INI value (without the key= prefix). "
+                 "Add or remove lines to modify spawns. Changes auto-save to staging.",
+            foreground=theme["muted"], wraplength=700)
+        note.grid(row=start_row, column=0, sticky="w", padx=4, pady=(0, 6))
+        start_row += 1
+
+        for ini_file, section, key, title, desc in spawn_keys:
+            vk = self._ini_visual_var_key(ini_file, section, key)
+
+            frm = ttk.LabelFrame(parent, text=title, padding=6)
+            frm.grid(row=start_row, column=0, sticky="ew", pady=4, padx=2)
+            frm.columnconfigure(0, weight=1)
+
+            ttk.Label(frm, text=desc, foreground=theme["muted"],
+                      wraplength=680, justify="left").grid(row=0, column=0, sticky="w")
+
+            text = tk.Text(frm, height=4, wrap="word", font=("Consolas", 9))
+            text.grid(row=1, column=0, sticky="ew", pady=(4, 0))
+
+            # Store the Text widget; refresh/write methods detect tk.Text instances.
+            self._ini_visual_vars[vk] = text
+
+            text.bind("<KeyRelease>", lambda e, _vk=vk: self._ini_visual_schedule_write(_vk))
+            start_row += 1
+
+        return start_row
+
     def _ini_visual_scale_to_entry(self, scale_var: tk.DoubleVar, text_var: tk.StringVar,
-                                   vk: str, vtype: str) -> None:
-        """Scale slider changed -> update entry and schedule INI write."""
+                                   vk: str, vtype: str, step: float = 0.25) -> None:
+        """Scale slider changed -> snap to step, update entry and schedule INI write."""
         if self._ini_visual_loading:
             return
         val = scale_var.get()
+        # Snap value to nearest step increment
+        if step > 0:
+            val = round(round(val / step) * step, 10)
+            scale_var.set(val)
         if vtype == "int":
             text_var.set(str(int(round(val))))
         else:
@@ -5713,6 +5841,17 @@ class ServerManagerApp:
                     continue
                 ini_file, section, key = parts
 
+                # --- Text widget (spawn customization, multi-value keys) ---
+                if isinstance(var, tk.Text):
+                    doc = gus_doc if ini_file == "gus" else game_doc
+                    if doc is None:
+                        continue
+                    vals = doc.get_all_values(section, key)
+                    var.delete("1.0", "end")
+                    if vals:
+                        var.insert("1.0", "\n".join(vals))
+                    continue
+
                 val_map = gus_map if ini_file == "gus" else game_map
                 current = val_map.get(section, {}).get(key, None)
 
@@ -5764,6 +5903,27 @@ class ServerManagerApp:
                 continue
             ini_file, section, key = parts
 
+            doc = gus_doc if ini_file == "gus" else game_doc
+
+            # --- Text widget (spawn customization, multi-value keys) ---
+            if isinstance(var, tk.Text):
+                content = var.get("1.0", "end").strip()
+                doc.remove_all_kv(section, key)
+                if content:
+                    for line in content.split("\n"):
+                        line = line.strip()
+                        if not line:
+                            continue
+                        # Strip key= prefix if user pasted full INI lines
+                        if line.lower().startswith(key.lower() + "="):
+                            line = line[len(key) + 1:]
+                        doc.append_kv(section, key, line)
+                if ini_file == "gus":
+                    gus_dirty = True
+                else:
+                    game_dirty = True
+                continue
+
             if isinstance(var, tk.BooleanVar):
                 val = "True" if var.get() else "False"
             elif isinstance(var, tk.StringVar):
@@ -5771,7 +5931,6 @@ class ServerManagerApp:
             else:
                 continue
 
-            doc = gus_doc if ini_file == "gus" else game_doc
             doc.set(section, key, val)
             if ini_file == "gus":
                 gus_dirty = True
