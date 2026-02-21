@@ -37,6 +37,9 @@ from tkinter import font as tkfont
 from tkinter import ttk
 import uuid
 
+from ark_creature_data import (_CREATURE_DATA, _CREATURE_NAMES_SORTED,
+                               _ENTITY_ID_TO_NAME, _NAMETAG_TO_NAMES)
+
 try:
     import winreg  # type: ignore
 except Exception:
@@ -1885,6 +1888,31 @@ _SPAWN_ENTRY_KEYS: list = [
      "NPCSpawnEntries=((AnEntryName=\"Override\",EntryWeight=1.0,"
      "NPCsToSpawnStrings=(\"Dino_Character_BP_C\"))))"),
 ]
+
+# =============================================================================
+# Creature wiki data — see ark_creature_data.py
+# =============================================================================
+
+class _SpawnListData:
+    """Stores structured spawn entries for a spawn customization key."""
+    def __init__(self, listbox: tk.Listbox):
+        self.listbox = listbox
+        self.entries: list[str] = []  # raw INI value strings
+
+    def clear(self) -> None:
+        self.listbox.delete(0, "end")
+        self.entries.clear()
+
+    def add(self, raw: str, display: str) -> None:
+        self.entries.append(raw)
+        self.listbox.insert("end", display)
+
+    def remove_selected(self) -> None:
+        sel = self.listbox.curselection()
+        for i in reversed(sel):
+            self.listbox.delete(i)
+            del self.entries[i]
+
 
 # =============================================================================
 # INI (order-preserving, duplicate-key aware)
@@ -5679,13 +5707,28 @@ class ServerManagerApp:
         is_dino = per_stat_count >= 4
 
         if is_dino:
-            headers = ["Stat", "Wild", "Tamed", "Tamed Add", "Affinity"]
-            for ci, h in enumerate(headers):
+            col_info = [
+                ("Stat", ""),
+                ("Wild", "Multiplier per wild level-up point."),
+                ("Tamed", "Multiplier per tamed level-up point."),
+                ("Tamed Add", "Flat bonus added after taming (stacks with Tamed)."),
+                ("Affinity", "Bonus multiplier based on taming effectiveness."),
+            ]
+            for ci, (h, tip) in enumerate(col_info):
                 ttk.Label(grid_frame, text=h, font=("", 9, "bold")).grid(
-                    row=0, column=ci, sticky="w", padx=4, pady=2)
+                    row=0, column=ci, sticky="w", padx=4, pady=(2, 0))
+                if tip:
+                    ttk.Label(grid_frame, text=tip, foreground=theme["muted"],
+                              font=("", 7), wraplength=100).grid(
+                        row=1, column=ci, sticky="w", padx=4, pady=(0, 4))
+
+            data_row_offset = 2  # row 0 = header, row 1 = desc, data starts at 2
 
             for si, sn in enumerate(_STAT_NAMES):
-                ttk.Label(grid_frame, text=sn).grid(row=si + 1, column=0, sticky="w", padx=4, pady=1)
+                defs = _DINO_STAT_DEFAULTS.get(si, (1.0, 1.0, 1.0, 1.0))
+                label_text = f"{sn}  (def: {defs[0]}, {defs[1]}, {defs[2]}, {defs[3]})"
+                ttk.Label(grid_frame, text=label_text).grid(
+                    row=si + data_row_offset, column=0, sticky="w", padx=4, pady=1)
                 for gi, suffix in enumerate(["DinoWild", "DinoTamed", "DinoTamed_Add", "DinoTamed_Affinity"]):
                     key = f"PerLevelStatsMultiplier_{suffix}[{si}]"
                     sd = next((x for x in stats if x[2] == key), None)
@@ -5697,7 +5740,7 @@ class ServerManagerApp:
                     var = tk.StringVar(master=m, value=default)
                     self._ini_visual_vars[vk] = var
                     ent = ttk.Entry(grid_frame, textvariable=var, width=8)
-                    ent.grid(row=si + 1, column=gi + 1, padx=2, pady=1)
+                    ent.grid(row=si + data_row_offset, column=gi + 1, padx=2, pady=1)
                     ent.bind("<KeyRelease>", lambda e, _vk=vk: self._ini_visual_schedule_write(_vk))
         else:
             # Player stats – 2-column layout
@@ -5716,7 +5759,8 @@ class ServerManagerApp:
                 vk = self._ini_visual_var_key(ini_file, section, key)
                 var = tk.StringVar(master=m, value=default)
                 self._ini_visual_vars[vk] = var
-                ttk.Label(grid_frame, text=sn).grid(row=si + 1, column=0, sticky="w", padx=4, pady=1)
+                ttk.Label(grid_frame, text=f"{sn}  (def: 1.0)",
+                          ).grid(row=si + 1, column=0, sticky="w", padx=4, pady=1)
                 ent = ttk.Entry(grid_frame, textvariable=var, width=10)
                 ent.grid(row=si + 1, column=1, padx=2, pady=1)
                 ent.bind("<KeyRelease>", lambda e, _vk=vk: self._ini_visual_schedule_write(_vk))
@@ -5724,21 +5768,63 @@ class ServerManagerApp:
         start_row += 1
         return start_row
 
+    # -----------------------------------------------------------------
+    # Spawn-entry display helpers
+    # -----------------------------------------------------------------
+    @staticmethod
+    def _spawn_raw_to_display(key: str, raw: str) -> str:
+        """Convert a raw INI spawn value to a human-readable display string."""
+        if key == "NPCReplacements":
+            m = re.search(r'FromClassName="([^"]*)".*?ToClassName="([^"]*)"', raw)
+            if m:
+                from_id, to_id = m.group(1), m.group(2)
+                from_name = _ENTITY_ID_TO_NAME.get(from_id, from_id)
+                to_name = _ENTITY_ID_TO_NAME.get(to_id, to_id) if to_id else "(disabled)"
+                return f"{from_name}  \u2192  {to_name}"
+        elif key == "DinoSpawnWeightMultipliers":
+            m_tag = re.search(r'DinoNameTag=(\w+)', raw)
+            m_w = re.search(r'SpawnWeightMultiplier=([\d.]+)', raw)
+            m_l = re.search(r'SpawnLimitPercentage=([\d.]+)', raw)
+            tag = m_tag.group(1) if m_tag else "?"
+            w = m_w.group(1) if m_w else "?"
+            lim = m_l.group(1) if m_l else "?"
+            return f"{tag}   W={w}  Limit={lim}"
+        else:
+            m_c = re.search(r'NPCSpawnEntriesContainerClassString="([^"]*)"', raw)
+            container = m_c.group(1) if m_c else "?"
+            m_bp = re.search(r'NPCsToSpawnStrings=\("([^"]*)"', raw)
+            if m_bp:
+                bp = m_bp.group(1)
+                creature = bp
+                for name, cdata in _CREATURE_DATA.items():
+                    if cdata[2] == bp:
+                        creature = name
+                        break
+                return f"{container}  \u2190  {creature}"
+            return f"{container}  \u2190  ..."
+        return raw[:80]
+
+    # -----------------------------------------------------------------
+    # Spawn section builder (dropdown-based UI)
+    # -----------------------------------------------------------------
     def _ini_visual_build_spawn_section(self, parent: ttk.Frame, spawn_keys: list,
                                         start_row: int, theme: dict) -> int:
-        """Build text-area editors for complex spawn customization INI entries."""
+        """Build dropdown-based editors for spawn customization INI entries."""
         sep = ttk.Separator(parent, orient="horizontal")
         sep.grid(row=start_row, column=0, sticky="ew", pady=(10, 4))
         start_row += 1
 
-        lbl = ttk.Label(parent, text="Spawn Customization", font=("", 10, "bold"))
-        lbl.grid(row=start_row, column=0, sticky="w", padx=4)
+        hdr_frm = ttk.Frame(parent)
+        hdr_frm.grid(row=start_row, column=0, sticky="w", padx=4)
+        ttk.Label(hdr_frm, text="Spawn Customization", font=("", 10, "bold")).pack(side="left")
+        ttk.Label(hdr_frm, text="  BETA", font=("", 8, "bold"),
+                  foreground="#e07b00").pack(side="left", pady=(2, 0))
         start_row += 1
 
         note = ttk.Label(
             parent,
-            text="Each line below is one INI value (without the key= prefix). "
-                 "Add or remove lines to modify spawns. Changes auto-save to staging.",
+            text="Use dropdowns to select creatures, then click Add. "
+                 "Select an entry and click Remove to delete it. Changes auto-save to staging.",
             foreground=theme["muted"], wraplength=700)
         note.grid(row=start_row, column=0, sticky="w", padx=4, pady=(0, 6))
         start_row += 1
@@ -5751,18 +5837,194 @@ class ServerManagerApp:
             frm.columnconfigure(0, weight=1)
 
             ttk.Label(frm, text=desc, foreground=theme["muted"],
-                      wraplength=680, justify="left").grid(row=0, column=0, sticky="w")
+                      wraplength=680, justify="left").grid(row=0, column=0, sticky="w", columnspan=2)
 
-            text = tk.Text(frm, height=4, wrap="word", font=("Consolas", 9))
-            text.grid(row=1, column=0, sticky="ew", pady=(4, 0))
+            if key == "NPCReplacements":
+                self._build_spawn_npc_replacements(frm, vk, key)
+            elif key == "DinoSpawnWeightMultipliers":
+                self._build_spawn_weight_multipliers(frm, vk, key)
+            else:
+                self._build_spawn_container_op(frm, vk, key)
 
-            # Store the Text widget; refresh/write methods detect tk.Text instances.
-            self._ini_visual_vars[vk] = text
-
-            text.bind("<KeyRelease>", lambda e, _vk=vk: self._ini_visual_schedule_write(_vk))
             start_row += 1
 
         return start_row
+
+    @staticmethod
+    def _make_searchable_cb(cb: ttk.Combobox, full_values: list) -> None:
+        """Bind KeyRelease so the combobox filters its drop-down as the user types."""
+        def _filter(event=None):
+            typed = cb.get().lower()
+            if typed:
+                cb['values'] = [v for v in full_values if typed in v.lower()]
+            else:
+                cb['values'] = full_values
+            try:
+                cb.event_generate('<Down>')
+            except Exception:
+                pass
+        cb.bind('<KeyRelease>', _filter)
+
+    def _build_spawn_npc_replacements(self, parent: ttk.Frame, vk: str, key: str) -> None:
+        input_frm = ttk.Frame(parent)
+        input_frm.grid(row=1, column=0, sticky="ew", pady=(4, 2))
+
+        ttk.Label(input_frm, text="From:").grid(row=0, column=0, padx=(0, 4))
+        from_cb = ttk.Combobox(input_frm, values=_CREATURE_NAMES_SORTED, width=28)
+        from_cb.grid(row=0, column=1, padx=(0, 8))
+        self._make_searchable_cb(from_cb, list(_CREATURE_NAMES_SORTED))
+
+        ttk.Label(input_frm, text="\u2192 To:").grid(row=0, column=2, padx=(0, 4))
+        to_values = ["(disabled)"] + list(_CREATURE_NAMES_SORTED)
+        to_cb = ttk.Combobox(input_frm, values=to_values, width=28)
+        to_cb.grid(row=0, column=3, padx=(0, 8))
+        self._make_searchable_cb(to_cb, to_values)
+
+        list_frm = ttk.Frame(parent)
+        list_frm.grid(row=2, column=0, sticky="ew", pady=(2, 2))
+        list_frm.columnconfigure(0, weight=1)
+
+        lb = tk.Listbox(list_frm, height=5, font=("Consolas", 9))
+        lb.grid(row=0, column=0, sticky="ew")
+        sb = ttk.Scrollbar(list_frm, orient="vertical", command=lb.yview)
+        sb.grid(row=0, column=1, sticky="ns")
+        lb.configure(yscrollcommand=sb.set)
+
+        data = _SpawnListData(lb)
+        self._ini_visual_vars[vk] = data
+
+        def add_entry():
+            from_name = from_cb.get().strip()
+            to_name = to_cb.get().strip()
+            if not from_name:
+                return
+            from_id = _CREATURE_DATA.get(from_name, ("", "", ""))[0]
+            if not from_id:
+                return
+            if to_name == "(disabled)" or not to_name:
+                to_id = ""
+                display = f"{from_name}  \u2192  (disabled)"
+            else:
+                to_id = _CREATURE_DATA.get(to_name, ("", "", ""))[0]
+                display = f"{from_name}  \u2192  {to_name}"
+            raw = f'(FromClassName="{from_id}",ToClassName="{to_id}")'
+            data.add(raw, display)
+            self._ini_visual_schedule_write(vk)
+
+        def remove_entry():
+            data.remove_selected()
+            self._ini_visual_schedule_write(vk)
+
+        ttk.Button(input_frm, text="Add", command=add_entry, width=6).grid(row=0, column=4)
+        ttk.Button(parent, text="Remove Selected", command=remove_entry).grid(
+            row=3, column=0, sticky="w", pady=(2, 0))
+
+    def _build_spawn_weight_multipliers(self, parent: ttk.Frame, vk: str, key: str) -> None:
+        nametags = sorted({v[1] for v in _CREATURE_DATA.values() if v[1] and v[1] != '???'})
+
+        input_frm = ttk.Frame(parent)
+        input_frm.grid(row=1, column=0, sticky="ew", pady=(4, 2))
+
+        ttk.Label(input_frm, text="DinoNameTag:").grid(row=0, column=0, padx=(0, 4))
+        tag_cb = ttk.Combobox(input_frm, values=nametags, width=20)
+        tag_cb.grid(row=0, column=1, padx=(0, 8))
+        self._make_searchable_cb(tag_cb, nametags)
+
+        ttk.Label(input_frm, text="Weight:").grid(row=0, column=2, padx=(0, 4))
+        weight_var = tk.StringVar(value="1.0")
+        ttk.Entry(input_frm, textvariable=weight_var, width=8).grid(row=0, column=3, padx=(0, 8))
+
+        ttk.Label(input_frm, text="Limit%:").grid(row=0, column=4, padx=(0, 4))
+        limit_var = tk.StringVar(value="0.1")
+        ttk.Entry(input_frm, textvariable=limit_var, width=8).grid(row=0, column=5, padx=(0, 8))
+
+        list_frm = ttk.Frame(parent)
+        list_frm.grid(row=2, column=0, sticky="ew", pady=(2, 2))
+        list_frm.columnconfigure(0, weight=1)
+
+        lb = tk.Listbox(list_frm, height=5, font=("Consolas", 9))
+        lb.grid(row=0, column=0, sticky="ew")
+        sb = ttk.Scrollbar(list_frm, orient="vertical", command=lb.yview)
+        sb.grid(row=0, column=1, sticky="ns")
+        lb.configure(yscrollcommand=sb.set)
+
+        data = _SpawnListData(lb)
+        self._ini_visual_vars[vk] = data
+
+        def add_entry():
+            tag = tag_cb.get().strip()
+            if not tag:
+                return
+            weight = weight_var.get().strip() or "1.0"
+            limit = limit_var.get().strip() or "0.1"
+            raw = (f"(DinoNameTag={tag},SpawnWeightMultiplier={weight},"
+                   f"OverrideSpawnLimitPercentage=true,SpawnLimitPercentage={limit})")
+            display = f"{tag}   W={weight}  Limit={limit}"
+            data.add(raw, display)
+            self._ini_visual_schedule_write(vk)
+
+        def remove_entry():
+            data.remove_selected()
+            self._ini_visual_schedule_write(vk)
+
+        ttk.Button(input_frm, text="Add", command=add_entry, width=6).grid(row=0, column=6)
+        ttk.Button(parent, text="Remove Selected", command=remove_entry).grid(
+            row=3, column=0, sticky="w", pady=(2, 0))
+
+    def _build_spawn_container_op(self, parent: ttk.Frame, vk: str, key: str) -> None:
+        input_frm = ttk.Frame(parent)
+        input_frm.grid(row=1, column=0, sticky="ew", pady=(4, 2))
+
+        ttk.Label(input_frm, text="Container:").grid(row=0, column=0, padx=(0, 4))
+        container_var = tk.StringVar()
+        ttk.Entry(input_frm, textvariable=container_var, width=28).grid(row=0, column=1, padx=(0, 8))
+
+        ttk.Label(input_frm, text="Creature:").grid(row=0, column=2, padx=(0, 4))
+        creature_cb = ttk.Combobox(input_frm, values=_CREATURE_NAMES_SORTED, width=28)
+        creature_cb.grid(row=0, column=3, padx=(0, 8))
+        self._make_searchable_cb(creature_cb, list(_CREATURE_NAMES_SORTED))
+
+        ttk.Label(input_frm, text="Weight:").grid(row=0, column=4, padx=(0, 4))
+        weight_var = tk.StringVar(value="1.0")
+        ttk.Entry(input_frm, textvariable=weight_var, width=6).grid(row=0, column=5, padx=(0, 8))
+
+        list_frm = ttk.Frame(parent)
+        list_frm.grid(row=2, column=0, sticky="ew", pady=(2, 2))
+        list_frm.columnconfigure(0, weight=1)
+
+        lb = tk.Listbox(list_frm, height=5, font=("Consolas", 9))
+        lb.grid(row=0, column=0, sticky="ew")
+        sb = ttk.Scrollbar(list_frm, orient="vertical", command=lb.yview)
+        sb.grid(row=0, column=1, sticky="ns")
+        lb.configure(yscrollcommand=sb.set)
+
+        data = _SpawnListData(lb)
+        self._ini_visual_vars[vk] = data
+
+        def add_entry():
+            container = container_var.get().strip()
+            creature_name = creature_cb.get().strip()
+            if not container or not creature_name:
+                return
+            bp = _CREATURE_DATA.get(creature_name, ("", "", ""))[2]
+            if not bp:
+                return
+            weight = weight_var.get().strip() or "1.0"
+            raw = (f'(NPCSpawnEntriesContainerClassString="{container}",'
+                   f'NPCSpawnEntries=((AnEntryName="{creature_name}",'
+                   f'EntryWeight={weight},'
+                   f'NPCsToSpawnStrings=("{bp}"))))')
+            display = f"{container}  \u2190  {creature_name} (w={weight})"
+            data.add(raw, display)
+            self._ini_visual_schedule_write(vk)
+
+        def remove_entry():
+            data.remove_selected()
+            self._ini_visual_schedule_write(vk)
+
+        ttk.Button(input_frm, text="Add", command=add_entry, width=6).grid(row=0, column=6)
+        ttk.Button(parent, text="Remove Selected", command=remove_entry).grid(
+            row=3, column=0, sticky="w", pady=(2, 0))
 
     def _ini_visual_scale_to_entry(self, scale_var: tk.DoubleVar, text_var: tk.StringVar,
                                    vk: str, vtype: str, step: float = 0.25) -> None:
@@ -5852,6 +6114,18 @@ class ServerManagerApp:
                         var.insert("1.0", "\n".join(vals))
                     continue
 
+                # --- SpawnListData (dropdown-based spawn editors) ---
+                if isinstance(var, _SpawnListData):
+                    doc = gus_doc if ini_file == "gus" else game_doc
+                    if doc is None:
+                        continue
+                    vals = doc.get_all_values(section, key)
+                    var.clear()
+                    for raw_val in vals:
+                        display = self._spawn_raw_to_display(key, raw_val)
+                        var.add(raw_val, display)
+                    continue
+
                 val_map = gus_map if ini_file == "gus" else game_map
                 current = val_map.get(section, {}).get(key, None)
 
@@ -5918,6 +6192,19 @@ class ServerManagerApp:
                         if line.lower().startswith(key.lower() + "="):
                             line = line[len(key) + 1:]
                         doc.append_kv(section, key, line)
+                if ini_file == "gus":
+                    gus_dirty = True
+                else:
+                    game_dirty = True
+                continue
+
+            # --- SpawnListData (dropdown-based spawn editors) ---
+            if isinstance(var, _SpawnListData):
+                doc.remove_all_kv(section, key)
+                for raw_val in var.entries:
+                    raw_val = raw_val.strip()
+                    if raw_val:
+                        doc.append_kv(section, key, raw_val)
                 if ini_file == "gus":
                     gus_dirty = True
                 else:
