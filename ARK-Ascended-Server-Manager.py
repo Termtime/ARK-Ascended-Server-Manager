@@ -1,4 +1,4 @@
-# ARK: Survival Ascended Dedicated Server Manager (Windows)
+﻿# ARK: Survival Ascended Dedicated Server Manager (Windows)
 from __future__ import annotations
 
 import base64
@@ -37,8 +37,22 @@ from tkinter import font as tkfont
 from tkinter import ttk
 import uuid
 
-from ark_creature_data import (_CREATURE_DATA, _CREATURE_NAMES_SORTED,
-                               _ENTITY_ID_TO_NAME, _NAMETAG_TO_NAMES)
+from data.ark_creature_data import (_CREATURE_DATA, _CREATURE_NAMES_SORTED,
+                                    _ENTITY_ID_TO_NAME, _NAMETAG_TO_NAMES)
+from data.ark_item_data import (_ITEM_DATA, _ITEM_NAMES_SORTED, _CLASS_TO_ITEM_NAME)
+from data.ark_harvest_data import (_HARVEST_RESOURCES, _HARVEST_NAMES_SORTED,
+                                    _HARVEST_CLASS_TO_NAME)
+from data.ini_settings import (
+    _STAT_NAMES, _SS, _GM,
+    INI_SETTINGS_GENERAL, INI_SETTINGS_CROPS,
+    INI_SETTINGS_DINOS, INI_SETTINGS_DINO_STATS,
+    INI_SETTINGS_PLAYERS, INI_SETTINGS_PLAYER_STATS,
+    INI_SETTINGS_MISC,
+    INI_SETTINGS_ENVIRONMENT, INI_SETTINGS_DINOS_FULL,
+    INI_SETTINGS_STRUCTURES, INI_SETTINGS_STACK_SIZE,
+    INI_SETTINGS_SERVER_OPTIONS, _SPAWN_ENTRY_KEYS,
+    _DINO_STAT_DEFAULTS,
+)
 
 try:
     import winreg  # type: ignore
@@ -558,7 +572,8 @@ def relaunch_as_admin() -> bool:
         return True
     try:
         exe = sys.executable  # type: ignore[name-defined]
-        params = " ".join([f'"{a}"' for a in sys.argv[1:]])  # type: ignore[name-defined]
+        script = os.path.abspath(sys.argv[0])  # type: ignore[name-defined]
+        params = f'"{script}" ' + " ".join([f'"{a}"' for a in sys.argv[1:]])  # type: ignore[name-defined]
         rc = ctypes.windll.shell32.ShellExecuteW(None, "runas", exe, params, None, 1)
         return int(rc) > 32
     except Exception:
@@ -1662,235 +1677,7 @@ def steamcmd_app_update(
             raise RuntimeError(f"SteamCMD failed (exit={code}). Last output:\n{tail}")
 
 # =============================================================================
-# INI Visual Editor – ASA Setting Definitions
-# =============================================================================
-# Each tuple: (ini_file, section, key, label, description, value_type, default, min, max[, step])
-# ini_file: "gus" = GameUserSettings.ini, "game" = Game.ini
-# value_type: "bool", "float", "int"
-# min/max only used for float/int sliders
-# step (optional 10th element): slider increment; defaults to 0.25 for float, 1 for int
-
-_STAT_NAMES = [
-    "Health", "Stamina", "Torpidity", "Oxygen", "Food",
-    "Water", "Temperature", "Weight", "Damage", "Speed",
-]
-
-_SS = "ServerSettings"
-_GM = "/Script/ShooterGame.ShooterGameMode"
-
-INI_SETTINGS_GENERAL: list = [
-    ("gus", _SS, "serverPVE", "PvE Mode", "Enable Player vs Environment mode.", "bool", "False", 0, 1),
-    ("gus", _SS, "DifficultyOffset", "Difficulty Offset", "Base difficulty (0.0–1.0). Affects creature levels.", "float", "1.0", 0.0, 1.0, 0.1),
-    ("gus", _SS, "OverrideOfficialDifficulty", "Override Official Difficulty", "Set to 5.0 to allow wild creatures up to level 150.", "float", "0.0", 0.0, 15.0, 0.5),
-    ("gus", _SS, "AllowCaveBuildingPvE", "Allow Cave Building (PvE)", "Allow structures inside caves in PvE.", "bool", "False", 0, 1),
-    ("gus", _SS, "AllowCaveBuildingPvP", "Allow Cave Building (PvP)", "Allow structures inside caves in PvP.", "bool", "True", 0, 1),
-    ("gus", _SS, "DayCycleSpeedScale", "Day Cycle Speed", "Overall day/night cycle speed. Lower = longer days.", "float", "1.0", 0.01, 10.0),
-    ("gus", _SS, "DayTimeSpeedScale", "Daytime Speed", "Speed of daytime relative to night.", "float", "1.0", 0.01, 10.0),
-    ("gus", _SS, "NightTimeSpeedScale", "Nighttime Speed", "Speed of nighttime relative to day.", "float", "1.0", 0.01, 10.0),
-    ("gus", _SS, "ShowMapPlayerLocation", "Show Map Player Location", "Show player position on the in-game map.", "bool", "True", 0, 1),
-    ("gus", _SS, "AllowThirdPersonPlayer", "Allow Third Person", "Let players use 3rd-person camera.", "bool", "True", 0, 1),
-    ("gus", _SS, "ServerCrosshair", "Server Crosshair", "Show crosshair for all players.", "bool", "True", 0, 1),
-    ("gus", _SS, "AllowHitMarkers", "Allow Hit Markers", "Show hit markers on damage.", "bool", "True", 0, 1),
-    ("gus", _SS, "AllowFlyerCarryPvE", "Flyer Carry (PvE)", "Allow flyers to pick up wild creatures in PvE.", "bool", "False", 0, 1),
-    ("gus", _SS, "PreventOfflinePvP", "Offline Raid Prevention", "Tribes offline become invulnerable.", "bool", "False", 0, 1),
-    ("gus", _SS, "ForceAllStructureLocking", "Force Structure Locking", "Default-lock all placed structures.", "bool", "False", 0, 1),
-    ("gus", _SS, "EnablePvPGamma", "Enable PvP Gamma", "Allow gamma adjustment in PvP.", "bool", "False", 0, 1),
-    ("gus", _SS, "DisablePvEGamma", "Disable PvE Gamma", "Prevent gamma command in PvE.", "bool", "False", 0, 1),
-    ("gus", _SS, "PreventTribeAlliances", "Prevent Tribe Alliances", "Block tribes from creating alliances.", "bool", "False", 0, 1),
-    ("gus", _SS, "PreventSpawnAnimations", "Skip Spawn Animations", "Skip wake-up animation on respawn.", "bool", "False", 0, 1),
-    ("gus", _SS, "RandomSupplyCratePoints", "Random Supply Drops", "Randomise supply drop locations.", "bool", "False", 0, 1),
-    ("gus", _SS, "DisableWeatherFog", "Disable Fog", "Remove weather fog effects.", "bool", "False", 0, 1),
-    ("gus", _SS, "NonPermanentDiseases", "Non-Permanent Diseases", "Diseases are lost on respawn.", "bool", "False", 0, 1),
-    ("gus", _SS, "globalVoiceChat", "Global Voice Chat", "Voice chat is heard server-wide.", "bool", "False", 0, 1),
-    ("gus", _SS, "ProximityChat", "Proximity Chat", "Only nearby players see text chat.", "bool", "False", 0, 1),
-    ("gus", _SS, "AutoSavePeriodMinutes", "Auto-Save Interval (min)", "Minutes between automatic world saves.", "float", "15.0", 1.0, 120.0, 1.0),
-    ("gus", _SS, "MaxTamedDinos", "Max Tamed Dinos (Server)", "Global cap on tamed creatures.", "int", "5000", 0, 20000, 100),
-    ("gus", _SS, "MaxPersonalTamedDinos", "Max Tamed Dinos (Tribe)", "Per-tribe creature cap (0 = unlimited).", "int", "0", 0, 5000, 50),
-    ("game", _GM, "bUseSingleplayerSettings", "Use Singleplayer Settings", "Apply boosted SP multipliers (breeding, XP, etc.).", "bool", "False", 0, 1),
-    ("game", _GM, "bDisableFriendlyFire", "Disable Friendly Fire", "Prevent damage to tribemates/tames/structures.", "bool", "False", 0, 1),
-]
-
-INI_SETTINGS_CROPS: list = [
-    ("game", _GM, "CropGrowthSpeedMultiplier", "Crop Growth Speed", "Scales speed of crop growth in plots.", "float", "1.0", 0.01, 20.0),
-    ("game", _GM, "CropDecaySpeedMultiplier", "Crop Decay Speed", "Scales speed of crop decay (higher = faster decay).", "float", "1.0", 0.01, 10.0),
-    ("game", _GM, "GlobalSpoilingTimeMultiplier", "Global Spoiling Time", "Scales spoiling of perishables (higher = longer).", "float", "1.0", 0.01, 20.0),
-    ("game", _GM, "GlobalItemDecompositionTimeMultiplier", "Item Decomposition Time", "Scales decomp time of dropped items/loot bags.", "float", "1.0", 0.01, 20.0),
-]
-
-INI_SETTINGS_DINOS: list = [
-    # -- Combat & General --
-    ("gus", _SS, "DinoDamageMultiplier", "Wild Dino Damage", "Scales damage dealt by wild creatures.", "float", "1.0", 0.01, 10.0),
-    ("gus", _SS, "DinoResistanceMultiplier", "Wild Dino Resistance", "Scales damage resistance of wild creatures.", "float", "1.0", 0.01, 10.0),
-    ("gus", _SS, "DinoCharacterFoodDrainMultiplier", "Dino Food Drain", "Scales how fast dinos consume food.", "float", "1.0", 0.01, 10.0),
-    ("gus", _SS, "DinoCharacterHealthRecoveryMultiplier", "Dino Health Recovery", "Scales passive health regen speed.", "float", "1.0", 0.01, 10.0),
-    ("gus", _SS, "DinoCharacterStaminaDrainMultiplier", "Dino Stamina Drain", "Scales stamina consumption rate.", "float", "1.0", 0.01, 10.0),
-    ("gus", _SS, "TamingSpeedMultiplier", "Taming Speed", "Higher = faster taming.", "float", "1.0", 0.1, 100.0, 1.0),
-    ("gus", _SS, "PreventMateBoost", "Prevent Mate Boost", "Disable creature mate-boost buff.", "bool", "False", 0, 1),
-    ("gus", _SS, "AllowAnyoneBabyImprintCuddle", "Anyone Can Imprint", "Any player can cuddle/imprint babies.", "bool", "False", 0, 1),
-    ("gus", _SS, "DisableImprintDinoBuff", "Disable Imprint Buff", "Remove rider imprint stat bonus.", "bool", "False", 0, 1),
-    ("gus", _SS, "AllowRaidDinoFeeding", "Allow Raid Dino Feeding", "Titanosaurs can be permanently fed.", "bool", "False", 0, 1),
-    # -- Respawn & Population --
-    ("gus", _SS, "DinoCountMultiplier", "Dino Count Multiplier",
-     "Scales the number of wild dinos that spawn on the map. Higher = more wild creatures.", "float", "1.0", 0.01, 5.0),
-    ("gus", _SS, "ServerAutoForceRespawnWildDinosInterval", "Auto Respawn Wild Dinos (s)",
-     "Seconds between automatic forced respawns of all wild dinos. 0 = disabled. "
-     "Helps refresh population on long-running servers.", "float", "0.0", 0.0, 86400.0, 60.0),
-    # -- Breeding --
-    ("game", _GM, "MatingIntervalMultiplier", "Mating Interval", "Scales time between matings (lower = faster).", "float", "1.0", 0.01, 10.0),
-    ("game", _GM, "MatingSpeedMultiplier", "Mating Speed", "Scales how fast mating completes.", "float", "1.0", 0.1, 50.0),
-    ("game", _GM, "EggHatchSpeedMultiplier", "Egg Hatch Speed", "Higher = eggs hatch faster.", "float", "1.0", 0.1, 100.0, 1.0),
-    ("game", _GM, "BabyMatureSpeedMultiplier", "Baby Mature Speed", "Higher = babies grow faster.", "float", "1.0", 0.1, 200.0, 1.0),
-    ("game", _GM, "BabyCuddleIntervalMultiplier", "Cuddle Interval",
-     "Scales time between imprint care requests (cuddle, walk, food). "
-     "Lower values = more frequent requests, faster imprinting.", "float", "1.0", 0.01, 10.0),
-    ("game", _GM, "BabyFoodConsumptionSpeedMultiplier", "Baby Food Consumption",
-     "Scales how fast baby dinos consume food from their inventory. "
-     "Higher values = faster drain, requiring more food during raising.", "float", "1.0", 0.01, 10.0),
-    ("game", _GM, "BabyImprintingStatScaleMultiplier", "Imprinting Stat Scale", "Scales stat bonus from imprinting.", "float", "1.0", 0.0, 10.0),
-    ("game", _GM, "BabyImprintAmountMultiplier", "Imprint Amount",
-     "Scales the imprint percentage gained per care event. Higher values mean fewer "
-     "cuddle/care events needed for 100% imprint.", "float", "1.0", 0.1, 50.0, 1.0),
-    ("game", _GM, "BabyCuddleGracePeriodMultiplier", "Cuddle Grace Period", "Time before imprint quality degrades.", "float", "1.0", 0.01, 10.0),
-    ("game", _GM, "BabyCuddleLoseImprintQualitySpeedMultiplier", "Imprint Loss Speed", "Speed imprint quality drops after grace.", "float", "1.0", 0.01, 10.0),
-    ("game", _GM, "LayEggIntervalMultiplier", "Lay Egg Interval", "Scales egg-laying frequency.", "float", "1.0", 0.01, 10.0),
-    # -- Speed Leveling --
-    ("game", _GM, "bAllowSpeedLeveling", "Allow Speed Leveling", "Let players/dinos level movement speed (ASA).", "bool", "False", 0, 1),
-    ("game", _GM, "bAllowFlyerSpeedLeveling", "Allow Flyer Speed Leveling", "Let flyers level movement speed.", "bool", "False", 0, 1),
-    ("game", _GM, "bUseDinoLevelUpAnimations", "Dino Level-Up Animation", "Play an animation on dino level-up.", "bool", "True", 0, 1),
-    ("game", _GM, "DestroyTamesOverLevelClamp", "Destroy Tames Over Level", "Delete tames above this level on restart (0 = off).", "int", "0", 0, 1000, 10),
-]
-
-# Defaults per the official wiki – stats 0 (Health) and 8 (Damage) differ.
-_DINO_STAT_DEFAULTS = {
-    #            Wild  Tamed  Add    Affinity
-    0:          (1.0,  0.2,   0.14,  0.44),   # Health
-    8:          (1.0,  0.17,  0.14,  0.44),   # Damage
-}
-
-INI_SETTINGS_DINO_STATS: list = []
-for _si, _sn in enumerate(_STAT_NAMES):
-    _wd, _td, _ad, _fd = _DINO_STAT_DEFAULTS.get(_si, (1.0, 1.0, 1.0, 1.0))
-    INI_SETTINGS_DINO_STATS.append(
-        ("game", _GM, f"PerLevelStatsMultiplier_DinoWild[{_si}]",
-         f"Wild {_sn}", f"Wild dino {_sn} gain per level.", "float",
-         str(_wd), 0.0, 10.0))
-    INI_SETTINGS_DINO_STATS.append(
-        ("game", _GM, f"PerLevelStatsMultiplier_DinoTamed[{_si}]",
-         f"Tamed {_sn}", f"Tamed dino {_sn} gain per level.", "float",
-         str(_td), 0.0, 10.0))
-    INI_SETTINGS_DINO_STATS.append(
-        ("game", _GM, f"PerLevelStatsMultiplier_DinoTamed_Add[{_si}]",
-         f"Tamed Add {_sn}",
-         f"Flat {_sn} bonus applied once when a wild creature is first tamed "
-         f"(additive, independent of taming effectiveness).", "float",
-         str(_ad), 0.0, 10.0))
-    INI_SETTINGS_DINO_STATS.append(
-        ("game", _GM, f"PerLevelStatsMultiplier_DinoTamed_Affinity[{_si}]",
-         f"Affinity {_sn}",
-         f"{_sn} bonus that scales with Taming Effectiveness (TE) \u2014 "
-         f"higher TE yields a larger bonus; this multiplier adjusts that bonus.", "float",
-         str(_fd), 0.0, 10.0))
-
-INI_SETTINGS_PLAYERS: list = [
-    ("gus", _SS, "PlayerDamageMultiplier", "Player Damage", "Scales damage dealt by players.", "float", "1.0", 0.01, 10.0),
-    ("gus", _SS, "PlayerResistanceMultiplier", "Player Resistance", "Scales damage resistance (higher = more damage taken).", "float", "1.0", 0.01, 10.0),
-    ("gus", _SS, "PlayerCharacterFoodDrainMultiplier", "Food Drain", "Scales food consumption rate.", "float", "1.0", 0.01, 10.0),
-    ("gus", _SS, "PlayerCharacterHealthRecoveryMultiplier", "Health Recovery", "Scales passive health regen.", "float", "1.0", 0.01, 10.0),
-    ("gus", _SS, "PlayerCharacterStaminaDrainMultiplier", "Stamina Drain", "Scales stamina consumption.", "float", "1.0", 0.01, 10.0),
-    ("gus", _SS, "PlayerCharacterWaterDrainMultiplier", "Water Drain", "Scales water consumption.", "float", "1.0", 0.01, 10.0),
-    ("gus", _SS, "XPMultiplier", "XP Multiplier", "Scales all experience gain.", "float", "1.0", 0.1, 100.0, 1.0),
-    ("gus", _SS, "HarvestAmountMultiplier", "Harvest Amount", "Scales resources gained per hit.", "float", "1.0", 0.1, 100.0, 1.0),
-    ("gus", _SS, "HarvestHealthMultiplier", "Harvest Health", "Scales health of harvestables (more hits = more yield).", "float", "1.0", 0.1, 20.0),
-    ("gus", _SS, "OxygenSwimSpeedStatMultiplier", "Oxygen Swim Speed", "Scales swim speed gained from Oxygen stat.", "float", "1.0", 0.0, 10.0),
-    ("game", _GM, "KillXPMultiplier", "Kill XP", "Scales XP from kills.", "float", "1.0", 0.1, 50.0),
-    ("game", _GM, "HarvestXPMultiplier", "Harvest XP", "Scales XP from harvesting.", "float", "1.0", 0.1, 50.0),
-    ("game", _GM, "CraftXPMultiplier", "Craft XP", "Scales XP from crafting.", "float", "1.0", 0.1, 50.0),
-    ("game", _GM, "GenericXPMultiplier", "Generic XP", "Scales XP from passive/time gain.", "float", "1.0", 0.1, 50.0),
-    ("game", _GM, "SpecialXPMultiplier", "Special XP", "Scales XP from special events.", "float", "1.0", 0.1, 50.0),
-    ("game", _GM, "bAllowUnlimitedRespecs", "Unlimited Respecs", "Allow Mindwipe Tonic without cooldown.", "bool", "False", 0, 1),
-]
-
-INI_SETTINGS_PLAYER_STATS: list = []
-for _si, _sn in enumerate(_STAT_NAMES):
-    INI_SETTINGS_PLAYER_STATS.append(
-        ("game", _GM, f"PerLevelStatsMultiplier_Player[{_si}]",
-         f"Player {_sn}", f"Player {_sn} gain per level.", "float",
-         "1.0", 0.0, 10.0))
-
-INI_SETTINGS_MISC: list = [
-    ("gus", _SS, "ItemStackSizeMultiplier", "Item Stack Size", "Scales default stack sizes.", "float", "1.0", 0.1, 50.0),
-    ("gus", _SS, "ResourcesRespawnPeriodMultiplier", "Resource Respawn Period", "Scales resource respawn timer.", "float", "1.0", 0.01, 10.0),
-    ("gus", _SS, "StructureResistanceMultiplier", "Structure Resistance", "Scales structure damage resistance.", "float", "1.0", 0.01, 10.0),
-    ("gus", _SS, "StructurePickupHoldDuration", "Pickup Hold Duration", "Seconds to hold for quick-pickup (0 = instant).", "float", "0.5", 0.0, 5.0),
-    ("gus", _SS, "StructurePickupTimeAfterPlacement", "Pickup Time After Place",
-     "Seconds after placing a structure during which pickup is still allowed. "
-     "After this window closes, the structure becomes permanent "
-     "(unless Always Allow Pickup is on). 0 = no pickup window.", "float", "30.0", 0.0, 600.0, 5.0),
-    ("gus", _SS, "TheMaxStructuresInRange", "Max Structures In Range", "Cap on structures in a coded radius.", "int", "10500", 100, 50000, 500),
-    ("gus", _SS, "PerPlatformMaxStructuresMultiplier", "Platform Struct Multiplier", "Scales max items on saddles/rafts.", "float", "1.0", 0.1, 10.0),
-    ("gus", _SS, "PlatformSaddleBuildAreaBoundsMultiplier", "Platform Build Area", "Scales platform saddle build range.", "float", "1.0", 0.1, 10.0),
-    ("gus", _SS, "AlwaysAllowStructurePickup", "Always Allow Pickup", "Structures can always be picked up.", "bool", "False", 0, 1),
-    ("gus", _SS, "ClampResourceHarvestDamage", "Clamp Harvest Damage", "Clamp harvest damage to resource health.", "bool", "False", 0, 1),
-    ("gus", _SS, "ClampItemSpoilingTimes", "Clamp Item Spoiling", "Prevent spoil timers going below base.", "bool", "False", 0, 1),
-    ("gus", _SS, "AllowMultipleAttachedC4", "Multiple C4 Attach", "Allow more than one C4 per creature.", "bool", "False", 0, 1),
-    ("gus", _SS, "DisableDinoDecayPvE", "Disable Dino Decay (PvE)", "Prevent tame auto-decay in PvE.", "bool", "False", 0, 1),
-    ("gus", _SS, "DisableStructureDecayPvE", "Disable Structure Decay (PvE)", "Prevent structure auto-decay in PvE.", "bool", "False", 0, 1),
-    ("gus", _SS, "DisableCryopodEnemyCheck", "Cryopod No Enemy Check", "Use cryopods when enemies nearby (ASA).", "bool", "False", 0, 1),
-    ("gus", _SS, "DisableCryopodFridgeRequirement", "Cryopod No Fridge", "Use cryopods without a cryofridge (ASA).", "bool", "False", 0, 1),
-    ("gus", _SS, "AllowCryoFridgeOnSaddle", "Cryofridge On Saddle", "Allow cryofridge on platform saddles (ASA).", "bool", "False", 0, 1),
-    ("gus", _SS, "MaxTrainCars", "Max Train Cars", "Max carts per train (ASA).", "int", "8", 1, 50),
-    ("game", _GM, "HairGrowthSpeedMultiplier", "Hair Growth Speed", "Scales hair growth.", "float", "1.0", 0.0, 10.0),
-    ("game", _GM, "PoopIntervalMultiplier", "Poop Interval", "Scales poop frequency (higher = less often).", "float", "1.0", 0.01, 10.0),
-    ("game", _GM, "CustomRecipeEffectivenessMultiplier", "Custom Recipe Effectiveness", "Scales custom recipe results.", "float", "1.0", 0.1, 10.0),
-    ("game", _GM, "CustomRecipeSkillMultiplier", "Custom Recipe Skill", "Scales crafting skill effect on recipes.", "float", "1.0", 0.1, 10.0),
-    ("game", _GM, "ResourceNoReplenishRadiusPlayers", "No-Replenish Radius (Players)", "Distance from players resources won't regrow.", "float", "1.0", 0.0, 5.0),
-    ("game", _GM, "ResourceNoReplenishRadiusStructures", "No-Replenish Radius (Structures)", "Distance from structures resources won't regrow.", "float", "1.0", 0.0, 5.0),
-    ("game", _GM, "LimitGeneratorsNum", "Generator Limit (Count)", "Max generators in range (ASA).", "int", "3", 0, 50),
-    ("game", _GM, "LimitGeneratorsRange", "Generator Limit (Range)", "Range in UE units for generator limit (ASA).", "int", "15000", 0, 100000, 1000),
-    ("game", _GM, "BaseHexagonRewardMultiplier", "Hexagon Reward Multiplier", "Scales mission/club hex rewards.", "float", "1.0", 0.1, 50.0),
-    ("game", _GM, "HexagonCostMultiplier", "Hexagon Cost Multiplier", "Scales hex store/club item costs.", "float", "1.0", 0.1, 50.0),
-    ("game", _GM, "PhotoModeRangeLimit", "Photo Mode Range", "Max camera distance in photo mode (ASA).", "int", "3000", 0, 50000, 500),
-    ("game", _GM, "bDisablePhotoMode", "Disable Photo Mode", "Completely disable photo mode (ASA).", "bool", "False", 0, 1),
-    ("gus", _SS, "TribeNameChangeCooldown", "Tribe Rename Cooldown (min)", "Minutes between tribe name changes.", "float", "15.0", 0.0, 10080.0, 5.0),
-    ("gus", _SS, "ImplantSuicideCD", "Implant Respawn Cooldown (s)", "Seconds between implant respawns (ASA).", "float", "28800.0", 0.0, 86400.0, 300.0),
-    ("gus", _SS, "RCONServerGameLogBuffer", "RCON Log Buffer", "Lines kept in RCON game log buffer.", "int", "600", 0, 5000, 50),
-]
-
-# Spawn customization keys – complex multi-value entries edited via text areas.
-# Each tuple: (ini_file, section, key, title, description)
-_SPAWN_ENTRY_KEYS: list = [
-    ("game", _GM, "NPCReplacements",
-     "NPC Replacements",
-     "Replace one dino species with another (or disable it with an empty ToClassName).\n"
-     "Syntax: (FromClassName=\"Dino_Character_BP_C\",ToClassName=\"NewDino_Character_BP_C\")\n"
-     "To disable a dino: (FromClassName=\"Dino_Character_BP_C\",ToClassName=\"\")"),
-    ("game", _GM, "DinoSpawnWeightMultipliers",
-     "Dino Spawn Weight Multipliers",
-     "Adjust spawn rates and caps for specific dinos.\n"
-     "Syntax: (DinoNameTag=<Tag>,SpawnWeightMultiplier=<X>,OverrideSpawnLimitPercentage=true,"
-     "SpawnLimitPercentage=<Y>)"),
-    ("game", _GM, "ConfigSubtractNPCSpawnEntriesContainer",
-     "Remove NPC Spawn Entries",
-     "Remove specific dinos from a spawn container.\n"
-     "Syntax: (NPCSpawnEntriesContainerClassString=\"<ContainerID>\","
-     "NPCSpawnEntries=((AnEntryName=\"Remove\",EntryWeight=1.0,"
-     "NPCsToSpawnStrings=(\"Dino_Character_BP_C\"))))"),
-    ("game", _GM, "ConfigAddNPCSpawnEntriesContainer",
-     "Add NPC Spawn Entries",
-     "Add custom dinos to an existing spawn container.\n"
-     "Syntax: (NPCSpawnEntriesContainerClassString=\"<ContainerID>\","
-     "NPCSpawnEntries=((AnEntryName=\"Add\",EntryWeight=1.0,"
-     "NPCsToSpawnStrings=(\"Dino_Character_BP_C\"))))"),
-    ("game", _GM, "ConfigOverrideNPCSpawnEntriesContainer",
-     "Override NPC Spawn Entries",
-     "Completely replace all spawn entries of a container.\n"
-     "Syntax: (NPCSpawnEntriesContainerClassString=\"<ContainerID>\","
-     "NPCSpawnEntries=((AnEntryName=\"Override\",EntryWeight=1.0,"
-     "NPCsToSpawnStrings=(\"Dino_Character_BP_C\"))))"),
-]
-
-# =============================================================================
-# Creature wiki data — see ark_creature_data.py
+# INI Visual Editor
 # =============================================================================
 
 class _SpawnListData:
@@ -4027,7 +3814,6 @@ class ServerManagerApp:
         self.var_ini_add_key = tk.StringVar(master=m)
         self.var_ini_add_value = tk.StringVar(master=m)
 
-        # Visual INI editor controls – populated at build time
         self._ini_visual_vars: Dict[str, tk.Variable] = {}   # "gus|section|key" -> Variable
         self._ini_visual_debounce_id: Optional[str] = None
         self._ini_visual_loading: bool = False                # guard against feedback loops
@@ -4462,7 +4248,6 @@ class ServerManagerApp:
         self.ini_sub_nb = ttk.Notebook(self.tab_ini)
         self.ini_sub_nb.grid(row=0, column=0, sticky="nsew")
 
-        # -- Sub-tab: Raw Editor --
         raw_tab = ttk.Frame(self.ini_sub_nb, padding=6)
         self.ini_sub_nb.add(raw_tab, text="Raw Editor")
         raw_tab.columnconfigure(0, weight=2)
@@ -4562,13 +4347,13 @@ class ServerManagerApp:
         ttk.Button(add_btns, text="Append Line (duplicate keys allowed)", command=self._ini_append_line).grid(row=0, column=0, padx=(0, 8))
         ttk.Button(add_btns, text="Set/Replace First Occurrence", command=self._ini_set_line).grid(row=0, column=1)
 
-        # -- Sub-tab: Visual config sections (General, Crops, Dinosaurs, Players, Misc) --
         visual_sections = [
-            ("General", INI_SETTINGS_GENERAL, None, None),
-            ("Crops & Spoiling", INI_SETTINGS_CROPS, None, None),
-            ("Dinosaurs", INI_SETTINGS_DINOS, INI_SETTINGS_DINO_STATS, _SPAWN_ENTRY_KEYS),
-            ("Players", INI_SETTINGS_PLAYERS, INI_SETTINGS_PLAYER_STATS, None),
-            ("Misc / Structures", INI_SETTINGS_MISC, None, None),
+            ("Environment", INI_SETTINGS_ENVIRONMENT, None, None),
+            ("Dino Settings", INI_SETTINGS_DINOS_FULL, INI_SETTINGS_DINO_STATS, _SPAWN_ENTRY_KEYS),
+            ("Player Settings", INI_SETTINGS_PLAYERS, INI_SETTINGS_PLAYER_STATS, None),
+            ("Structures", INI_SETTINGS_STRUCTURES, None, None),
+            ("Stack Size Overrides", INI_SETTINGS_STACK_SIZE, None, None),
+            ("Server Options", INI_SETTINGS_SERVER_OPTIONS, None, None),
         ]
 
         for tab_label, settings_list, stats_list, spawn_keys in visual_sections:
@@ -4577,7 +4362,6 @@ class ServerManagerApp:
             vtab.columnconfigure(0, weight=1)
             vtab.rowconfigure(1, weight=1)
 
-            # Load / status bar at top
             vbar = ttk.Frame(vtab)
             vbar.grid(row=0, column=0, sticky="ew", pady=(0, 4))
             vbar.columnconfigure(2, weight=1)
@@ -4588,7 +4372,6 @@ class ServerManagerApp:
             ttk.Label(vbar, text="Load both INI files to enable all settings. Changes auto-save to staging.",
                       foreground=theme["muted"]).grid(row=0, column=2, sticky="w", padx=6)
 
-            # Scrollable content area
             canvas = tk.Canvas(vtab, highlightthickness=0, background=theme["bg"])
             vscroll = ttk.Scrollbar(vtab, orient="vertical", command=canvas.yview)
             inner = ttk.Frame(canvas, padding=6)
@@ -4602,7 +4385,6 @@ class ServerManagerApp:
             canvas.grid(row=1, column=0, sticky="nsew")
             vscroll.grid(row=1, column=1, sticky="ns")
 
-            # Bind mouse wheel to canvas scrolling
             def _on_mousewheel(event, c=canvas):
                 c.yview_scroll(int(-1 * (event.delta / 120)), "units")
 
@@ -4617,18 +4399,16 @@ class ServerManagerApp:
 
             row_i = 0
 
-            # Build controls for main settings
             row_i = self._ini_visual_build_settings(inner, settings_list, row_i, theme)
-
-            # Build per-level stat tables if present
             if stats_list:
                 row_i = self._ini_visual_build_stats_table(inner, stats_list, row_i, theme)
-
-            # Build spawn customization text areas if present
             if spawn_keys:
                 row_i = self._ini_visual_build_spawn_section(inner, spawn_keys, row_i, theme)
+            if tab_label == "Stack Size Overrides":
+                row_i = self._ini_visual_build_stack_size_table(inner, row_i, theme)
+            if tab_label == "Environment":
+                row_i = self._ini_visual_build_harvest_table(inner, row_i, theme)
 
-        # Wire sub-notebook tab changes to refresh visual controls
         self.ini_sub_nb.bind("<<NotebookTabChanged>>", lambda e: self._ini_visual_refresh_all())
 
         # ---------------- Console (bottom) ----------------
@@ -5631,52 +5411,51 @@ class ServerManagerApp:
             step = s[9] if len(s) > 9 else (0.25 if vtype == "float" else 1)
             vk = self._ini_visual_var_key(ini_file, section, key)
 
-            frm = ttk.Frame(parent)
-            frm.grid(row=row, column=0, sticky="ew", pady=2, padx=2)
-            frm.columnconfigure(1, weight=1)
+            frame = ttk.Frame(parent)
+            frame.grid(row=row, column=0, sticky="ew", pady=2, padx=2)
+            frame.columnconfigure(1, weight=1)
 
             if vtype == "bool":
                 var = tk.BooleanVar(master=m, value=(default.lower() == "true"))
                 self._ini_visual_vars[vk] = var
-                cb = ttk.Checkbutton(frm, text=label, variable=var,
+                cb = ttk.Checkbutton(frame, text=label, variable=var,
                                      command=lambda _vk=vk: self._ini_visual_on_change(_vk))
                 cb.grid(row=0, column=0, columnspan=2, sticky="w")
-                ttk.Label(frm, text=desc, foreground=theme["muted"],
+                ttk.Label(frame, text=desc, foreground=theme["muted"],
                           wraplength=600).grid(row=1, column=0, columnspan=2, sticky="w", padx=(20, 0))
             elif vtype == "float":
                 var = tk.StringVar(master=m, value=default)
                 self._ini_visual_vars[vk] = var
-                ttk.Label(frm, text=label, width=28, anchor="w").grid(row=0, column=0, sticky="w")
-                entry = ttk.Entry(frm, textvariable=var, width=14)
+                ttk.Label(frame, text=label, width=28, anchor="w").grid(row=0, column=0, sticky="w")
+                entry = ttk.Entry(frame, textvariable=var, width=14)
                 entry.grid(row=0, column=1, sticky="w", padx=(4, 4))
                 scale_var = tk.DoubleVar(master=m, value=float(default))
-                scale = ttk.Scale(frm, variable=scale_var, from_=lo, to=hi,
+                scale = ttk.Scale(frame, variable=scale_var, from_=lo, to=hi,
                                   command=lambda v, sv=scale_var, tv=var, _vk=vk, _st=step:
                                   self._ini_visual_scale_to_entry(sv, tv, _vk, "float", _st))
                 scale.grid(row=0, column=2, sticky="ew", padx=(0, 4))
-                frm.columnconfigure(2, weight=1)
-                # Keep a ref to the scale var for reverse sync
+                frame.columnconfigure(2, weight=1)
                 self._ini_visual_vars[vk + "|scale"] = scale_var
                 entry.bind("<KeyRelease>", lambda e, sv=scale_var, tv=var, _vk=vk:
                            self._ini_visual_entry_to_scale(tv, sv, _vk))
-                ttk.Label(frm, text=desc, foreground=theme["muted"],
+                ttk.Label(frame, text=desc, foreground=theme["muted"],
                           wraplength=600).grid(row=1, column=0, columnspan=3, sticky="w", padx=(4, 0))
             elif vtype == "int":
                 var = tk.StringVar(master=m, value=default)
                 self._ini_visual_vars[vk] = var
-                ttk.Label(frm, text=label, width=28, anchor="w").grid(row=0, column=0, sticky="w")
-                entry = ttk.Entry(frm, textvariable=var, width=14)
+                ttk.Label(frame, text=label, width=28, anchor="w").grid(row=0, column=0, sticky="w")
+                entry = ttk.Entry(frame, textvariable=var, width=14)
                 entry.grid(row=0, column=1, sticky="w", padx=(4, 4))
                 scale_var = tk.DoubleVar(master=m, value=float(default))
-                scale = ttk.Scale(frm, variable=scale_var, from_=lo, to=hi,
+                scale = ttk.Scale(frame, variable=scale_var, from_=lo, to=hi,
                                   command=lambda v, sv=scale_var, tv=var, _vk=vk, _st=step:
                                   self._ini_visual_scale_to_entry(sv, tv, _vk, "int", _st))
                 scale.grid(row=0, column=2, sticky="ew", padx=(0, 4))
-                frm.columnconfigure(2, weight=1)
+                frame.columnconfigure(2, weight=1)
                 self._ini_visual_vars[vk + "|scale"] = scale_var
                 entry.bind("<KeyRelease>", lambda e, sv=scale_var, tv=var, _vk=vk:
                            self._ini_visual_entry_to_scale(tv, sv, _vk))
-                ttk.Label(frm, text=desc, foreground=theme["muted"],
+                ttk.Label(frame, text=desc, foreground=theme["muted"],
                           wraplength=600).grid(row=1, column=0, columnspan=3, sticky="w", padx=(4, 0))
 
             row += 1
@@ -5697,13 +5476,7 @@ class ServerManagerApp:
         grid_frame = ttk.Frame(parent)
         grid_frame.grid(row=start_row, column=0, sticky="ew", padx=4, pady=4)
 
-        # Settings are already in repeating groups of 4 per stat (wild/tamed/add/affinity)
-        # or 1 per stat (player). Determine mode by checking key patterns.
-        per_stat_count = 0
-        for s in stats:
-            if "[0]" in s[2]:
-                per_stat_count += 1
-        # If 4 entries per stat -> dino table; if 1 -> player table
+        per_stat_count = sum(1 for s in stats if "[0]" in s[2])
         is_dino = per_stat_count >= 4
 
         if is_dino:
@@ -5743,7 +5516,6 @@ class ServerManagerApp:
                     ent.grid(row=si + data_row_offset, column=gi + 1, padx=2, pady=1)
                     ent.bind("<KeyRelease>", lambda e, _vk=vk: self._ini_visual_schedule_write(_vk))
         else:
-            # Player stats – 2-column layout
             headers = ["Stat", "Multiplier"]
             for ci, h in enumerate(headers):
                 ttk.Label(grid_frame, text=h, font=("", 9, "bold")).grid(
@@ -5769,12 +5541,285 @@ class ServerManagerApp:
         return start_row
 
     # -----------------------------------------------------------------
-    # Spawn-entry display helpers
+    # Stack Size Override table builder
     # -----------------------------------------------------------------
+    def _ini_visual_build_stack_size_table(self, parent: ttk.Frame,
+                                           start_row: int, theme: dict) -> int:
+        """Build a table for ConfigOverrideItemMaxQuantity entries with item picker."""
+        sep = ttk.Separator(parent, orient="horizontal")
+        sep.grid(row=start_row, column=0, sticky="ew", pady=(10, 4))
+        start_row += 1
+
+        ttk.Label(parent, text="Per-Item Stack Size Overrides", font=("", 10, "bold")).grid(
+            row=start_row, column=0, sticky="w", padx=4)
+        start_row += 1
+
+        ttk.Label(parent, text=(
+            "Override stack sizes for individual items. "
+            "Select an item from the dropdown, set the max quantity, "
+            "and whether to ignore the global stack multiplier."),
+            foreground=theme["muted"], wraplength=700).grid(
+            row=start_row, column=0, sticky="w", padx=4, pady=(0, 6))
+        start_row += 1
+
+        vk = self._ini_visual_var_key("game", _GM, "ConfigOverrideItemMaxQuantity")
+
+        frame = ttk.Frame(parent)
+        frame.grid(row=start_row, column=0, sticky="ew", padx=2, pady=4)
+        frame.columnconfigure(0, weight=1)
+
+        # Input row
+        input_frame = ttk.Frame(frame)
+        input_frame.grid(row=0, column=0, sticky="ew", pady=(0, 4))
+
+        ttk.Label(input_frame, text="Item:").grid(row=0, column=0, padx=(0, 4))
+        item_cb = ttk.Combobox(input_frame, values=_ITEM_NAMES_SORTED, width=32)
+        item_cb.grid(row=0, column=1, padx=(0, 8))
+        self._make_searchable_cb(item_cb, list(_ITEM_NAMES_SORTED))
+
+        ttk.Label(input_frame, text="Max Qty:").grid(row=0, column=2, padx=(0, 4))
+        qty_var = tk.StringVar(value="100")
+        ttk.Entry(input_frame, textvariable=qty_var, width=8).grid(row=0, column=3, padx=(0, 8))
+
+        ttk.Label(input_frame, text="Ignore Multiplier:").grid(row=0, column=4, padx=(0, 4))
+        ignore_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(input_frame, variable=ignore_var).grid(row=0, column=5, padx=(0, 8))
+
+        # Listbox for entries
+        list_frame = ttk.Frame(frame)
+        list_frame.grid(row=1, column=0, sticky="ew", pady=(2, 2))
+        list_frame.columnconfigure(0, weight=1)
+
+        lb = tk.Listbox(list_frame, height=8, font=("Consolas", 9))
+        lb.grid(row=0, column=0, sticky="ew")
+        sb = ttk.Scrollbar(list_frame, orient="vertical", command=lb.yview)
+        sb.grid(row=0, column=1, sticky="ns")
+        lb.configure(yscrollcommand=sb.set)
+
+        data = _SpawnListData(lb)
+        self._ini_visual_vars[vk] = data
+
+        def _refresh_listbox():
+            lb.delete(0, "end")
+            for raw in data.entries:
+                display = self._stack_raw_to_display(raw)
+                lb.insert("end", display)
+
+        def add_entry():
+            item_name = item_cb.get().strip()
+            if not item_name:
+                return
+            item_info = _ITEM_DATA.get(item_name)
+            if item_info:
+                item_cls = item_info[0]
+            else:
+                item_cls = item_name  # allow raw class name as fallback
+            qty = qty_var.get().strip() or "100"
+            ignore = "true" if ignore_var.get() else "false"
+            raw = (f'(ItemClassString="{item_cls}",'
+                   f'Quantity=(MaxItemQuantity={qty},bIgnoreMultiplier={ignore}))')
+            data.add(raw, self._stack_raw_to_display(raw))
+            self._ini_visual_schedule_write(vk)
+
+        def remove_entry():
+            sel = lb.curselection()
+            if not sel:
+                return
+            for s in reversed(sel):
+                if s < len(data.entries):
+                    del data.entries[s]
+            _refresh_listbox()
+            self._ini_visual_schedule_write(vk)
+
+        ttk.Button(input_frame, text="Add", command=add_entry, width=6).grid(row=0, column=6)
+        ttk.Button(frame, text="Remove Selected", command=remove_entry).grid(
+            row=2, column=0, sticky="w", pady=(2, 0))
+
+        start_row += 1
+        return start_row
+
+    def _ini_visual_build_harvest_table(self, parent: ttk.Frame,
+                                        start_row: int, theme: dict) -> int:
+        """Build a table for HarvestResourceItemAmountClassMultipliers entries."""
+        sep = ttk.Separator(parent, orient="horizontal")
+        sep.grid(row=start_row, column=0, sticky="ew", pady=(10, 4))
+        start_row += 1
+
+        ttk.Label(parent, text="Custom Harvest Amount Multipliers", font=("", 10, "bold")).grid(
+            row=start_row, column=0, sticky="w", padx=4)
+        start_row += 1
+
+        ttk.Label(parent, text=(
+            "Override harvest multipliers for individual resources. "
+            "Click a row and use the slider or enter a value to change the multiplier. "
+            "Resources at 1.0x are not written to the INI."),
+            foreground=theme["muted"], wraplength=700).grid(
+            row=start_row, column=0, sticky="w", padx=4, pady=(0, 6))
+        start_row += 1
+
+        vk = self._ini_visual_var_key("game", _GM, "HarvestResourceItemAmountClassMultipliers")
+
+        frame = ttk.Frame(parent)
+        frame.grid(row=start_row, column=0, sticky="nsew", padx=2, pady=4)
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(1, weight=1)
+
+        # Filter row
+        filter_frame = ttk.Frame(frame)
+        filter_frame.grid(row=0, column=0, sticky="ew", pady=(0, 4))
+        ttk.Label(filter_frame, text="Search:").pack(side="left", padx=(0, 4))
+        filter_var = tk.StringVar()
+        ttk.Entry(filter_frame, textvariable=filter_var, width=30).pack(side="left", padx=(0, 8))
+        ttk.Label(filter_frame, text="Only modified:").pack(side="left", padx=(0, 4))
+        modified_only_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(filter_frame, variable=modified_only_var).pack(side="left")
+
+        # Treeview table
+        tree_frame = ttk.Frame(frame)
+        tree_frame.grid(row=1, column=0, sticky="nsew")
+        tree_frame.columnconfigure(0, weight=1)
+        tree_frame.rowconfigure(0, weight=1)
+
+        columns = ("multiplier",)
+        tree = ttk.Treeview(tree_frame, columns=columns, show="tree headings",
+                            height=12, selectmode="browse")
+        tree.heading("#0", text="Resource", anchor="w")
+        tree.heading("multiplier", text="Multiplier", anchor="center")
+        tree.column("#0", width=350, minwidth=200)
+        tree.column("multiplier", width=100, minwidth=80, anchor="center")
+
+        vsb = ttk.Scrollbar(tree_frame, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=vsb.set)
+        tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+
+        # State: resource_name -> multiplier
+        harvest_state: dict[str, float] = {}
+        for name in _HARVEST_NAMES_SORTED:
+            harvest_state[name] = 1.0
+
+        self._harvest_tree = tree
+        self._ini_visual_vars[vk] = harvest_state
+
+        def _populate_tree(*_args):
+            tree.delete(*tree.get_children())
+            ft = filter_var.get().lower()
+            show_modified = modified_only_var.get()
+            for name in _HARVEST_NAMES_SORTED:
+                if ft and ft not in name.lower():
+                    continue
+                mult = harvest_state.get(name, 1.0)
+                if show_modified and abs(mult - 1.0) < 0.001:
+                    continue
+                tree.insert("", "end", iid=name, text=name,
+                            values=(f"{mult:.2f}x",))
+
+        _populate_tree()
+        filter_var.trace_add("write", _populate_tree)
+        modified_only_var.trace_add("write", lambda *a: _populate_tree())
+
+        # Edit controls below tree
+        edit_frame = ttk.Frame(frame)
+        edit_frame.grid(row=2, column=0, sticky="ew", pady=(4, 0))
+
+        ttk.Label(edit_frame, text="Selected:").pack(side="left", padx=(0, 4))
+        sel_label = ttk.Label(edit_frame, text="(none)", width=30, anchor="w")
+        sel_label.pack(side="left", padx=(0, 8))
+
+        ttk.Label(edit_frame, text="Multiplier:").pack(side="left", padx=(0, 4))
+        mult_var = tk.DoubleVar(value=1.0)
+        mult_entry = ttk.Entry(edit_frame, textvariable=mult_var, width=8)
+        mult_entry.pack(side="left", padx=(0, 4))
+
+        mult_scale = ttk.Scale(edit_frame, from_=0.0, to=10.0, variable=mult_var,
+                               orient="horizontal", length=200)
+        mult_scale.pack(side="left", padx=(0, 8))
+
+        _current_selection = [None]
+        _snapping = [False]
+
+        def _on_tree_select(event=None):
+            sel = tree.selection()
+            if not sel:
+                return
+            name = sel[0]
+            _current_selection[0] = name
+            sel_label.configure(text=name)
+            mult_var.set(harvest_state.get(name, 1.0))
+
+        tree.bind("<<TreeviewSelect>>", _on_tree_select)
+
+        def _on_mult_change(*_args):
+            if _snapping[0]:
+                return
+            name = _current_selection[0]
+            if not name:
+                return
+            try:
+                val = round(round(mult_var.get() / 0.25) * 0.25, 2)
+            except (ValueError, tk.TclError):
+                return
+            harvest_state[name] = val
+            if tree.exists(name):
+                tree.item(name, values=(f"{val:.2f}x",))
+            _snapping[0] = True
+            mult_var.set(val)
+            _snapping[0] = False
+            self._ini_visual_schedule_write(vk)
+
+        mult_var.trace_add("write", _on_mult_change)
+
+        def _apply_to_all():
+            """Set all visible resources to the current multiplier."""
+            try:
+                val = round(round(mult_var.get() / 0.25) * 0.25, 2)
+            except (ValueError, tk.TclError):
+                return
+            for item_id in tree.get_children():
+                harvest_state[item_id] = val
+                tree.item(item_id, values=(f"{val:.2f}x",))
+            self._ini_visual_schedule_write(vk)
+
+        ttk.Button(edit_frame, text="Apply to visible", command=_apply_to_all).pack(
+            side="left", padx=(8, 0))
+
+        def _reset_all():
+            """Reset all resources to 1.0x."""
+            for name in harvest_state:
+                harvest_state[name] = 1.0
+            _populate_tree()
+            self._ini_visual_schedule_write(vk)
+
+        ttk.Button(edit_frame, text="Reset all", command=_reset_all).pack(
+            side="left", padx=(4, 0))
+
+        start_row += 1
+        return start_row
+
+    @staticmethod
+    def _stack_raw_to_display(raw: str) -> str:
+        """Convert a raw ConfigOverrideItemMaxQuantity value to display text."""
+        m_item = re.search(r'ItemClassString="([^"]*)"', raw)
+        m_qty = re.search(r'MaxItemQuantity=(\d+)', raw)
+        m_ignore = re.search(r'bIgnoreMultiplier=(true|false)', raw, re.IGNORECASE)
+        cls = m_item.group(1) if m_item else "?"
+        item = _CLASS_TO_ITEM_NAME.get(cls, cls)
+        qty = m_qty.group(1) if m_qty else "?"
+        ignore = m_ignore.group(1).lower() if m_ignore else "false"
+        return f"{item}  qty={qty}  ignore={ignore}"
+
     @staticmethod
     def _spawn_raw_to_display(key: str, raw: str) -> str:
         """Convert a raw INI spawn value to a human-readable display string."""
-        if key == "NPCReplacements":
+        if key == "ConfigOverrideItemMaxQuantity":
+            m_item = re.search(r'ItemClassString="([^"]*)"', raw)
+            m_qty = re.search(r'MaxItemQuantity=(\d+)', raw)
+            m_ignore = re.search(r'bIgnoreMultiplier=(true|false)', raw, re.IGNORECASE)
+            item = m_item.group(1) if m_item else "?"
+            qty = m_qty.group(1) if m_qty else "?"
+            ignore = m_ignore.group(1).lower() if m_ignore else "false"
+            return f"{item}  qty={qty}  ignore={ignore}"
+        elif key == "NPCReplacements":
             m = re.search(r'FromClassName="([^"]*)".*?ToClassName="([^"]*)"', raw)
             if m:
                 from_id, to_id = m.group(1), m.group(2)
@@ -5804,227 +5849,220 @@ class ServerManagerApp:
             return f"{container}  \u2190  ..."
         return raw[:80]
 
-    # -----------------------------------------------------------------
-    # Spawn section builder (dropdown-based UI)
-    # -----------------------------------------------------------------
     def _ini_visual_build_spawn_section(self, parent: ttk.Frame, spawn_keys: list,
                                         start_row: int, theme: dict) -> int:
-        """Build dropdown-based editors for spawn customization INI entries."""
+        """Build a dino replacement table showing all creatures with spawnable/tameable toggles."""
         sep = ttk.Separator(parent, orient="horizontal")
         sep.grid(row=start_row, column=0, sticky="ew", pady=(10, 4))
         start_row += 1
 
-        hdr_frm = ttk.Frame(parent)
-        hdr_frm.grid(row=start_row, column=0, sticky="w", padx=4)
-        ttk.Label(hdr_frm, text="Spawn Customization", font=("", 10, "bold")).pack(side="left")
-        ttk.Label(hdr_frm, text="  BETA", font=("", 8, "bold"),
-                  foreground="#e07b00").pack(side="left", pady=(2, 0))
+        ttk.Label(parent, text="Dino Spawn Control", font=("", 10, "bold")).grid(
+            row=start_row, column=0, sticky="w", padx=4)
         start_row += 1
 
-        note = ttk.Label(
-            parent,
-            text="Use dropdowns to select creatures, then click Add. "
-                 "Select an entry and click Remove to delete it. Changes auto-save to staging.",
-            foreground=theme["muted"], wraplength=700)
-        note.grid(row=start_row, column=0, sticky="w", padx=4, pady=(0, 6))
+        ttk.Label(parent, text=(
+            "Control which creatures can spawn, be tamed, or be replaced. "
+            "Uncheck Spawnable to disable a creature via NPCReplacements. "
+            "Uncheck Tameable to prevent taming via PreventDinoTameClassNames. "
+            "Use Replace With to swap a creature for another."),
+            foreground=theme["muted"], wraplength=700).grid(
+            row=start_row, column=0, sticky="w", padx=4, pady=(0, 6))
         start_row += 1
 
-        for ini_file, section, key, title, desc in spawn_keys:
-            vk = self._ini_visual_var_key(ini_file, section, key)
+        vk_spawn = self._ini_visual_var_key("game", _GM, "NPCReplacements")
+        vk_tame = self._ini_visual_var_key("game", _GM, "PreventDinoTameClassNames")
 
-            frm = ttk.LabelFrame(parent, text=title, padding=6)
-            frm.grid(row=start_row, column=0, sticky="ew", pady=4, padx=2)
-            frm.columnconfigure(0, weight=1)
+        # Container frame
+        frame = ttk.Frame(parent)
+        frame.grid(row=start_row, column=0, sticky="nsew", padx=2, pady=4)
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(1, weight=1)
 
-            ttk.Label(frm, text=desc, foreground=theme["muted"],
-                      wraplength=680, justify="left").grid(row=0, column=0, sticky="w", columnspan=2)
+        # Search filter
+        filter_frame = ttk.Frame(frame)
+        filter_frame.grid(row=0, column=0, sticky="ew", pady=(0, 4))
+        ttk.Label(filter_frame, text="Search:").pack(side="left", padx=(0, 4))
+        filter_var = tk.StringVar()
+        ttk.Entry(filter_frame, textvariable=filter_var, width=30).pack(side="left", padx=(0, 8))
+        ttk.Label(filter_frame, text="Only modified:").pack(side="left", padx=(0, 4))
+        modified_only_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(filter_frame, variable=modified_only_var).pack(side="left")
 
-            if key == "NPCReplacements":
-                self._build_spawn_npc_replacements(frm, vk, key)
-            elif key == "DinoSpawnWeightMultipliers":
-                self._build_spawn_weight_multipliers(frm, vk, key)
-            else:
-                self._build_spawn_container_op(frm, vk, key)
+        # Treeview table
+        tree_frame = ttk.Frame(frame)
+        tree_frame.grid(row=1, column=0, sticky="nsew")
+        tree_frame.columnconfigure(0, weight=1)
+        tree_frame.rowconfigure(0, weight=1)
 
-            start_row += 1
+        columns = ("spawnable", "tameable", "replace_with")
+        tree = ttk.Treeview(tree_frame, columns=columns, show="tree headings",
+                            height=15, selectmode="browse")
+        tree.heading("#0", text="Creature", anchor="w")
+        tree.heading("spawnable", text="Spawnable", anchor="center")
+        tree.heading("tameable", text="Tameable", anchor="center")
+        tree.heading("replace_with", text="Replace With", anchor="w")
+        tree.column("#0", width=250, minwidth=150)
+        tree.column("spawnable", width=80, minwidth=70, anchor="center")
+        tree.column("tameable", width=80, minwidth=70, anchor="center")
+        tree.column("replace_with", width=200, minwidth=120, anchor="w")
 
+        vsb = ttk.Scrollbar(tree_frame, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=vsb.set)
+        tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+
+        # Track state: creature_name -> {spawnable, tameable, replace_with}
+        spawn_state: dict[str, dict] = {}
+        for name in _CREATURE_NAMES_SORTED:
+            spawn_state[name] = {"spawnable": True, "tameable": True, "replace_with": ""}
+
+        # Store references
+        self._dino_spawn_tree = tree
+        self._dino_spawn_state = spawn_state
+        self._dino_spawn_vk = vk_spawn
+        self._dino_spawn_vk_tame = vk_tame
+        self._ini_visual_vars[vk_spawn] = spawn_state
+        self._ini_visual_vars[vk_tame] = spawn_state  # same dict, keyed by both
+
+        creature_names_with_empty = [""] + list(_CREATURE_NAMES_SORTED)
+
+        def _row_values(name: str):
+            st = spawn_state.get(name, {"spawnable": True, "tameable": True, "replace_with": ""})
+            sp = "\u2611" if st["spawnable"] else "\u2610"
+            tm = "\u2611" if st["tameable"] else "\u2610"
+            rw = st["replace_with"] if st["replace_with"] else ""
+            return (sp, tm, rw)
+
+        def _populate_tree(*_args):
+            tree.delete(*tree.get_children())
+            ft = filter_var.get().lower()
+            show_modified = modified_only_var.get()
+            for name in _CREATURE_NAMES_SORTED:
+                if ft and ft not in name.lower():
+                    continue
+                st = spawn_state.get(name, {"spawnable": True, "tameable": True, "replace_with": ""})
+                is_modified = (not st["spawnable"] or not st["tameable"] or st["replace_with"])
+                if show_modified and not is_modified:
+                    continue
+                tree.insert("", "end", iid=name, text=name, values=_row_values(name))
+
+        _populate_tree()
+        filter_var.trace_add("write", _populate_tree)
+        modified_only_var.trace_add("write", lambda *a: _populate_tree())
+
+        def _on_click(event):
+            col = tree.identify_column(event.x)
+            item = tree.identify_row(event.y)
+            if not item:
+                return
+            name = item
+            st = spawn_state.get(name, {"spawnable": True, "tameable": True, "replace_with": ""})
+            if col == "#1":  # spawnable column
+                st["spawnable"] = not st["spawnable"]
+                tree.item(name, values=_row_values(name))
+                self._ini_visual_schedule_write(vk_spawn)
+            elif col == "#2":  # tameable column
+                st["tameable"] = not st["tameable"]
+                tree.item(name, values=_row_values(name))
+                self._ini_visual_schedule_write(vk_tame)
+
+        tree.bind("<ButtonRelease-1>", _on_click)
+
+        # Replace-with controls below tree
+        replace_frame = ttk.Frame(frame)
+        replace_frame.grid(row=2, column=0, sticky="ew", pady=(4, 0))
+
+        ttk.Label(replace_frame, text="Selected:").pack(side="left", padx=(0, 4))
+        sel_label = ttk.Label(replace_frame, text="(none)", width=25, anchor="w")
+        sel_label.pack(side="left", padx=(0, 8))
+
+        ttk.Label(replace_frame, text="Replace With:").pack(side="left", padx=(0, 4))
+        replace_cb = ttk.Combobox(replace_frame, values=creature_names_with_empty, width=30)
+        replace_cb.pack(side="left", padx=(0, 4))
+        self._make_searchable_cb(replace_cb, creature_names_with_empty)
+
+        _current_selection = [None]
+
+        def _on_tree_select(event=None):
+            sel = tree.selection()
+            if not sel:
+                return
+            name = sel[0]
+            _current_selection[0] = name
+            sel_label.configure(text=name)
+            st = spawn_state.get(name, {"spawnable": True, "tameable": True, "replace_with": ""})
+            replace_cb.set(st["replace_with"])
+
+        tree.bind("<<TreeviewSelect>>", _on_tree_select)
+
+        def _on_replace_change(event=None):
+            name = _current_selection[0]
+            if not name:
+                return
+            new_val = replace_cb.get().strip()
+            if new_val == name:
+                new_val = ""
+            st = spawn_state.get(name, {"spawnable": True, "tameable": True, "replace_with": ""})
+            st["replace_with"] = new_val
+            tree.item(name, values=_row_values(name))
+            self._ini_visual_schedule_write(vk_spawn)
+
+        replace_cb.bind("<<ComboboxSelected>>", _on_replace_change)
+
+        def _apply_replace():
+            name = _current_selection[0]
+            if not name:
+                return
+            _on_replace_change()
+
+        ttk.Button(replace_frame, text="Apply", command=_apply_replace, width=8).pack(
+            side="left", padx=(4, 0))
+
+        def _clear_replace():
+            name = _current_selection[0]
+            if not name:
+                return
+            replace_cb.set("")
+            st = spawn_state.get(name, {"spawnable": True, "tameable": True, "replace_with": ""})
+            st["replace_with"] = ""
+            tree.item(name, values=_row_values(name))
+            self._ini_visual_schedule_write(vk_spawn)
+
+        ttk.Button(replace_frame, text="Clear", command=_clear_replace, width=8).pack(
+            side="left", padx=(4, 0))
+
+        start_row += 1
         return start_row
 
     @staticmethod
     def _make_searchable_cb(cb: ttk.Combobox, full_values: list) -> None:
         """Bind KeyRelease so the combobox filters its drop-down as the user types."""
         def _filter(event=None):
-            typed = cb.get().lower()
+            if event and event.keysym in ('Up', 'Down', 'Return', 'Escape',
+                                          'Tab', 'Shift_L', 'Shift_R',
+                                          'Control_L', 'Control_R',
+                                          'Alt_L', 'Alt_R'):
+                return
+            typed = cb.get()
+            pos = cb.index(tk.INSERT)
             if typed:
-                cb['values'] = [v for v in full_values if typed in v.lower()]
+                cb['values'] = [v for v in full_values if typed.lower() in v.lower()]
             else:
                 cb['values'] = full_values
-            try:
-                cb.event_generate('<Down>')
-            except Exception:
-                pass
+            cb.icursor(pos)
         cb.bind('<KeyRelease>', _filter)
 
     def _build_spawn_npc_replacements(self, parent: ttk.Frame, vk: str, key: str) -> None:
-        input_frm = ttk.Frame(parent)
-        input_frm.grid(row=1, column=0, sticky="ew", pady=(4, 2))
-
-        ttk.Label(input_frm, text="From:").grid(row=0, column=0, padx=(0, 4))
-        from_cb = ttk.Combobox(input_frm, values=_CREATURE_NAMES_SORTED, width=28)
-        from_cb.grid(row=0, column=1, padx=(0, 8))
-        self._make_searchable_cb(from_cb, list(_CREATURE_NAMES_SORTED))
-
-        ttk.Label(input_frm, text="\u2192 To:").grid(row=0, column=2, padx=(0, 4))
-        to_values = ["(disabled)"] + list(_CREATURE_NAMES_SORTED)
-        to_cb = ttk.Combobox(input_frm, values=to_values, width=28)
-        to_cb.grid(row=0, column=3, padx=(0, 8))
-        self._make_searchable_cb(to_cb, to_values)
-
-        list_frm = ttk.Frame(parent)
-        list_frm.grid(row=2, column=0, sticky="ew", pady=(2, 2))
-        list_frm.columnconfigure(0, weight=1)
-
-        lb = tk.Listbox(list_frm, height=5, font=("Consolas", 9))
-        lb.grid(row=0, column=0, sticky="ew")
-        sb = ttk.Scrollbar(list_frm, orient="vertical", command=lb.yview)
-        sb.grid(row=0, column=1, sticky="ns")
-        lb.configure(yscrollcommand=sb.set)
-
-        data = _SpawnListData(lb)
-        self._ini_visual_vars[vk] = data
-
-        def add_entry():
-            from_name = from_cb.get().strip()
-            to_name = to_cb.get().strip()
-            if not from_name:
-                return
-            from_id = _CREATURE_DATA.get(from_name, ("", "", ""))[0]
-            if not from_id:
-                return
-            if to_name == "(disabled)" or not to_name:
-                to_id = ""
-                display = f"{from_name}  \u2192  (disabled)"
-            else:
-                to_id = _CREATURE_DATA.get(to_name, ("", "", ""))[0]
-                display = f"{from_name}  \u2192  {to_name}"
-            raw = f'(FromClassName="{from_id}",ToClassName="{to_id}")'
-            data.add(raw, display)
-            self._ini_visual_schedule_write(vk)
-
-        def remove_entry():
-            data.remove_selected()
-            self._ini_visual_schedule_write(vk)
-
-        ttk.Button(input_frm, text="Add", command=add_entry, width=6).grid(row=0, column=4)
-        ttk.Button(parent, text="Remove Selected", command=remove_entry).grid(
-            row=3, column=0, sticky="w", pady=(2, 0))
+        """Legacy - unused, spawn section now uses dino table."""
+        pass
 
     def _build_spawn_weight_multipliers(self, parent: ttk.Frame, vk: str, key: str) -> None:
-        nametags = sorted({v[1] for v in _CREATURE_DATA.values() if v[1] and v[1] != '???'})
-
-        input_frm = ttk.Frame(parent)
-        input_frm.grid(row=1, column=0, sticky="ew", pady=(4, 2))
-
-        ttk.Label(input_frm, text="DinoNameTag:").grid(row=0, column=0, padx=(0, 4))
-        tag_cb = ttk.Combobox(input_frm, values=nametags, width=20)
-        tag_cb.grid(row=0, column=1, padx=(0, 8))
-        self._make_searchable_cb(tag_cb, nametags)
-
-        ttk.Label(input_frm, text="Weight:").grid(row=0, column=2, padx=(0, 4))
-        weight_var = tk.StringVar(value="1.0")
-        ttk.Entry(input_frm, textvariable=weight_var, width=8).grid(row=0, column=3, padx=(0, 8))
-
-        ttk.Label(input_frm, text="Limit%:").grid(row=0, column=4, padx=(0, 4))
-        limit_var = tk.StringVar(value="0.1")
-        ttk.Entry(input_frm, textvariable=limit_var, width=8).grid(row=0, column=5, padx=(0, 8))
-
-        list_frm = ttk.Frame(parent)
-        list_frm.grid(row=2, column=0, sticky="ew", pady=(2, 2))
-        list_frm.columnconfigure(0, weight=1)
-
-        lb = tk.Listbox(list_frm, height=5, font=("Consolas", 9))
-        lb.grid(row=0, column=0, sticky="ew")
-        sb = ttk.Scrollbar(list_frm, orient="vertical", command=lb.yview)
-        sb.grid(row=0, column=1, sticky="ns")
-        lb.configure(yscrollcommand=sb.set)
-
-        data = _SpawnListData(lb)
-        self._ini_visual_vars[vk] = data
-
-        def add_entry():
-            tag = tag_cb.get().strip()
-            if not tag:
-                return
-            weight = weight_var.get().strip() or "1.0"
-            limit = limit_var.get().strip() or "0.1"
-            raw = (f"(DinoNameTag={tag},SpawnWeightMultiplier={weight},"
-                   f"OverrideSpawnLimitPercentage=true,SpawnLimitPercentage={limit})")
-            display = f"{tag}   W={weight}  Limit={limit}"
-            data.add(raw, display)
-            self._ini_visual_schedule_write(vk)
-
-        def remove_entry():
-            data.remove_selected()
-            self._ini_visual_schedule_write(vk)
-
-        ttk.Button(input_frm, text="Add", command=add_entry, width=6).grid(row=0, column=6)
-        ttk.Button(parent, text="Remove Selected", command=remove_entry).grid(
-            row=3, column=0, sticky="w", pady=(2, 0))
+        """Legacy - unused, spawn section now uses dino table."""
+        pass
 
     def _build_spawn_container_op(self, parent: ttk.Frame, vk: str, key: str) -> None:
-        input_frm = ttk.Frame(parent)
-        input_frm.grid(row=1, column=0, sticky="ew", pady=(4, 2))
-
-        ttk.Label(input_frm, text="Container:").grid(row=0, column=0, padx=(0, 4))
-        container_var = tk.StringVar()
-        ttk.Entry(input_frm, textvariable=container_var, width=28).grid(row=0, column=1, padx=(0, 8))
-
-        ttk.Label(input_frm, text="Creature:").grid(row=0, column=2, padx=(0, 4))
-        creature_cb = ttk.Combobox(input_frm, values=_CREATURE_NAMES_SORTED, width=28)
-        creature_cb.grid(row=0, column=3, padx=(0, 8))
-        self._make_searchable_cb(creature_cb, list(_CREATURE_NAMES_SORTED))
-
-        ttk.Label(input_frm, text="Weight:").grid(row=0, column=4, padx=(0, 4))
-        weight_var = tk.StringVar(value="1.0")
-        ttk.Entry(input_frm, textvariable=weight_var, width=6).grid(row=0, column=5, padx=(0, 8))
-
-        list_frm = ttk.Frame(parent)
-        list_frm.grid(row=2, column=0, sticky="ew", pady=(2, 2))
-        list_frm.columnconfigure(0, weight=1)
-
-        lb = tk.Listbox(list_frm, height=5, font=("Consolas", 9))
-        lb.grid(row=0, column=0, sticky="ew")
-        sb = ttk.Scrollbar(list_frm, orient="vertical", command=lb.yview)
-        sb.grid(row=0, column=1, sticky="ns")
-        lb.configure(yscrollcommand=sb.set)
-
-        data = _SpawnListData(lb)
-        self._ini_visual_vars[vk] = data
-
-        def add_entry():
-            container = container_var.get().strip()
-            creature_name = creature_cb.get().strip()
-            if not container or not creature_name:
-                return
-            bp = _CREATURE_DATA.get(creature_name, ("", "", ""))[2]
-            if not bp:
-                return
-            weight = weight_var.get().strip() or "1.0"
-            raw = (f'(NPCSpawnEntriesContainerClassString="{container}",'
-                   f'NPCSpawnEntries=((AnEntryName="{creature_name}",'
-                   f'EntryWeight={weight},'
-                   f'NPCsToSpawnStrings=("{bp}"))))')
-            display = f"{container}  \u2190  {creature_name} (w={weight})"
-            data.add(raw, display)
-            self._ini_visual_schedule_write(vk)
-
-        def remove_entry():
-            data.remove_selected()
-            self._ini_visual_schedule_write(vk)
-
-        ttk.Button(input_frm, text="Add", command=add_entry, width=6).grid(row=0, column=6)
-        ttk.Button(parent, text="Remove Selected", command=remove_entry).grid(
-            row=3, column=0, sticky="w", pady=(2, 0))
+        """Legacy - unused, spawn section now uses dino table."""
+        pass
 
     def _ini_visual_scale_to_entry(self, scale_var: tk.DoubleVar, text_var: tk.StringVar,
                                    vk: str, vtype: str, step: float = 0.25) -> None:
@@ -6032,7 +6070,6 @@ class ServerManagerApp:
         if self._ini_visual_loading:
             return
         val = scale_var.get()
-        # Snap value to nearest step increment
         if step > 0:
             val = round(round(val / step) * step, 10)
             scale_var.set(val)
@@ -6103,7 +6140,6 @@ class ServerManagerApp:
                     continue
                 ini_file, section, key = parts
 
-                # --- Text widget (spawn customization, multi-value keys) ---
                 if isinstance(var, tk.Text):
                     doc = gus_doc if ini_file == "gus" else game_doc
                     if doc is None:
@@ -6114,7 +6150,6 @@ class ServerManagerApp:
                         var.insert("1.0", "\n".join(vals))
                     continue
 
-                # --- SpawnListData (dropdown-based spawn editors) ---
                 if isinstance(var, _SpawnListData):
                     doc = gus_doc if ini_file == "gus" else game_doc
                     if doc is None:
@@ -6124,6 +6159,68 @@ class ServerManagerApp:
                     for raw_val in vals:
                         display = self._spawn_raw_to_display(key, raw_val)
                         var.add(raw_val, display)
+                    continue
+
+                if isinstance(var, dict) and key in ("NPCReplacements", "PreventDinoTameClassNames"):
+                    # Only process once (NPCReplacements is the primary key)
+                    if key == "PreventDinoTameClassNames":
+                        continue
+                    doc = gus_doc if ini_file == "gus" else game_doc
+                    if doc is None:
+                        continue
+                    for name in var:
+                        var[name] = {"spawnable": True, "tameable": True, "replace_with": ""}
+                    vals = doc.get_all_values(section, key)
+                    for raw_val in vals:
+                        m = re.search(r'FromClassName="([^"]*)".*?ToClassName="([^"]*)"', raw_val)
+                        if m:
+                            from_id = m.group(1)
+                            to_id = m.group(2)
+                            name = _ENTITY_ID_TO_NAME.get(from_id)
+                            if name and name in var:
+                                if to_id == "":
+                                    var[name]["spawnable"] = False
+                                else:
+                                    to_name = _ENTITY_ID_TO_NAME.get(to_id, to_id)
+                                    var[name]["replace_with"] = to_name
+                    tame_vals = doc.get_all_values(section, "PreventDinoTameClassNames")
+                    for raw_val in tame_vals:
+                        entity_id = raw_val.strip().strip('"')
+                        name = _ENTITY_ID_TO_NAME.get(entity_id)
+                        if name and name in var:
+                            var[name]["tameable"] = False
+                    if hasattr(self, '_dino_spawn_tree'):
+                        tree = self._dino_spawn_tree
+                        for item_id in tree.get_children():
+                            st = var.get(item_id, {"spawnable": True, "tameable": True, "replace_with": ""})
+                            sp = "\u2611" if st["spawnable"] else "\u2610"
+                            tm = "\u2611" if st["tameable"] else "\u2610"
+                            rw = st["replace_with"] if st["replace_with"] else ""
+                            tree.item(item_id, values=(sp, tm, rw))
+                    continue
+
+                if isinstance(var, dict) and key == "HarvestResourceItemAmountClassMultipliers":
+                    doc = gus_doc if ini_file == "gus" else game_doc
+                    if doc is None:
+                        continue
+                    # Reset all to 1.0
+                    for name in var:
+                        var[name] = 1.0
+                    vals = doc.get_all_values(section, key)
+                    for raw_val in vals:
+                        m = re.search(r'ClassName="([^"]*)".*?Multiplier=([\d.]+)', raw_val)
+                        if m:
+                            cls = m.group(1)
+                            mult = float(m.group(2))
+                            res_name = _HARVEST_CLASS_TO_NAME.get(cls)
+                            if res_name and res_name in var:
+                                var[res_name] = mult
+                    # Refresh tree display if available
+                    if hasattr(self, '_harvest_tree'):
+                        tree = self._harvest_tree
+                        for item_id in tree.get_children():
+                            mult = var.get(item_id, 1.0)
+                            tree.item(item_id, values=(f"{mult:.2f}x",))
                     continue
 
                 val_map = gus_map if ini_file == "gus" else game_map
@@ -6136,7 +6233,6 @@ class ServerManagerApp:
                     var.set(current.strip().lower() == "true")
                 elif isinstance(var, tk.StringVar):
                     var.set(current)
-                    # Also update scale var if exists
                     sk = vk + "|scale"
                     if sk in self._ini_visual_vars:
                         try:
@@ -6179,7 +6275,6 @@ class ServerManagerApp:
 
             doc = gus_doc if ini_file == "gus" else game_doc
 
-            # --- Text widget (spawn customization, multi-value keys) ---
             if isinstance(var, tk.Text):
                 content = var.get("1.0", "end").strip()
                 doc.remove_all_kv(section, key)
@@ -6188,7 +6283,6 @@ class ServerManagerApp:
                         line = line.strip()
                         if not line:
                             continue
-                        # Strip key= prefix if user pasted full INI lines
                         if line.lower().startswith(key.lower() + "="):
                             line = line[len(key) + 1:]
                         doc.append_kv(section, key, line)
@@ -6198,13 +6292,55 @@ class ServerManagerApp:
                     game_dirty = True
                 continue
 
-            # --- SpawnListData (dropdown-based spawn editors) ---
             if isinstance(var, _SpawnListData):
                 doc.remove_all_kv(section, key)
                 for raw_val in var.entries:
                     raw_val = raw_val.strip()
                     if raw_val:
                         doc.append_kv(section, key, raw_val)
+                if ini_file == "gus":
+                    gus_dirty = True
+                else:
+                    game_dirty = True
+                continue
+
+            if isinstance(var, dict) and key in ("NPCReplacements", "PreventDinoTameClassNames"):
+                # Only process once (NPCReplacements is the primary trigger)
+                if key == "PreventDinoTameClassNames":
+                    continue
+                doc.remove_all_kv(section, "NPCReplacements")
+                for name, st in var.items():
+                    entity_id = _CREATURE_DATA.get(name, ("", "", ""))[0]
+                    if not entity_id:
+                        continue
+                    if not st["spawnable"]:
+                        raw = f'(FromClassName="{entity_id}",ToClassName="")'
+                        doc.append_kv(section, "NPCReplacements", raw)
+                    elif st["replace_with"]:
+                        to_data = _CREATURE_DATA.get(st["replace_with"])
+                        if to_data:
+                            raw = f'(FromClassName="{entity_id}",ToClassName="{to_data[0]}")'
+                            doc.append_kv(section, "NPCReplacements", raw)
+                doc.remove_all_kv(section, "PreventDinoTameClassNames")
+                for name, st in var.items():
+                    if not st["tameable"]:
+                        entity_id = _CREATURE_DATA.get(name, ("", "", ""))[0]
+                        if entity_id:
+                            doc.append_kv(section, "PreventDinoTameClassNames", f'"{entity_id}"')
+                if ini_file == "gus":
+                    gus_dirty = True
+                else:
+                    game_dirty = True
+                continue
+
+            if isinstance(var, dict) and key == "HarvestResourceItemAmountClassMultipliers":
+                doc.remove_all_kv(section, key)
+                for name, mult in var.items():
+                    if abs(mult - 1.0) > 0.001:
+                        cls = _HARVEST_RESOURCES.get(name, "")
+                        if cls:
+                            raw = f'(ClassName="{cls}",Multiplier={mult:.6f}'.rstrip("0").rstrip(".") + ")"
+                            doc.append_kv(section, key, raw)
                 if ini_file == "gus":
                     gus_dirty = True
                 else:
@@ -6229,7 +6365,6 @@ class ServerManagerApp:
         if game_dirty:
             write_ini(game_paths.stage, game_doc)
 
-        # If the raw editor has one of these targets loaded, reload it
         if self._ini_loaded_target == "gus" and gus_dirty:
             self._ini_doc = read_ini(gus_paths.stage)
             self._ini_refresh_tree()
