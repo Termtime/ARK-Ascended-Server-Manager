@@ -136,6 +136,95 @@ DIRECTX_LEGACY_DLLS = [
 GAMEUSERSETTINGS_REL = Path(r"ShooterGame\Saved\Config\WindowsServer\GameUserSettings.ini")
 GAME_INI_REL = Path(r"ShooterGame\Saved\Config\WindowsServer\Game.ini")
 
+# --- Single player (client) layout -------------------------------------------
+# ASA keeps local/single player worlds in SavedArksLocal; dedicated servers use SavedArks.
+SP_SAVED_ARKS_DIR_NAMES = ("SavedArksLocal", "SavedArks")
+SERVER_SAVED_ARKS_DIR_NAME = "SavedArks"
+SP_CONFIG_DIR_NAME = "Config"
+SP_CONFIG_PLATFORM_DIRS = ("Windows", "WindowsNoEditor", "WindowsClient", "WindowsServer")
+SP_CONFIG_SEARCH_DEPTH = 5
+SP_LOCAL_PROFILE_STEM = "localplayer"
+# A dedicated server loads <PlayerID>.arkprofile, whatever the client called its own copy.
+SP_SERVER_PROFILE_SUFFIX = ".arkprofile"
+
+# A complete character profile carries these; a name-only stub does not. Importing a
+# stub gets the survivor's name back but leaves them at level 1 with no engrams, so it
+# is worth telling the user which one they have.
+SP_PROFILE_PROGRESSION_MARKERS = (
+    b"CharacterStatusComponent_ExtraCharacterLevel",
+    b"PlayerState_TotalEngramPoints",
+)
+
+# ARK writes float32 spew: 0.00999999978 for 0.01, and its sliders emit 0.999989986 for 1.
+# The client records its enabled CurseForge mods here; a server takes the same ids via -mods=.
+SP_ACTIVE_MODS_KEY = "ActiveMods"
+# These must never reach a server GameUserSettings.ini. ActiveMods is the old ASE
+# mod mechanism, and an ASA server that sees it alongside -mods= deadlocks during
+# world load: it reaches "Number of cores" in ~6s instead of ~36s and then spins
+# forever on one thread without ever completing startup. The mod list belongs in
+# the manager's Mods field, which is what -mods= is built from.
+SP_MOD_KEYS_LOWER = {"activemods", "activemapmod"}
+
+# Single player only. On a dedicated server this silently re-applies the hidden
+# single player multipliers on top of the rates being imported.
+SP_NEVER_IMPORT_KEYS = {"busesingleplayersettings"}
+
+SP_FLOAT_SNAP_DECIMALS = 4
+SP_FLOAT_SNAP_TOLERANCE = 2e-5
+SP_FLOAT_SNAP_MIN_MAGNITUDE = 0.001
+SP_FLOAT_MAX_EXACT = 1e7
+
+# ASA installed through Steam keeps its saves inside the game folder, not LocalAppData.
+ASA_STEAM_APP_DIR = "ARK Survival Ascended"
+
+SP_WORLD_SUFFIXES = (".ark",)
+SP_PROFILE_SUFFIXES = (".arkprofile", ".arkprofilebak", ".profilebak")
+SP_TRIBE_SUFFIXES = (".arktribe", ".arktribebak", ".tribebak", ".arktributetribe")
+
+# Client-only sections of a single player GameUserSettings.ini; never useful on a server.
+SP_GUS_CLIENT_ONLY_SECTIONS = {
+    "scalabilitygroups",
+    "/script/engine.gameusersettings",
+    "/script/engine.inputsettings",
+    "/script/shootergame.shootergameusersettings",
+    "/script/shootergame.shootergameinstance",
+    "/script/shootergame.primalgameinstance",
+    "clientsettings",
+    "audiosettings",
+    "windowssettings",
+    "player.info",
+    "startup",
+    "marketing",
+}
+
+# Client-only sections of a single player Game.ini.
+SP_GAME_CLIENT_ONLY_SECTIONS = {
+    "/script/shootergame.shooterplayercontroller_menu",
+    "/script/shootergame.shootergameusersettings",
+}
+
+# Keys this manager owns. An imported single player INI must never clobber them,
+# or the server loses its name, passwords, RCON access or player slots.
+SP_PROTECTED_INI_KEYS = {
+    "serversettings": {
+        "serveradminpassword",
+        "serverpassword",
+        "spectatorpassword",
+        "rconenabled",
+        "rconport",
+    },
+    "sessionsettings": {
+        "sessionname",
+        "port",
+        "queryport",
+        "multihome",
+    },
+    "/script/engine.gamesession": {
+        "sessionname",
+        "maxplayers",
+    },
+}
+
 THEME_COLORS = {
     "bg": "#f5f7fb",
     "surface": "#ffffff",
@@ -2951,6 +3040,603 @@ def ensure_required_server_settings(
     logger.info("Staged Game.ini (/Script/Engine.GameSession MaxPlayers).")
 
 # =============================================================================
+# SINGLE PLAYER IMPORT
+# =============================================================================
+
+@dataclass(frozen=True)
+class SinglePlayerSave:
+    map_name: str
+    folder: Path
+    world_file: Optional[Path]
+    profiles: Tuple[Path, ...]
+    tribes: Tuple[Path, ...]
+    modified: float
+    size_bytes: int
+
+    def file_count(self) -> int:
+        return (1 if self.world_file else 0) + len(self.profiles) + len(self.tribes)
+
+
+@dataclass
+class SinglePlayerImportResult:
+    destination: Optional[Path] = None
+    files_copied: int = 0
+    backup_zip: Optional[Path] = None
+    renamed_profiles: List[str] = field(default_factory=list)
+    claimed_profile_is_stub: bool = False
+    settings_source: Optional[Path] = None
+    floats_tidied: int = 0
+    mods_found: List[str] = field(default_factory=list)
+    mods_previous: str = ""
+    gus_applied: int = 0
+    gus_preserved: List[str] = field(default_factory=list)
+    game_applied: int = 0
+    game_preserved: List[str] = field(default_factory=list)
+    notes: List[str] = field(default_factory=list)
+
+
+def steam_install_path() -> Optional[Path]:
+    if winreg is None:
+        return None
+    for hive, subkey in (
+        (winreg.HKEY_CURRENT_USER, r"SOFTWARE\Valve\Steam"),
+        (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Valve\Steam"),
+        (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Valve\Steam"),
+    ):
+        try:
+            with reg_open_key_64(hive, subkey) as key:
+                for name in ("SteamPath", "InstallPath"):
+                    try:
+                        value = str(winreg.QueryValueEx(key, name)[0]).strip()
+                    except OSError:
+                        continue
+                    if value:
+                        return Path(value)
+        except Exception:
+            continue
+    return None
+
+
+def steam_library_roots() -> List[Path]:
+    """Steam install plus every extra library folder listed in libraryfolders.vdf."""
+    steam = steam_install_path()
+    if steam is None:
+        return []
+
+    roots: List[Path] = [steam]
+    try:
+        vdf = (steam / "steamapps" / "libraryfolders.vdf").read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return roots
+
+    for match in re.finditer(r'"path"\s*"([^"]+)"', vdf):
+        raw = match.group(1).replace("\\\\", "\\").strip()
+        if not raw:
+            continue
+        candidate = Path(raw)
+        if candidate not in roots:
+            roots.append(candidate)
+    return roots
+
+
+def singleplayer_candidate_roots() -> List[Path]:
+    """Known locations of an ASA single player 'Saved' folder, best first."""
+    roots: List[Path] = []
+
+    for lib in steam_library_roots():
+        roots.append(lib / "steamapps" / "common" / ASA_STEAM_APP_DIR / "ShooterGame" / "Saved")
+
+    local = os.environ.get("LOCALAPPDATA", "").strip()
+    if local:
+        base = Path(local)
+        roots.append(base / "ArkSurvivalAscended" / "Saved")
+        # Microsoft Store / Game Pass build keeps its own redirected LocalAppData.
+        try:
+            for pkg in (base / "Packages").glob("StudioWildcard.*"):
+                roots.append(pkg / "LocalCache" / "Local" / "ArkSurvivalAscended" / "Saved")
+        except OSError:
+            pass
+    return roots
+
+
+def folder_holds_saves(folder: Path) -> bool:
+    """True when this folder holds .ark files directly or one level down."""
+    if not folder.is_dir():
+        return False
+    if _sp_files_with_suffix(folder, SP_WORLD_SUFFIXES):
+        return True
+    try:
+        for child in folder.iterdir():
+            if child.is_dir() and _sp_files_with_suffix(child, SP_WORLD_SUFFIXES):
+                return True
+    except OSError:
+        return False
+    return False
+
+
+def resolve_singleplayer_saves_root(chosen: Path) -> Optional[Path]:
+    """Use the chosen folder exactly as given when it holds saves, else probe the usual subfolders."""
+    candidates: List[Path] = [chosen]
+    for base in (chosen, chosen / "Saved", chosen / "ShooterGame" / "Saved"):
+        candidates.extend(base / name for name in SP_SAVED_ARKS_DIR_NAMES)
+    for candidate in candidates:
+        if folder_holds_saves(candidate):
+            return candidate
+    return None
+
+
+def _holds_singleplayer_ini(folder: Path) -> bool:
+    try:
+        return (folder / "GameUserSettings.ini").is_file() or (folder / "Game.ini").is_file()
+    except OSError:
+        return False
+
+
+def resolve_singleplayer_config_dir(chosen: Path) -> Optional[Path]:
+    """Find the Config folder for whatever the user pointed at, walking upward if needed.
+
+    A world folder sits at <Saved>\\SavedArksLocal\\<Map>, so the INIs next to it in
+    <Saved>\\Config\\Windows are two levels up; browsing straight to a map folder is common.
+    """
+    if _holds_singleplayer_ini(chosen):
+        return chosen
+
+    ancestors: List[Path] = [chosen, *list(chosen.parents)[:SP_CONFIG_SEARCH_DEPTH]]
+    for ancestor in ancestors:
+        for base in (ancestor, ancestor / "Saved", ancestor / "ShooterGame" / "Saved"):
+            for platform in SP_CONFIG_PLATFORM_DIRS:
+                candidate = base / SP_CONFIG_DIR_NAME / platform
+                if _holds_singleplayer_ini(candidate):
+                    return candidate
+    return None
+
+
+def detect_singleplayer_root() -> Optional[Path]:
+    for root in singleplayer_candidate_roots():
+        if resolve_singleplayer_saves_root(root) is not None:
+            return root
+    for root in singleplayer_candidate_roots():
+        if root.is_dir():
+            return root
+    return None
+
+
+def _sp_files_with_suffix(folder: Path, suffixes: Tuple[str, ...]) -> Tuple[Path, ...]:
+    try:
+        return tuple(
+            p for p in sorted(folder.iterdir())
+            if p.is_file() and p.suffix.lower() in suffixes
+        )
+    except OSError:
+        return tuple()
+
+
+def _sp_build_save(folder: Path, map_name: str, world_file: Optional[Path]) -> Optional[SinglePlayerSave]:
+    profiles = _sp_files_with_suffix(folder, SP_PROFILE_SUFFIXES)
+    tribes = _sp_files_with_suffix(folder, SP_TRIBE_SUFFIXES)
+    files = [p for p in (world_file, *profiles, *tribes) if p is not None]
+    if not files:
+        return None
+
+    size = 0
+    modified = 0.0
+    for p in files:
+        try:
+            st = p.stat()
+        except OSError:
+            continue
+        size += st.st_size
+        modified = max(modified, st.st_mtime)
+
+    return SinglePlayerSave(
+        map_name=map_name,
+        folder=folder,
+        world_file=world_file,
+        profiles=profiles,
+        tribes=tribes,
+        modified=modified,
+        size_bytes=size,
+    )
+
+
+def discover_singleplayer_saves(chosen: Path) -> List[SinglePlayerSave]:
+    """List importable single player worlds at (or just below) the chosen folder."""
+    saves_root = resolve_singleplayer_saves_root(chosen)
+    found: List[SinglePlayerSave] = []
+    if saves_root is None:
+        return found
+
+    try:
+        folders = sorted(p for p in saves_root.iterdir() if p.is_dir())
+    except OSError:
+        folders = []
+
+    for folder in folders:
+        world: Optional[Path] = folder / f"{folder.name}.ark"
+        if not world.is_file():
+            candidates = _sp_files_with_suffix(folder, SP_WORLD_SUFFIXES)
+            world = candidates[0] if candidates else None
+        if world is None:
+            continue
+        save = _sp_build_save(folder, folder.name, world)
+        if save is not None:
+            found.append(save)
+
+    # Flat layout: <saves root>\<Map>.ark sitting next to shared profile/tribe files.
+    for world in _sp_files_with_suffix(saves_root, SP_WORLD_SUFFIXES):
+        save = _sp_build_save(saves_root, world.stem, world)
+        if save is not None:
+            found.append(save)
+
+    found.sort(key=lambda s: s.modified, reverse=True)
+    return found
+
+
+def parse_mod_id_list(raw: str) -> List[str]:
+    """Split an ActiveMods / -mods= list into de-duplicated ids, dropping the 0 placeholder."""
+    out: List[str] = []
+    for token in re.split(r"[,;\s]+", (raw or "").strip()):
+        token = token.strip()
+        if not token or token == "0":
+            continue
+        if token not in out:
+            out.append(token)
+    return out
+
+
+def read_singleplayer_active_mods(sp_root: Path) -> List[str]:
+    """Mod ids the client has enabled, read from ActiveMods in its GameUserSettings.ini."""
+    cfg_dir = resolve_singleplayer_config_dir(sp_root)
+    if cfg_dir is None:
+        return []
+
+    gus_path = cfg_dir / "GameUserSettings.ini"
+    if not gus_path.is_file():
+        return []
+
+    raw = ""
+    for line in read_ini(gus_path).lines:
+        if line.kind == "kv" and line.key.strip().lower() == SP_ACTIVE_MODS_KEY.lower():
+            raw = line.value
+    return parse_mod_id_list(raw)
+
+
+def server_saves_root(server_dir: Path, alt_save_directory_name: str = "") -> Path:
+    name = (alt_save_directory_name or "").strip() or SERVER_SAVED_ARKS_DIR_NAME
+    return server_saved_dir(server_dir) / name
+
+
+def backup_server_save_folder(folder: Path, backup_root: Path, logger: logging.Logger) -> Optional[Path]:
+    """Zip the server save folder about to be overwritten. None when there is nothing to keep."""
+    if not folder.is_dir():
+        return None
+    files = [p for p in folder.rglob("*") if p.is_file()]
+    if not files:
+        return None
+
+    ensure_dir(backup_root)
+    out_zip = backup_root / f"ASA_PreImport_{folder.name}_{now_ts()}.zip"
+    with zipfile.ZipFile(out_zip, "w", compression=zipfile.ZIP_DEFLATED) as z:
+        for p in files:
+            z.write(p, arcname=str(p.relative_to(folder)))
+    logger.info(f"Pre-import backup created: {out_zip}")
+    return out_zip
+
+
+def import_singleplayer_save(
+    save: SinglePlayerSave,
+    server_dir: Path,
+    alt_save_directory_name: str,
+    logger: logging.Logger,
+    *,
+    include_profiles: bool = True,
+    include_tribes: bool = True,
+    target_player_id: str = "",
+    backup_root: Optional[Path] = None,
+    result: Optional[SinglePlayerImportResult] = None,
+) -> SinglePlayerImportResult:
+    res = result if result is not None else SinglePlayerImportResult()
+
+    if save.world_file is None:
+        raise ValueError(f"No .ark world file found in {save.folder}")
+
+    dest_dir = server_saves_root(server_dir, alt_save_directory_name) / save.map_name
+    res.destination = dest_dir
+
+    if backup_root is not None:
+        res.backup_zip = backup_server_save_folder(dest_dir, backup_root, logger)
+
+    ensure_dir(dest_dir)
+
+    sources: List[Path] = [save.world_file]
+    if include_profiles:
+        sources.extend(save.profiles)
+    if include_tribes:
+        sources.extend(save.tribes)
+
+    player_id = (target_player_id or "").strip()
+    local_profile = pick_local_player_profile(save.profiles) if (player_id and include_profiles) else None
+
+    for src in sources:
+        name = src.name
+        if local_profile is not None and src == local_profile:
+            name = f"{player_id}{SP_SERVER_PROFILE_SUFFIX}"
+            res.renamed_profiles.append(f"{src.name} -> {name}")
+            res.claimed_profile_is_stub = not profile_carries_progression(src)
+        shutil.copy2(src, dest_dir / name)
+        res.files_copied += 1
+
+    logger.info(f"Imported {res.files_copied} single player save file(s) into {dest_dir}")
+    if res.renamed_profiles:
+        logger.info(f"Local player profile imported as {', '.join(res.renamed_profiles)}")
+    elif player_id:
+        res.notes.append("No LocalPlayer profile was found to rename.")
+    if res.claimed_profile_is_stub:
+        res.notes.append(
+            "That profile holds only the survivor's name - no level or engram data - so you "
+            "will spawn at level 1. ARK did not leave a complete profile in this save; the "
+            "character itself lives inside the world and stays where you left it."
+        )
+        logger.info("Claimed profile is a name-only stub; character progression will not carry over.")
+    if player_id and len(save.profiles) > 1:
+        res.notes.append(
+            "Other profile files were copied under their original names; only the newest "
+            "LocalPlayer profile was claimed for your player ID."
+        )
+
+    return res
+
+
+def profile_carries_progression(path: Path) -> bool:
+    """True when the profile holds level/engram data rather than just a name."""
+    try:
+        blob = path.read_bytes()
+    except OSError:
+        return False
+    return any(marker in blob for marker in SP_PROFILE_PROGRESSION_MARKERS)
+
+
+def _profile_mtime(p: Path) -> float:
+    try:
+        return p.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def pick_local_player_profile(profiles: Tuple[Path, ...]) -> Optional[Path]:
+    """The profile most likely to be this save's character.
+
+    ASA does not always leave a LocalPlayer.arkprofile behind. A local save may hold
+    only stale LocalPlayer.profilebak stubs while the real profile sits under an EOS id
+    instead, so prefer whichever candidate actually carries level and engram data.
+    """
+    if not profiles:
+        return None
+
+    local = [p for p in profiles if p.stem.lower().startswith(SP_LOCAL_PROFILE_STEM)]
+    others = [p for p in profiles if p not in local]
+
+    def newest(seq: List[Path]) -> Optional[Path]:
+        return max(seq, key=_profile_mtime) if seq else None
+
+    local_full = [p for p in local if profile_carries_progression(p)]
+    if local_full:
+        return newest(local_full)
+
+    other_full = [p for p in others if profile_carries_progression(p)]
+    if other_full:
+        return newest(other_full)
+
+    return newest(local) or newest(others)
+
+
+_INI_FLOAT_RE = re.compile(r"^[+-]?(?:\d+\.\d*|\.\d+)(?:[eE][+-]?\d+)?$")
+
+
+def _float32(value: float) -> float:
+    return struct.unpack("<f", struct.pack("<f", value))[0]
+
+
+def _shortest_float32_text(value: float) -> str:
+    """The shortest decimal that still round-trips to the same float32.
+
+    Plain decimal notation is tried first: %g would turn 10.0 into "1e+01", which ARK
+    parses but nobody wants to read in the INI editor.
+    """
+    if abs(value) < 1e16:
+        for decimals in range(0, 10):
+            text = f"{value:.{decimals}f}"
+            if _float32(float(text)) == value:
+                return text
+
+    for precision in range(1, 18):
+        text = f"{value:.{precision}g}"
+        if _float32(float(text)) == value:
+            return text
+    return repr(value)
+
+
+def tidy_ini_float(raw: str, snap: bool = True) -> str:
+    """Rewrite ARK float spew as a readable number.
+
+    Shortening is lossless: 0.00999999978 and 0.01 are the same float32, so the value
+    the server reads does not change. Snapping is not - the settings sliders write
+    0.999989986 where the user picked 1 - so it is kept behind a flag.
+    """
+    stripped = raw.strip()
+    if not _INI_FLOAT_RE.match(stripped):
+        return raw
+
+    try:
+        value = _float32(float(stripped))
+    except (ValueError, OverflowError):
+        return raw
+
+    # Past float32's exact integer range the shortened form looks like a different
+    # number (123456789 reads back as 123456792), so leave the game's own text alone.
+    if abs(value) >= SP_FLOAT_MAX_EXACT:
+        return raw
+
+    # Snapping is an absolute correction of about 1e-5, so it must not be applied to
+    # values small enough for that to swamp them - 0.0000001 would become 0.
+    if snap and abs(value) >= SP_FLOAT_SNAP_MIN_MAGNITUDE:
+        snapped = round(value, SP_FLOAT_SNAP_DECIMALS)
+        if snapped != value and abs(value - snapped) <= max(abs(value), 1.0) * SP_FLOAT_SNAP_TOLERANCE:
+            value = _float32(snapped)
+
+    if value == 0.0:
+        value = 0.0  # collapse -0.0
+
+    cleaned = _shortest_float32_text(value)
+    return cleaned if cleaned != stripped else raw
+
+
+def _canonical_section_name(doc: IniDocument, section: str) -> str:
+    """Reuse the destination spelling of a section so no duplicate header is created."""
+    target = section.strip().lower()
+    for line in doc.lines:
+        if line.kind == "section" and line.section.strip().lower() == target:
+            return line.section
+    return section.strip()
+
+
+def merge_ini_sections(
+    dest: IniDocument,
+    src: IniDocument,
+    *,
+    skip_sections: Set[str],
+    protected_keys: Dict[str, Set[str]],
+    protected_anywhere: Optional[Set[str]] = None,
+    tidy_floats: bool = True,
+    snap_floats: bool = True,
+) -> Tuple[int, List[str], int]:
+    """Copy src values into dest section by section.
+
+    Returns (applied, preserved labels, floats tidied).
+    """
+    applied = 0
+    preserved: List[str] = []
+    tidied = 0
+
+    for section, entries in src.kv_entries_by_section().items():
+        sec_l = section.strip().lower()
+        if not sec_l or sec_l in skip_sections:
+            continue
+
+        prot = set(protected_keys.get(sec_l, set()))
+        if protected_anywhere:
+            prot |= protected_anywhere
+        dest_section = _canonical_section_name(dest, section)
+
+        ordered_keys: List[str] = []
+        values_by_key: Dict[str, List[str]] = {}
+        for _idx, key, value in entries:
+            k = key.strip()
+            if not k:
+                continue
+            k_l = k.lower()
+            if k_l in prot:
+                label = f"[{section}] {k}"
+                if label not in preserved:
+                    preserved.append(label)
+                continue
+            if tidy_floats:
+                cleaned = tidy_ini_float(value, snap=snap_floats)
+                if cleaned != value:
+                    tidied += 1
+                    value = cleaned
+            if k_l not in values_by_key:
+                ordered_keys.append(k)
+                values_by_key[k_l] = []
+            values_by_key[k_l].append(value)
+
+        for k in ordered_keys:
+            values = values_by_key[k.lower()]
+            dest.remove_all_kv(dest_section, k)
+            if len(values) == 1:
+                dest.set(dest_section, k, values[0])
+            else:
+                dest.ensure_section(dest_section)
+                for v in values:
+                    dest.append_kv(dest_section, k, v)
+            applied += len(values)
+
+    return applied, preserved, tidied
+
+
+def import_singleplayer_settings(
+    sp_root: Path,
+    app_base: Path,
+    server_id: str,
+    server_dir: Path,
+    logger: logging.Logger,
+    *,
+    server_running: bool = False,
+    import_gus: bool = True,
+    import_game: bool = True,
+    tidy_floats: bool = True,
+    snap_floats: bool = True,
+    result: Optional[SinglePlayerImportResult] = None,
+) -> SinglePlayerImportResult:
+    """Merge the single player GameUserSettings.ini / Game.ini into this server INI staging."""
+    res = result if result is not None else SinglePlayerImportResult()
+    cfg_dir = resolve_singleplayer_config_dir(sp_root)
+    if cfg_dir is None:
+        res.notes.append(
+            f"No GameUserSettings.ini or Game.ini found near {sp_root}. "
+            "Point the Saved Folder at the game's ShooterGame\\Saved folder and try again."
+        )
+        logger.info("Single player config folder not found; settings import skipped.")
+        return res
+
+    res.settings_source = cfg_dir
+    logger.info(f"Single player settings source: {cfg_dir}")
+
+    protected_anywhere = set(SP_NEVER_IMPORT_KEYS) | SP_MOD_KEYS_LOWER
+
+    jobs: List[Tuple[str, Path, Set[str]]] = []
+    if import_gus:
+        jobs.append(("gus", cfg_dir / "GameUserSettings.ini", set(SP_GUS_CLIENT_ONLY_SECTIONS)))
+    if import_game:
+        jobs.append(("game", cfg_dir / "Game.ini", set(SP_GAME_CLIENT_ONLY_SECTIONS)))
+
+    for target, src_path, skip_sections in jobs:
+        if not src_path.is_file():
+            res.notes.append(f"Single player {src_path.name} not found in {cfg_dir}")
+            logger.info(f"Single player {src_path.name} not found; skipped.")
+            continue
+
+        paths = ini_stage_paths(app_base, server_id, server_dir, target)
+        ensure_ini_staging_synced(paths, server_running=server_running, logger=logger)
+
+        dest_doc = read_ini(paths.stage)
+        src_doc = read_ini(src_path)
+        applied, preserved, tidied = merge_ini_sections(
+            dest_doc,
+            src_doc,
+            skip_sections=skip_sections,
+            protected_keys=SP_PROTECTED_INI_KEYS,
+            protected_anywhere=protected_anywhere,
+            tidy_floats=tidy_floats,
+            snap_floats=snap_floats,
+        )
+        write_ini(paths.stage, dest_doc)
+        res.floats_tidied += tidied
+
+        if target == "gus":
+            res.gus_applied = applied
+            res.gus_preserved = preserved
+        else:
+            res.game_applied = applied
+            res.game_preserved = preserved
+
+        logger.info(f"Imported {applied} setting(s) from single player {src_path.name} into staged {paths.stage.name}.")
+        if preserved:
+            logger.info(f"Kept server-managed values: {', '.join(preserved)}")
+
+    return res
+
+# =============================================================================
 # BACKUP
 # =============================================================================
 
@@ -3056,6 +3742,483 @@ def build_logger(log_dir: Path, text_widget: tk.Text) -> Tuple[logging.Logger, T
 # =============================================================================
 # APP
 # =============================================================================
+
+@dataclass
+class SinglePlayerImportRequest:
+    sp_root: Path
+    save: Optional[SinglePlayerSave] = None
+    import_save: bool = True
+    include_profiles: bool = True
+    include_tribes: bool = True
+    target_player_id: str = ""
+    backup_first: bool = True
+    set_server_map: bool = True
+    import_gus: bool = True
+    import_game: bool = True
+    import_mods: bool = True
+    snap_floats: bool = True
+
+
+def _format_size(num_bytes: int) -> str:
+    size = float(max(0, num_bytes))
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024.0 or unit == "GB":
+            return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024.0
+    return f"{size:.1f} GB"
+
+
+class SinglePlayerImportDialog(tk.Toplevel):
+    """Pick a single player world and/or its settings and bring them onto the active server."""
+
+    PLAYER_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+    def __init__(self, app: "ServerManagerApp") -> None:
+        super().__init__(app.root)
+        self.app = app
+        self._saves: List[SinglePlayerSave] = []
+        self._iid_to_save: Dict[str, SinglePlayerSave] = {}
+
+        detected = detect_singleplayer_root()
+        self.var_sp_root = tk.StringVar(master=self, value=str(detected) if detected else "")
+        self.var_import_save = tk.BooleanVar(master=self, value=True)
+        self.var_include_profiles = tk.BooleanVar(master=self, value=True)
+        self.var_include_tribes = tk.BooleanVar(master=self, value=True)
+        self.var_rename_profile = tk.BooleanVar(master=self, value=False)
+        self.var_player_id = tk.StringVar(master=self, value="")
+        self.var_backup_first = tk.BooleanVar(master=self, value=True)
+        self.var_set_map = tk.BooleanVar(master=self, value=True)
+        self.var_import_gus = tk.BooleanVar(master=self, value=True)
+        self.var_import_game = tk.BooleanVar(master=self, value=True)
+        self.var_snap_floats = tk.BooleanVar(master=self, value=True)
+        self.var_import_mods = tk.BooleanVar(master=self, value=True)
+        self.var_mods_label = tk.StringVar(master=self, value="Import the enabled mod list")
+        self._sp_mods: List[str] = []
+        self.var_selection_info = tk.StringVar(master=self, value="No save selected.")
+        self.var_resolved_info = tk.StringVar(master=self, value="")
+        self.var_rename_claim = tk.StringVar(master=self, value="")
+        self.var_mods_detail = tk.StringVar(master=self, value="")
+        self.var_destination = tk.StringVar(master=self, value="")
+
+        self.title("Import Single Player Save")
+        self.transient(app.root)
+        self.configure(background=THEME_COLORS["bg"])
+        apply_initial_window_geometry(self, 860, 800)
+        apply_min_window_size(self, 760, 620)
+
+        self._build()
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
+        self.bind("<Escape>", lambda _e: self.destroy())
+
+        self._refresh_saves()
+        self._sync_enabled_state()
+
+        self.grab_set()
+        self.focus_set()
+
+    # -- layout ------------------------------------------------------------
+    def _build(self) -> None:
+        theme = THEME_COLORS
+        root = ttk.Frame(self, padding=12)
+        root.grid(row=0, column=0, sticky="nsew")
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(0, weight=1)
+        root.columnconfigure(0, weight=1)
+        root.rowconfigure(1, weight=1)
+
+        lf_source = ttk.LabelFrame(root, text="Single Player Location", padding=10)
+        lf_source.grid(row=0, column=0, sticky="ew")
+        lf_source.columnconfigure(1, weight=1)
+
+        ttk.Label(lf_source, text="Saved Folder").grid(row=0, column=0, sticky="w")
+        ttk.Entry(lf_source, textvariable=self.var_sp_root).grid(row=0, column=1, sticky="ew", padx=6)
+        ttk.Button(lf_source, text="Browse", command=self._browse_root).grid(row=0, column=2)
+        ttk.Button(lf_source, text="Rescan", command=self._refresh_saves).grid(row=0, column=3, padx=(6, 0))
+        ttk.Label(
+            lf_source,
+            text=r"Usually %LOCALAPPDATA%\ArkSurvivalAscended\Saved (worlds live in SavedArksLocal). "
+                 "The folder is used as given. Stop the game before importing.",
+            foreground=theme["muted"],
+            wraplength=740,
+            justify="left",
+        ).grid(row=1, column=0, columnspan=4, sticky="w", pady=(4, 0))
+        ttk.Label(
+            lf_source,
+            textvariable=self.var_resolved_info,
+            foreground=theme["muted"],
+            wraplength=740,
+            justify="left",
+        ).grid(row=2, column=0, columnspan=4, sticky="w", pady=(4, 0))
+
+        lf_saves = ttk.LabelFrame(root, text="Available Worlds", padding=10)
+        lf_saves.grid(row=1, column=0, sticky="nsew", pady=(10, 0))
+        lf_saves.columnconfigure(0, weight=1)
+        lf_saves.rowconfigure(0, weight=1)
+
+        self.tree = ttk.Treeview(
+            lf_saves,
+            columns=("map", "played", "size", "contents"),
+            show="headings",
+            height=7,
+            selectmode="browse",
+        )
+        self.tree.heading("map", text="Map")
+        self.tree.heading("played", text="Last Played")
+        self.tree.heading("size", text="Size")
+        self.tree.heading("contents", text="Contents")
+        self.tree.column("map", width=220, anchor="w")
+        self.tree.column("played", width=150, anchor="w")
+        self.tree.column("size", width=90, anchor="e")
+        self.tree.column("contents", width=220, anchor="w")
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        self.tree.bind("<<TreeviewSelect>>", lambda _e: self._on_select())
+
+        yscroll = ttk.Scrollbar(lf_saves, orient="vertical", command=self.tree.yview)
+        yscroll.grid(row=0, column=1, sticky="ns")
+        self.tree.configure(yscrollcommand=yscroll.set)
+
+        ttk.Label(lf_saves, textvariable=self.var_selection_info, foreground=theme["muted"], wraplength=740, justify="left") \
+            .grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+        lf_world = ttk.LabelFrame(root, text="World Import", padding=10)
+        lf_world.grid(row=2, column=0, sticky="ew", pady=(10, 0))
+        lf_world.columnconfigure(1, weight=1)
+
+        self.chk_import_save = ttk.Checkbutton(
+            lf_world,
+            text="Import the selected world into this server",
+            variable=self.var_import_save,
+            command=self._sync_enabled_state,
+        )
+        self.chk_import_save.grid(row=0, column=0, columnspan=3, sticky="w")
+
+        self.chk_profiles = ttk.Checkbutton(lf_world, text="Include player profiles", variable=self.var_include_profiles)
+        self.chk_profiles.grid(row=1, column=0, sticky="w", padx=(20, 0))
+        self.chk_tribes = ttk.Checkbutton(lf_world, text="Include tribes", variable=self.var_include_tribes)
+        self.chk_tribes.grid(row=1, column=1, sticky="w")
+
+        self.chk_backup = ttk.Checkbutton(
+            lf_world,
+            text="Back up the current server save first",
+            variable=self.var_backup_first,
+        )
+        self.chk_backup.grid(row=2, column=0, columnspan=3, sticky="w", padx=(20, 0), pady=(4, 0))
+
+        self.chk_set_map = ttk.Checkbutton(
+            lf_world,
+            text="Switch this server to the imported map",
+            variable=self.var_set_map,
+        )
+        self.chk_set_map.grid(row=3, column=0, columnspan=3, sticky="w", padx=(20, 0))
+
+        self.chk_rename = ttk.Checkbutton(
+            lf_world,
+            text="Rename LocalPlayer profile to player ID",
+            variable=self.var_rename_profile,
+            command=self._sync_enabled_state,
+        )
+        self.chk_rename.grid(row=4, column=0, sticky="w", padx=(20, 0), pady=(4, 0))
+        self.ent_player_id = ttk.Entry(lf_world, textvariable=self.var_player_id)
+        self.ent_player_id.grid(row=4, column=1, columnspan=2, sticky="ew", padx=6, pady=(4, 0))
+        HoverTooltip(
+            self.ent_player_id,
+            "Your EOS / Steam ID on the server - run 'whoami' in the in-game console to get it.\n"
+            "The best matching profile is copied in as <ID>.arkprofile, which is what a\n"
+            "dedicated server loads. This restores the survivor's profile only; the body\n"
+            "already standing in the world is not re-bound to your new account.",
+        )
+
+        ttk.Label(
+            lf_world,
+            textvariable=self.var_rename_claim,
+            foreground=theme["muted"],
+            wraplength=740,
+            justify="left",
+        ).grid(row=5, column=0, columnspan=3, sticky="w", padx=(38, 0), pady=(2, 0))
+
+        self.lbl_destination = ttk.Label(lf_world, textvariable=self.var_destination, foreground=theme["muted"], wraplength=740, justify="left")
+        self.lbl_destination.grid(row=6, column=0, columnspan=3, sticky="w", padx=(20, 0), pady=(6, 0))
+
+        lf_settings = ttk.LabelFrame(root, text="Settings and Mods Import", padding=10)
+        lf_settings.grid(row=3, column=0, sticky="ew", pady=(10, 0))
+        lf_settings.columnconfigure(0, weight=1)
+
+        ttk.Checkbutton(
+            lf_settings,
+            text="Import single player GameUserSettings.ini (rates, taming, day cycle, ...)",
+            variable=self.var_import_gus,
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Checkbutton(
+            lf_settings,
+            text="Import single player Game.ini (per-level stats, engrams, breeding, ...)",
+            variable=self.var_import_game,
+        ).grid(row=1, column=0, sticky="w")
+        self.chk_import_mods = ttk.Checkbutton(
+            lf_settings,
+            textvariable=self.var_mods_label,
+            variable=self.var_import_mods,
+        )
+        self.chk_import_mods.grid(row=2, column=0, sticky="w")
+        ttk.Label(
+            lf_settings,
+            textvariable=self.var_mods_detail,
+            foreground=theme["muted"],
+            wraplength=740,
+            justify="left",
+        ).grid(row=3, column=0, sticky="w", padx=(20, 0), pady=(2, 0))
+
+        ttk.Checkbutton(
+            lf_settings,
+            text="Round off slider noise (0.999989986 becomes 1, 0.439990014 becomes 0.44)",
+            variable=self.var_snap_floats,
+        ).grid(row=4, column=0, sticky="w", pady=(4, 0))
+        ttk.Label(
+            lf_settings,
+            text="ARK writes floats like 0.00999999978 for 0.01; those are always rewritten to the short "
+                 "form, which is the same value. Its settings sliders also emit 0.999989986 where you "
+                 "picked 1 - rounding those off changes the value very slightly, so untick the box to "
+                 "import them exactly as the game wrote them.",
+            foreground=theme["muted"],
+            wraplength=740,
+            justify="left",
+        ).grid(row=5, column=0, sticky="w", padx=(20, 0), pady=(2, 0))
+        ttk.Label(
+            lf_settings,
+            text="Merged into this server INI staging, so the INI Editor shows them right away and they "
+                 "apply on the next start. Server name, passwords, RCON, ports and max players are kept. "
+                 "Note that single player applies extra hidden multipliers the server does not, so some "
+                 "rates will still feel different.",
+            foreground=theme["muted"],
+            wraplength=740,
+            justify="left",
+        ).grid(row=6, column=0, sticky="w", pady=(6, 0))
+
+        buttons = ttk.Frame(root)
+        buttons.grid(row=4, column=0, sticky="e", pady=(12, 0))
+        self.btn_import = ttk.Button(buttons, text="Import", command=self._on_import)
+        self.btn_import.grid(row=0, column=0, padx=(0, 8))
+        ttk.Button(buttons, text="Cancel", command=self.destroy).grid(row=0, column=1)
+
+    # -- data --------------------------------------------------------------
+    def _browse_root(self) -> None:
+        initial = self.var_sp_root.get().strip()
+        chosen = filedialog.askdirectory(
+            parent=self,
+            title="Select the ARK: Survival Ascended 'Saved' folder",
+            initialdir=initial or None,
+        )
+        if not chosen:
+            return
+        self.var_sp_root.set(str(Path(chosen)))
+        self._refresh_saves()
+
+    def _current_root(self) -> Optional[Path]:
+        raw = self.var_sp_root.get().strip()
+        return Path(raw) if raw else None
+
+    def _refresh_saves(self) -> None:
+        self.tree.delete(*self.tree.get_children())
+        self._iid_to_save.clear()
+        self._saves = []
+
+        root = self._current_root()
+        if root is None:
+            self.var_resolved_info.set("")
+            self.var_selection_info.set("Choose the single player 'Saved' folder to scan.")
+            self._update_destination()
+            return
+
+        try:
+            self._saves = discover_singleplayer_saves(root)
+        except Exception as e:
+            self.var_resolved_info.set("")
+            self.var_selection_info.set(f"Could not scan saves: {e}")
+            self._update_destination()
+            return
+
+        self._update_resolved_info(root)
+
+        for save in self._saves:
+            contents = []
+            if save.profiles:
+                contents.append(f"{len(save.profiles)} profile(s)")
+            if save.tribes:
+                contents.append(f"{len(save.tribes)} tribe(s)")
+            iid = self.tree.insert(
+                "",
+                "end",
+                values=(
+                    save.map_name,
+                    datetime.fromtimestamp(save.modified).strftime("%Y-%m-%d %H:%M"),
+                    _format_size(save.size_bytes),
+                    ", ".join(contents) or "world only",
+                ),
+            )
+            self._iid_to_save[iid] = save
+
+        if not self._saves:
+            self.var_selection_info.set(f"No .ark world files found in or under {root}")
+        else:
+            first = self.tree.get_children()
+            if first:
+                self.tree.selection_set(first[0])
+                self.tree.focus(first[0])
+        self._on_select()
+
+    def _update_resolved_info(self, root: Path) -> None:
+        saves_root = resolve_singleplayer_saves_root(root)
+        cfg_dir = resolve_singleplayer_config_dir(root)
+        parts = [f"Worlds: {saves_root}" if saves_root else "Worlds: none found"]
+        parts.append(f"Settings: {cfg_dir}" if cfg_dir else "Settings: no INI found")
+        self.var_resolved_info.set("   |   ".join(parts))
+        self._update_mods_info(root)
+
+    def _update_mods_info(self, root: Path) -> None:
+        try:
+            self._sp_mods = read_singleplayer_active_mods(root)
+        except Exception:
+            self._sp_mods = []
+
+        count = len(self._sp_mods)
+        if count:
+            self.var_mods_label.set(f"Import the {count} mod(s) enabled in single player")
+            shown = ", ".join(self._sp_mods[:8])
+            if count > 8:
+                shown += f" (+{count - 8} more)"
+            self.var_mods_detail.set(
+                f"{shown}\nReplaces this server's Mods field, which is what -mods= is built from."
+            )
+        else:
+            self.var_mods_label.set("Import the enabled mod list (none found)")
+            self.var_mods_detail.set("")
+        try:
+            self.chk_import_mods.configure(state=("normal" if count else "disabled"))
+        except Exception:
+            pass
+
+    def _selected_save(self) -> Optional[SinglePlayerSave]:
+        sel = self.tree.selection()
+        if not sel:
+            return None
+        return self._iid_to_save.get(sel[0])
+
+    def _on_select(self) -> None:
+        save = self._selected_save()
+        if save is None:
+            if self._saves:
+                self.var_selection_info.set("No save selected.")
+            self._update_destination()
+            return
+
+        profile_names = [p.name for p in save.profiles]
+        detail = f"Source: {save.folder}"
+        if profile_names:
+            detail += f"  |  Profiles: {', '.join(profile_names[:4])}"
+            if len(profile_names) > 4:
+                detail += f" (+{len(profile_names) - 4} more)"
+        self.var_selection_info.set(detail)
+
+        local_profile = pick_local_player_profile(save.profiles)
+        if local_profile is not None:
+            if profile_carries_progression(local_profile):
+                detail = "carries level and engrams"
+            else:
+                detail = "name only - no level or engrams, you will spawn at level 1"
+            self.var_rename_claim.set(f"Will claim {local_profile.name} ({detail}).")
+            if not self.var_player_id.get().strip():
+                self.var_rename_profile.set(True)
+        else:
+            self.var_rename_claim.set("No LocalPlayer profile in this save; nothing to rename.")
+        self._update_destination()
+        self._sync_enabled_state()
+
+    def _update_destination(self) -> None:
+        save = self._selected_save()
+        if save is None or not self.var_import_save.get():
+            self.var_destination.set("")
+            return
+        cfg = self.app.cfg
+        dest = server_saves_root(Path(cfg.server_dir), cfg.alt_save_directory_name) / save.map_name
+        self.var_destination.set(f"Destination: {dest}")
+
+    def _sync_enabled_state(self) -> None:
+        importing = bool(self.var_import_save.get())
+        state = "normal" if importing else "disabled"
+        for widget in (self.chk_profiles, self.chk_tribes, self.chk_backup, self.chk_set_map, self.chk_rename):
+            widget.configure(state=state)
+        self.ent_player_id.configure(
+            state=("normal" if importing and bool(self.var_rename_profile.get()) else "disabled")
+        )
+        self._update_destination()
+
+    # -- submit ------------------------------------------------------------
+    def _on_import(self) -> None:
+        import_save = bool(self.var_import_save.get())
+        import_gus = bool(self.var_import_gus.get())
+        import_game = bool(self.var_import_game.get())
+        import_mods = bool(self.var_import_mods.get()) and bool(self._sp_mods)
+
+        if not (import_save or import_gus or import_game or import_mods):
+            messagebox.showwarning("Import Single Player", "Nothing selected to import.", parent=self)
+            return
+
+        root = self._current_root()
+        if root is None or not root.is_dir():
+            messagebox.showerror("Import Single Player", "Select a valid single player 'Saved' folder.", parent=self)
+            return
+
+        save = self._selected_save()
+        if import_save and save is None:
+            messagebox.showwarning("Import Single Player", "Select a world to import.", parent=self)
+            return
+
+        player_id = self.var_player_id.get().strip() if self.var_rename_profile.get() else ""
+        if import_save and self.var_rename_profile.get():
+            if not player_id:
+                messagebox.showerror("Import Single Player", "Enter the player ID to rename the profile to.", parent=self)
+                return
+            if not self.PLAYER_ID_RE.match(player_id):
+                messagebox.showerror(
+                    "Import Single Player",
+                    "Player ID may only contain letters, digits, '-' and '_'.",
+                    parent=self,
+                )
+                return
+
+        summary = []
+        if import_save and save is not None:
+            dest = server_saves_root(Path(self.app.cfg.server_dir), self.app.cfg.alt_save_directory_name) / save.map_name
+            summary.append(f"World '{save.map_name}' -> {dest}")
+            if dest.is_dir() and any(dest.iterdir()):
+                summary.append("An existing server save for this map will be overwritten.")
+        if import_gus:
+            summary.append("Single player GameUserSettings.ini merged into staging.")
+        if import_game:
+            summary.append("Single player Game.ini merged into staging.")
+        if self.var_import_mods.get() and self._sp_mods:
+            summary.append(f"Mods field replaced with {len(self._sp_mods)} mod id(s).")
+
+        if not messagebox.askyesno("Import Single Player", "\n".join(summary) + "\n\nContinue?", parent=self):
+            return
+
+        req = SinglePlayerImportRequest(
+            sp_root=root,
+            save=save if import_save else None,
+            import_save=import_save,
+            include_profiles=bool(self.var_include_profiles.get()),
+            include_tribes=bool(self.var_include_tribes.get()),
+            target_player_id=player_id,
+            backup_first=bool(self.var_backup_first.get()),
+            set_server_map=bool(self.var_set_map.get()),
+            import_gus=import_gus,
+            import_game=import_game,
+            import_mods=bool(self.var_import_mods.get()) and bool(self._sp_mods),
+            snap_floats=bool(self.var_snap_floats.get()),
+        )
+
+        self.destroy()
+        self.app.start_singleplayer_import(req)
+
 
 class ServerManagerApp:
     def __init__(self, root: tk.Tk, app_base: Path):
@@ -4048,18 +5211,35 @@ class ServerManagerApp:
         ttk.Label(backup_frame, text="Retention (zip count)").grid(row=2, column=0, sticky="w")
         ttk.Entry(backup_frame, textvariable=self.var_backup_retention, validate="key", validatecommand=vcmd).grid(row=2, column=1, sticky="ew", padx=6)
 
+        sp_frame = ttk.LabelFrame(lf_ops, text="Single Player", padding=8)
+        sp_frame.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(10, 0))
+        sp_frame.columnconfigure(0, weight=1)
+
+        self.btn_sp_import = ttk.Button(
+            sp_frame,
+            text="Import Single Player Save / Settings...",
+            command=self.open_singleplayer_import,
+        )
+        self.btn_sp_import.grid(row=0, column=0, sticky="ew")
+        self._sp_import_tooltip = HoverTooltip(
+            self.btn_sp_import,
+            "Copy a local single player world onto this server, and optionally merge its\n"
+            "GameUserSettings.ini / Game.ini into this server INI staging.\n"
+            "Server name, passwords, RCON, ports and max players are kept.",
+        )
+
         ttk.Checkbutton(
             lf_ops,
             text="Start server on app launch (last profile)",
             variable=self.var_auto_start_on_launch,
-        ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(10, 0))
+        ).grid(row=3, column=0, columnspan=3, sticky="w", pady=(10, 0))
 
         ttk.Checkbutton(
             lf_ops,
             text="Hide GameAnalytics debug spam (console only)",
             variable=self.var_hide_gameanalytics_console_logs,
             command=self._sync_console_log_filter_state,
-        ).grid(row=3, column=0, columnspan=3, sticky="w", pady=(10, 0))
+        ).grid(row=4, column=0, columnspan=3, sticky="w", pady=(10, 0))
 
         # ---------------- Advanced Start Args tab ----------------
         self.tab_adv.columnconfigure(0, weight=1)
@@ -4810,6 +5990,7 @@ class ServerManagerApp:
         self.btn_start.configure(state=("disabled" if busy or running else "normal"))
         self.btn_stop.configure(state=("disabled" if busy or not running else "normal"))
         self.btn_backup_now.configure(state=("disabled" if busy else "normal"))
+        self.btn_sp_import.configure(state=("disabled" if busy or running else "normal"))
 
         self.btn_rcon_send.configure(state=("disabled" if busy else "normal"))
         self.btn_auto_update_test.configure(state=("disabled" if busy else "normal"))
@@ -5355,6 +6536,159 @@ class ServerManagerApp:
     # ---------------------------------------------------------------------
     # Auto Update Loop
     # ---------------------------------------------------------------------
+    # ---------------------------------------------------------------------
+    # Single player import
+    # ---------------------------------------------------------------------
+    def open_singleplayer_import(self) -> None:
+        if self._is_busy():
+            return
+        if self._is_server_running():
+            messagebox.showwarning(
+                "Import Single Player",
+                "Stop the server before importing a single player save.",
+            )
+            return
+
+        try:
+            self.cfg = self._collect_vars_to_cfg()
+            self._save_active_server_config(self.cfg)
+        except Exception as e:
+            messagebox.showerror("Import Single Player", f"Current configuration is invalid: {e}")
+            return
+
+        SinglePlayerImportDialog(self)
+
+    def start_singleplayer_import(self, req: SinglePlayerImportRequest) -> None:
+        if self._is_server_running():
+            messagebox.showwarning(
+                "Import Single Player",
+                "Stop the server before importing a single player save.",
+            )
+            return
+
+        cfg = self.cfg
+        server_dir = Path(cfg.server_dir)
+        server_id = self.active_server_id
+        app_base = self.app_base
+        backup_root = Path(cfg.backup_dir.strip()) if cfg.backup_dir.strip() else (app_base / BACKUP_DIR_NAME)
+
+        def job() -> None:
+            result = SinglePlayerImportResult()
+
+            if req.import_save and req.save is not None:
+                import_singleplayer_save(
+                    req.save,
+                    server_dir,
+                    cfg.alt_save_directory_name,
+                    self.logger,
+                    include_profiles=req.include_profiles,
+                    include_tribes=req.include_tribes,
+                    target_player_id=req.target_player_id,
+                    backup_root=backup_root if req.backup_first else None,
+                    result=result,
+                )
+
+            if req.import_gus or req.import_game:
+                import_singleplayer_settings(
+                    req.sp_root,
+                    app_base,
+                    server_id,
+                    server_dir,
+                    self.logger,
+                    server_running=False,
+                    import_gus=req.import_gus,
+                    import_game=req.import_game,
+                    tidy_floats=True,
+                    snap_floats=req.snap_floats,
+                    result=result,
+                )
+
+            if req.import_mods:
+                result.mods_found = read_singleplayer_active_mods(req.sp_root)
+                if result.mods_found:
+                    self.logger.info(
+                        f"Single player mods: {', '.join(result.mods_found)}"
+                    )
+
+            self._ui(lambda: self._finish_singleplayer_import(req, result))
+
+        self._run_task("Import Single Player", job)
+
+    def _finish_singleplayer_import(self, req: SinglePlayerImportRequest, result: SinglePlayerImportResult) -> None:
+        if req.set_server_map and req.save is not None and req.import_save:
+            map_name = req.save.map_name
+            if map_name in MAP_PRESETS:
+                self.var_map_preset.set(map_name)
+            else:
+                self.var_map_preset.set(MAP_CUSTOM_SENTINEL)
+            self.var_map_custom.set(map_name)
+            self._sync_map_mode()
+            try:
+                self.cfg = self._collect_vars_to_cfg()
+                self._save_active_server_config(self.cfg)
+            except Exception:
+                pass
+
+        if req.import_mods and result.mods_found:
+            result.mods_previous = self._mods_text_get().strip()
+            self._mods_text_set(",".join(result.mods_found))
+            try:
+                self.cfg = self._collect_vars_to_cfg()
+                self._save_active_server_config(self.cfg)
+            except Exception as e:
+                self.logger.error(f"Saving imported mod list failed: {e}")
+
+        if req.import_gus or req.import_game:
+            try:
+                if self._ini_loaded_target:
+                    self._ini_load_target(self._ini_loaded_target)
+                self._ini_visual_refresh_all()
+            except Exception as e:
+                self.logger.error(f"Refreshing INI editor after import failed: {e}")
+
+        lines: List[str] = []
+        if req.import_save and result.destination is not None:
+            lines.append(f"Copied {result.files_copied} save file(s) to:\n{result.destination}")
+            if result.backup_zip is not None:
+                lines.append(f"Previous server save archived to:\n{result.backup_zip}")
+            if result.renamed_profiles:
+                lines.append("Local player profile imported as " + ", ".join(result.renamed_profiles) + ".")
+            if req.set_server_map and req.save is not None:
+                lines.append(f"Server map set to {req.save.map_name}.")
+
+        if result.settings_source is not None:
+            lines.append(f"Settings read from:\n{result.settings_source}")
+            if req.import_gus:
+                lines.append(f"GameUserSettings.ini: {result.gus_applied} value(s) staged.")
+            if req.import_game:
+                lines.append(f"Game.ini: {result.game_applied} value(s) staged.")
+            if result.floats_tidied:
+                lines.append(f"Cleaned up {result.floats_tidied} float value(s) written by the game.")
+
+        if req.import_mods and result.mods_found:
+            mod_line = f"Mods field set to {len(result.mods_found)} mod(s):\n{', '.join(result.mods_found)}"
+            if result.mods_previous and result.mods_previous != ",".join(result.mods_found):
+                mod_line += f"\n(previously: {result.mods_previous})"
+            lines.append(mod_line)
+            lines.append(
+                "Install those mods on the server too - they are passed with -mods= on the next start."
+            )
+
+        preserved = list(dict.fromkeys(result.gus_preserved + result.game_preserved))
+        if preserved:
+            shown = ", ".join(preserved[:6])
+            if len(preserved) > 6:
+                shown += f" (+{len(preserved) - 6} more)"
+            lines.append(f"Kept server-managed values: {shown}")
+
+        lines.extend(result.notes)
+
+        if result.settings_source is not None:
+            lines.append("Staged INI changes are written to the server on the next start.")
+
+        self._set_status(f"Single player import done ({self._status_timestamp()})")
+        messagebox.showinfo("Import Single Player", "\n\n".join(lines) if lines else "Nothing was imported.")
+
     def _sync_auto_update_scheduler(self) -> None:
         try:
             self.cfg = self._collect_vars_to_cfg()

@@ -87,6 +87,16 @@ This manager separates *edit time* and *runtime*:
 - Zip retention policy
 - Optional “include configs” mode
 
+### Single player import
+- Auto-detects the game folder across every Steam library, plus `%LOCALAPPDATA%` and Game Pass installs
+- The folder you pick is used as given — point at the game folder, at `Saved`, at `SavedArksLocal`, or straight at a single map folder
+- Copies the selected world (plus profiles and tribes) into the server save folder, honouring `AltSaveDirectoryName`
+- Optionally claims your single player character: the newest `LocalPlayer*` profile is copied in as `<YourID>.arkprofile`, which is what a dedicated server loads
+- Zips the server save it is about to overwrite into the backup folder first
+- Optionally merges the single player `GameUserSettings.ini` / `Game.ini` into staging; server name, passwords, RCON, ports and max players are kept
+- Cleans up ARK's float spew (`0.00999999978` becomes `0.01`), and optionally rounds off its slider noise (`0.999989986` becomes `1`)
+- Optionally copies the mod list: the client's `ActiveMods` becomes the server's Mods field, so they are passed with `-mods=` on the next start
+
 ### Auto update & restart
 - Time-based update/validate + safe restart
 - Skips triggers while the app is busy
