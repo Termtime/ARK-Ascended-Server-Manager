@@ -113,6 +113,32 @@ LOG_FILE_NAME = "app.log"
 STAGING_DIR_NAME = "staging"
 BASELINE_DIR_NAME = "baseline"
 BACKUP_DIR_NAME = "backups"
+# Written into every zip the manager makes, so the backup screen can tell which server
+# a zip belongs to when several profiles share one backup folder.
+BACKUP_MANIFEST_NAME = "asa_manager_backup.json"
+BACKUP_KIND_FULL = "full"
+BACKUP_KIND_PRE_IMPORT = "pre-import"
+BACKUP_KIND_PRE_RESTORE = "pre-restore"
+BACKUP_KIND_AUTO_SAVE = "auto-save"
+BACKUP_FULL_PREFIX = "ASA_Backup_"
+AUTO_SAVE_PREFIX = "ASA_AutoSave_"
+# Auto-saves only run while the server is up, since a stopped world does not change.
+# They are zipped under their own prefix and pruned against their own count, so a busy
+# timer can never push manual or on-stop backups out of retention.
+AUTO_SAVE_DEFAULT_INTERVAL_MIN = 60
+AUTO_SAVE_MIN_INTERVAL_MIN = 5
+AUTO_SAVE_MAX_INTERVAL_MIN = 7 * 24 * 60
+AUTO_SAVE_TICK_SEC = 15.0
+AUTO_SAVE_DEFAULT_KEEP = 12
+AUTO_SAVE_MAX_KEEP = 500
+# Breathing room after SaveWorld returns before the save files are zipped.
+AUTO_SAVE_SETTLE_SEC = 5.0
+BACKUP_ZIP_PREFIXES = (
+    ("ASA_Backup_", BACKUP_KIND_FULL),
+    ("ASA_PreImport_", BACKUP_KIND_PRE_IMPORT),
+    ("ASA_PreRestore_", BACKUP_KIND_PRE_RESTORE),
+    ("ASA_AutoSave_", BACKUP_KIND_AUTO_SAVE),
+)
 SERVERS_DIR_NAME = "servers"
 LOCKS_DIR_NAME = "locks"
 GLOBAL_CONFIG_NAME = "global.json"
@@ -143,17 +169,11 @@ SERVER_SAVED_ARKS_DIR_NAME = "SavedArks"
 SP_CONFIG_DIR_NAME = "Config"
 SP_CONFIG_PLATFORM_DIRS = ("Windows", "WindowsNoEditor", "WindowsClient", "WindowsServer")
 SP_CONFIG_SEARCH_DEPTH = 5
-SP_LOCAL_PROFILE_STEM = "localplayer"
-# A dedicated server loads <PlayerID>.arkprofile, whatever the client called its own copy.
-SP_SERVER_PROFILE_SUFFIX = ".arkprofile"
-
-# A complete character profile carries these; a name-only stub does not. Importing a
-# stub gets the survivor's name back but leaves them at level 1 with no engrams, so it
-# is worth telling the user which one they have.
-SP_PROFILE_PROGRESSION_MARKERS = (
-    b"CharacterStatusComponent_ExtraCharacterLevel",
-    b"PlayerState_TotalEngramPoints",
-)
+# The server rebuilds player data for its own accounts on its first save, so a single
+# player survivor never comes across with the world; it has to travel through an obelisk.
+# The tribe does come across, and its id is the .arktribe file name, which is exactly
+# what TakeTribe needs to hand the old base and tames to the new survivor.
+SP_TRIBE_ID_RE = re.compile(r"^\d{5,}$")
 
 # ARK writes float32 spew: 0.00999999978 for 0.01, and its sliders emit 0.999989986 for 1.
 # The client records its enabled CurseForge mods here; a server takes the same ids via -mods=.
@@ -234,6 +254,7 @@ THEME_COLORS = {
     "accent": "#2563eb",
     "accent_dark": "#1d4ed8",
     "accent_light": "#e6eefc",
+    "warning": "#b45309",
     "console_bg": "#0b1220",
     "console_fg": "#e2e8f0",
     "console_select": "#1e293b",
@@ -1114,6 +1135,9 @@ class AppConfig:
     backup_on_stop: bool = True
     backup_dir: str = ""
     backup_retention: int = 20
+    auto_save_enabled: bool = False
+    auto_save_interval_minutes: int = AUTO_SAVE_DEFAULT_INTERVAL_MIN
+    auto_save_retention: int = AUTO_SAVE_DEFAULT_KEEP
     backup_include_configs: bool = True
 
     auto_update_restart: bool = False
@@ -3062,8 +3086,7 @@ class SinglePlayerImportResult:
     destination: Optional[Path] = None
     files_copied: int = 0
     backup_zip: Optional[Path] = None
-    renamed_profiles: List[str] = field(default_factory=list)
-    claimed_profile_is_stub: bool = False
+    tribe_ids: List[str] = field(default_factory=list)
     settings_source: Optional[Path] = None
     floats_tidied: int = 0
     mods_found: List[str] = field(default_factory=list)
@@ -3301,12 +3324,23 @@ def read_singleplayer_active_mods(sp_root: Path) -> List[str]:
     return parse_mod_id_list(raw)
 
 
+def singleplayer_tribe_ids(save: SinglePlayerSave) -> List[str]:
+    """Tribe ids in a save, taken from its .arktribe / .tribebak file names."""
+    ids = [p.stem for p in save.tribes if SP_TRIBE_ID_RE.match(p.stem)]
+    return list(dict.fromkeys(ids))
+
+
 def server_saves_root(server_dir: Path, alt_save_directory_name: str = "") -> Path:
     name = (alt_save_directory_name or "").strip() or SERVER_SAVED_ARKS_DIR_NAME
     return server_saved_dir(server_dir) / name
 
 
-def backup_server_save_folder(folder: Path, backup_root: Path, logger: logging.Logger) -> Optional[Path]:
+def backup_server_save_folder(
+    folder: Path,
+    backup_root: Path,
+    logger: logging.Logger,
+    manifest: Optional[Dict[str, Any]] = None,
+) -> Optional[Path]:
     """Zip the server save folder about to be overwritten. None when there is nothing to keep."""
     if not folder.is_dir():
         return None
@@ -3318,7 +3352,9 @@ def backup_server_save_folder(folder: Path, backup_root: Path, logger: logging.L
     out_zip = backup_root / f"ASA_PreImport_{folder.name}_{now_ts()}.zip"
     with zipfile.ZipFile(out_zip, "w", compression=zipfile.ZIP_DEFLATED) as z:
         for p in files:
-            z.write(p, arcname=str(p.relative_to(folder)))
+            z.write(p, arcname=p.relative_to(folder).as_posix())
+        if manifest is not None:
+            z.writestr(BACKUP_MANIFEST_NAME, json.dumps(manifest, indent=2))
     logger.info(f"Pre-import backup created: {out_zip}")
     return out_zip
 
@@ -3331,8 +3367,8 @@ def import_singleplayer_save(
     *,
     include_profiles: bool = True,
     include_tribes: bool = True,
-    target_player_id: str = "",
     backup_root: Optional[Path] = None,
+    backup_info: Optional[Dict[str, Any]] = None,
     result: Optional[SinglePlayerImportResult] = None,
 ) -> SinglePlayerImportResult:
     res = result if result is not None else SinglePlayerImportResult()
@@ -3344,7 +3380,7 @@ def import_singleplayer_save(
     res.destination = dest_dir
 
     if backup_root is not None:
-        res.backup_zip = backup_server_save_folder(dest_dir, backup_root, logger)
+        res.backup_zip = backup_server_save_folder(dest_dir, backup_root, logger, backup_info)
 
     ensure_dir(dest_dir)
 
@@ -3354,80 +3390,15 @@ def import_singleplayer_save(
     if include_tribes:
         sources.extend(save.tribes)
 
-    player_id = (target_player_id or "").strip()
-    local_profile = pick_local_player_profile(save.profiles) if (player_id and include_profiles) else None
-
     for src in sources:
-        name = src.name
-        if local_profile is not None and src == local_profile:
-            name = f"{player_id}{SP_SERVER_PROFILE_SUFFIX}"
-            res.renamed_profiles.append(f"{src.name} -> {name}")
-            res.claimed_profile_is_stub = not profile_carries_progression(src)
-        shutil.copy2(src, dest_dir / name)
+        shutil.copy2(src, dest_dir / src.name)
         res.files_copied += 1
 
+    if include_tribes:
+        res.tribe_ids = singleplayer_tribe_ids(save)
+
     logger.info(f"Imported {res.files_copied} single player save file(s) into {dest_dir}")
-    if res.renamed_profiles:
-        logger.info(f"Local player profile imported as {', '.join(res.renamed_profiles)}")
-    elif player_id:
-        res.notes.append("No LocalPlayer profile was found to rename.")
-    if res.claimed_profile_is_stub:
-        res.notes.append(
-            "That profile holds only the survivor's name - no level or engram data - so you "
-            "will spawn at level 1. ARK did not leave a complete profile in this save; the "
-            "character itself lives inside the world and stays where you left it."
-        )
-        logger.info("Claimed profile is a name-only stub; character progression will not carry over.")
-    if player_id and len(save.profiles) > 1:
-        res.notes.append(
-            "Other profile files were copied under their original names; only the newest "
-            "LocalPlayer profile was claimed for your player ID."
-        )
-
     return res
-
-
-def profile_carries_progression(path: Path) -> bool:
-    """True when the profile holds level/engram data rather than just a name."""
-    try:
-        blob = path.read_bytes()
-    except OSError:
-        return False
-    return any(marker in blob for marker in SP_PROFILE_PROGRESSION_MARKERS)
-
-
-def _profile_mtime(p: Path) -> float:
-    try:
-        return p.stat().st_mtime
-    except OSError:
-        return 0.0
-
-
-def pick_local_player_profile(profiles: Tuple[Path, ...]) -> Optional[Path]:
-    """The profile most likely to be this save's character.
-
-    ASA does not always leave a LocalPlayer.arkprofile behind. A local save may hold
-    only stale LocalPlayer.profilebak stubs while the real profile sits under an EOS id
-    instead, so prefer whichever candidate actually carries level and engram data.
-    """
-    if not profiles:
-        return None
-
-    local = [p for p in profiles if p.stem.lower().startswith(SP_LOCAL_PROFILE_STEM)]
-    others = [p for p in profiles if p not in local]
-
-    def newest(seq: List[Path]) -> Optional[Path]:
-        return max(seq, key=_profile_mtime) if seq else None
-
-    local_full = [p for p in local if profile_carries_progression(p)]
-    if local_full:
-        return newest(local_full)
-
-    other_full = [p for p in others if profile_carries_progression(p)]
-    if other_full:
-        return newest(other_full)
-
-    return newest(local) or newest(others)
 
 
 _INI_FLOAT_RE = re.compile(r"^[+-]?(?:\d+\.\d*|\.\d+)(?:[eE][+-]?\d+)?$")
@@ -3640,49 +3611,529 @@ def import_singleplayer_settings(
 # BACKUP
 # =============================================================================
 
-def backup_server(cfg: AppConfig, app_base: Path, logger: logging.Logger) -> Optional[Path]:
-    server_dir = Path(cfg.server_dir)
-    saved = server_saved_dir(server_dir)
-    if not saved.exists():
-        logger.info("Backup skipped: Saved folder not found.")
-        return None
+def resolve_backup_root(cfg: AppConfig, app_base: Path) -> Path:
+    raw = (cfg.backup_dir or "").strip()
+    return Path(raw) if raw else (app_base / BACKUP_DIR_NAME)
 
-    target_dir = Path(cfg.backup_dir.strip()) if cfg.backup_dir.strip() else (app_base / BACKUP_DIR_NAME)
-    ensure_dir(target_dir)
 
-    name = f"ASA_Backup_{now_ts()}.zip"
-    out_zip = target_dir / name
+def backup_manifest(kind: str, server_id: str = "", server_name: str = "", map_name: str = "") -> Dict[str, Any]:
+    return {
+        "format": 1,
+        "kind": kind,
+        "server_id": server_id,
+        "server_name": server_name,
+        "map": map_name,
+        "created": datetime.now().isoformat(timespec="seconds"),
+    }
 
-    include_paths = [saved, server_config_dir(server_dir)]
 
-    logger.info(f"Creating backup: {out_zip}")
+def read_backup_manifest(path: Path) -> Dict[str, Any]:
+    try:
+        with zipfile.ZipFile(path) as z:
+            if BACKUP_MANIFEST_NAME not in z.namelist():
+                return {}
+            data = json.loads(z.read(BACKUP_MANIFEST_NAME).decode("utf-8"))
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
 
+
+def _zip_server_tree(
+    out_zip: Path,
+    server_dir: Path,
+    roots: List[Path],
+    manifest: Optional[Dict[str, Any]],
+) -> int:
+    """Zip every file under roots, stored relative to the server folder, each file once."""
+    base = server_dir.resolve()
+    seen: Set[str] = set()
     with zipfile.ZipFile(out_zip, "w", compression=zipfile.ZIP_DEFLATED) as z:
-        for root in include_paths:
+        for root in roots:
             root = root.resolve()
             if not root.exists():
                 continue
             for path in root.rglob("*"):
-                if path.is_dir():
+                if not path.is_file():
                     continue
-                arc = path.relative_to(server_dir.resolve())
-                z.write(path, arcname=str(arc))
+                arc = path.relative_to(base).as_posix()
+                if arc in seen:
+                    continue
+                seen.add(arc)
+                z.write(path, arcname=arc)
+        if manifest is not None:
+            z.writestr(BACKUP_MANIFEST_NAME, json.dumps(manifest, indent=2))
+    return len(seen)
 
-    logger.info("Backup completed.")
+
+def prune_server_backups(
+    target_dir: Path,
+    server_id: str,
+    retention: Any,
+    logger: logging.Logger,
+    prefix: str = BACKUP_FULL_PREFIX,
+) -> None:
+    """Keep the newest zips of this server that carry the given prefix.
+
+    Backups and auto-saves use different prefixes, so each is only ever pruned against
+    its own count. Several profiles can share one backup folder; a zip whose manifest
+    names another server is left alone. Zips from before manifests existed are pruned
+    as before.
+    """
+    try:
+        keep = max(1, int(retention))
+    except Exception:
+        return
+
+    mine: List[Path] = []
+    for p in target_dir.glob(f"{prefix}*.zip"):
+        owner = str(read_backup_manifest(p).get("server_id", "") or "")
+        if owner and server_id and owner != server_id:
+            continue
+        mine.append(p)
+
+    def modified(p: Path) -> float:
+        try:
+            return p.stat().st_mtime
+        except OSError:
+            return 0.0
+
+    mine.sort(key=modified, reverse=True)
+    for old in mine[keep:]:
+        try:
+            old.unlink()
+            logger.info(f"Retention: deleted {old.name}")
+        except Exception:
+            pass
+
+
+def _write_server_zip(
+    cfg: AppConfig,
+    app_base: Path,
+    logger: logging.Logger,
+    server_id: str,
+    *,
+    prefix: str,
+    kind: str,
+    retention: Any,
+    label: str,
+) -> Optional[Path]:
+    server_dir = Path(cfg.server_dir)
+    saved = server_saved_dir(server_dir)
+    if not saved.exists():
+        logger.info(f"{label} skipped: Saved folder not found.")
+        return None
+
+    target_dir = resolve_backup_root(cfg, app_base)
+    ensure_dir(target_dir)
+    out_zip = target_dir / f"{prefix}{now_ts()}.zip"
+
+    logger.info(f"Creating {label.lower()}: {out_zip}")
+    # The config folder lives inside Saved, so zipping Saved already covers it.
+    try:
+        _zip_server_tree(
+            out_zip,
+            server_dir,
+            [saved],
+            backup_manifest(kind, server_id, cfg.server_name, cfg.map_name),
+        )
+    except Exception:
+        # A half-written zip would be listed as a backup and count towards retention.
+        with contextlib.suppress(OSError):
+            out_zip.unlink()
+        raise
+    logger.info(f"{label} completed.")
+
+    prune_server_backups(target_dir, server_id, retention, logger, prefix=prefix)
+    return out_zip
+
+
+def backup_server(cfg: AppConfig, app_base: Path, logger: logging.Logger, server_id: str = "") -> Optional[Path]:
+    return _write_server_zip(
+        cfg, app_base, logger, server_id,
+        prefix=BACKUP_FULL_PREFIX, kind=BACKUP_KIND_FULL, retention=cfg.backup_retention, label="Backup",
+    )
+
+
+def auto_save_server(cfg: AppConfig, app_base: Path, logger: logging.Logger, server_id: str = "") -> Optional[Path]:
+    """Zip the save as an auto-save; these rotate in their own slots, apart from backups."""
+    return _write_server_zip(
+        cfg, app_base, logger, server_id,
+        prefix=AUTO_SAVE_PREFIX, kind=BACKUP_KIND_AUTO_SAVE,
+        retention=clamp_auto_save_keep(cfg.auto_save_retention), label="Auto-save",
+    )
+
+
+# -- auto-saves ----------------------------------------------------------------
+
+def clamp_auto_save_minutes(value: Any) -> int:
+    minutes = safe_int(value, AUTO_SAVE_DEFAULT_INTERVAL_MIN)
+    if minutes <= 0:
+        minutes = AUTO_SAVE_DEFAULT_INTERVAL_MIN
+    return max(AUTO_SAVE_MIN_INTERVAL_MIN, min(AUTO_SAVE_MAX_INTERVAL_MIN, minutes))
+
+
+def describe_span(seconds: float) -> str:
+    """'45 minutes', '10 hours', '2 days 6 hours' - for sentences, unlike format_duration."""
+    minutes = max(0, int(round(seconds / 60)))
+    days, rem = divmod(minutes, 24 * 60)
+    hours, mins = divmod(rem, 60)
+
+    def unit(n: int, word: str) -> str:
+        return f"{n} {word}" + ("" if n == 1 else "s")
+
+    if days:
+        return unit(days, "day") + (f" {unit(hours, 'hour')}" if hours else "")
+    if hours:
+        return unit(hours, "hour") + (f" {unit(mins, 'minute')}" if mins else "")
+    return unit(mins, "minute")
+
+
+def clamp_auto_save_keep(value: Any) -> int:
+    keep = safe_int(value, AUTO_SAVE_DEFAULT_KEEP)
+    if keep <= 0:
+        keep = AUTO_SAVE_DEFAULT_KEEP
+    return min(AUTO_SAVE_MAX_KEEP, keep)
+
+
+def auto_save_interval_seconds(cfg: AppConfig) -> Optional[float]:
+    """Seconds between auto-saves, or None when they are off."""
+    if not cfg.auto_save_enabled:
+        return None
+    return float(clamp_auto_save_minutes(cfg.auto_save_interval_minutes) * 60)
+
+
+class AutoSaveScheduler:
+    """Decides when the next auto-save is due; the clock is passed in.
+
+    The countdown starts when the server is seen running and resets whenever it
+    stops, the feature is turned off, or the interval changes.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._next_due: Optional[float] = None
+        self._interval: Optional[float] = None
+
+    def tick(self, now: float, interval: Optional[float], server_running: bool) -> bool:
+        """True when an auto-save should start now; call mark_started() once it has."""
+        with self._lock:
+            if interval is None or not server_running:
+                self._next_due = None
+                self._interval = None
+                return False
+            if self._next_due is None or interval != self._interval:
+                self._interval = interval
+                self._next_due = now + interval
+                return False
+            return now >= self._next_due
+
+    def mark_started(self, now: float) -> None:
+        with self._lock:
+            if self._interval is not None:
+                self._next_due = now + self._interval
+
+    def seconds_until_due(self, now: float) -> Optional[float]:
+        with self._lock:
+            return None if self._next_due is None else max(0.0, self._next_due - now)
+
+
+# -- listing and restoring ---------------------------------------------------
+
+SERVER_SAVED_ZIP_PREFIX = "ShooterGame/Saved/"
+_BACKUP_NAME_RE = re.compile(
+    r"^ASA_(?:Backup|AutoSave|PreImport|PreRestore)_(?:(?P<map>.+)_)?"
+    r"(?P<ts>\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2})\.zip$",
+    re.IGNORECASE,
+)
+
+
+@dataclass
+class ServerBackup:
+    path: Path
+    kind: str = "unknown"
+    created: float = 0.0
+    size_bytes: int = 0
+    server_id: str = ""
+    server_name: str = ""
+    layout: str = ""  # "server": paths relative to the server folder; "map": a bare map folder
+    map_prefixes: Dict[str, str] = field(default_factory=dict)  # map -> zip member prefix
+    config_members: Dict[str, str] = field(default_factory=dict)  # "gus" / "game" -> member
+    file_count: int = 0
+    error: str = ""
+
+    @property
+    def maps(self) -> List[str]:
+        return sorted(self.map_prefixes)
+
+    @property
+    def restorable(self) -> bool:
+        return not self.error and bool(self.map_prefixes or self.config_members)
+
+
+def _session_name_from_ini(data: bytes) -> str:
+    try:
+        doc = IniDocument.parse(data.decode("utf-8-sig", errors="ignore"))
+    except Exception:
+        return ""
+    values = doc.get_last_value_map()
+    for section in ("SessionSettings", "/Script/Engine.GameSession"):
+        name = (values.get(section, {}).get("SessionName") or "").strip()
+        if name:
+            return name
+    return ""
+
+
+def read_server_backup(path: Path) -> ServerBackup:
+    """Describe a backup zip from its contents; the file name is only a fallback."""
+    b = ServerBackup(path=path)
+    try:
+        st = path.stat()
+    except OSError as e:
+        b.error = str(e)
+        return b
+    b.size_bytes = st.st_size
+    b.created = st.st_mtime
+
+    for prefix, kind in BACKUP_ZIP_PREFIXES:
+        if path.name.startswith(prefix):
+            b.kind = kind
+            break
+    name_match = _BACKUP_NAME_RE.match(path.name)
+    if name_match:
+        try:
+            b.created = datetime.strptime(name_match.group("ts"), "%Y-%m-%d_%H-%M-%S").timestamp()
+        except ValueError:
+            pass
 
     try:
-        keep = max(1, int(cfg.backup_retention))
-        zips = sorted(target_dir.glob("ASA_Backup_*.zip"), key=lambda p: p.stat().st_mtime, reverse=True)
-        for old in zips[keep:]:
-            try:
-                old.unlink()
-                logger.info(f"Retention: deleted {old.name}")
-            except Exception:
-                pass
-    except Exception:
-        pass
+        with zipfile.ZipFile(path) as z:
+            names = [n for n in dict.fromkeys(z.namelist()) if not n.endswith("/")]
+            manifest: Dict[str, Any] = {}
+            if BACKUP_MANIFEST_NAME in names:
+                try:
+                    loaded = json.loads(z.read(BACKUP_MANIFEST_NAME).decode("utf-8"))
+                    manifest = loaded if isinstance(loaded, dict) else {}
+                except Exception:
+                    manifest = {}
+                names.remove(BACKUP_MANIFEST_NAME)
 
+            b.file_count = len(names)
+            b.kind = str(manifest.get("kind") or b.kind)
+            b.server_id = str(manifest.get("server_id") or "")
+            b.server_name = str(manifest.get("server_name") or "")
+
+            if any(n.startswith(SERVER_SAVED_ZIP_PREFIX) for n in names):
+                b.layout = "server"
+                for n in names:
+                    if not n.startswith(SERVER_SAVED_ZIP_PREFIX) or not n.lower().endswith(".ark"):
+                        continue
+                    parts = n[len(SERVER_SAVED_ZIP_PREFIX):].split("/")
+                    # <SavedArks or AltSaveDirectoryName>/<map>/<file>.ark
+                    if len(parts) < 3 or parts[0].lower() == "config":
+                        continue
+                    b.map_prefixes.setdefault(parts[1], f"{SERVER_SAVED_ZIP_PREFIX}{parts[0]}/{parts[1]}/")
+                for key, rel in (("gus", GAMEUSERSETTINGS_REL), ("game", GAME_INI_REL)):
+                    member = rel.as_posix()
+                    if member in names:
+                        b.config_members[key] = member
+                if not b.server_name and "gus" in b.config_members:
+                    b.server_name = _session_name_from_ini(z.read(b.config_members["gus"]))
+            else:
+                top_arks = [n for n in names if "/" not in n and n.lower().endswith(".ark")]
+                if top_arks:
+                    b.layout = "map"
+                    # The folder also keeps dated copies (TheIsland_WP_19.09.2026_00.40.52.ark);
+                    # the live world is the shortest name.
+                    map_name = str(manifest.get("map") or "")
+                    if not map_name and name_match and name_match.group("map"):
+                        map_name = name_match.group("map")
+                    if not map_name:
+                        map_name = min((Path(n).stem for n in top_arks), key=len)
+                    b.map_prefixes[map_name] = ""
+    except (zipfile.BadZipFile, OSError) as e:
+        b.error = f"Unreadable zip: {e}"
+
+    if not b.error and not b.restorable:
+        b.error = "No world save or server settings inside."
+    return b
+
+
+def list_server_backups(backup_root: Path) -> List[ServerBackup]:
+    if not backup_root.is_dir():
+        return []
+    items = [read_server_backup(p) for p in backup_root.glob("*.zip") if p.is_file()]
+    items.sort(key=lambda b: b.created, reverse=True)
+    return items
+
+
+def backup_owner_match(backup: ServerBackup, server_id: str, server_name: str) -> Optional[bool]:
+    """True when the zip is this server's, False when it is provably another's, None if unknown."""
+    if backup.server_id and server_id:
+        return backup.server_id == server_id
+    if backup.server_name and server_name:
+        return backup.server_name.strip().lower() == server_name.strip().lower()
+    return None
+
+
+@dataclass
+class BackupRestoreResult:
+    safety_zip: Optional[Path] = None
+    destination: Optional[Path] = None
+    maps_restored: List[str] = field(default_factory=list)
+    files_written: int = 0
+    config_restored: List[str] = field(default_factory=list)
+
+
+def _member_target(root: Path, rel: str) -> Path:
+    target = (root / rel).resolve()
+    base = root.resolve()
+    if target != base and base not in target.parents:
+        raise ValueError(f"Refusing to extract outside the save folder: {rel}")
+    return target
+
+
+def create_pre_restore_backup(
+    server_dir: Path,
+    alt_save_directory_name: str,
+    backup_root: Path,
+    logger: logging.Logger,
+    server_id: str = "",
+    server_name: str = "",
+) -> Optional[Path]:
+    """Zip the saves and INIs a restore is about to replace, in the same layout as a full backup."""
+    roots = [
+        p for p in (server_saves_root(server_dir, alt_save_directory_name), server_config_dir(server_dir))
+        if p.is_dir() and any(q.is_file() for q in p.rglob("*"))
+    ]
+    if not roots:
+        return None
+    ensure_dir(backup_root)
+    out_zip = backup_root / f"ASA_PreRestore_{now_ts()}.zip"
+    count = _zip_server_tree(
+        out_zip, server_dir, roots, backup_manifest(BACKUP_KIND_PRE_RESTORE, server_id, server_name)
+    )
+    logger.info(f"Pre-restore backup created: {out_zip} ({count} file(s))")
     return out_zip
+
+
+def restore_server_backup(
+    backup: ServerBackup,
+    server_dir: Path,
+    alt_save_directory_name: str,
+    app_base: Path,
+    server_id: str,
+    logger: logging.Logger,
+    *,
+    restore_world: bool = True,
+    restore_config: bool = True,
+    safety_root: Optional[Path] = None,
+    server_name: str = "",
+) -> BackupRestoreResult:
+    """Put a backup back on the server.
+
+    Each map folder is rebuilt beside the live one and swapped in, so a failure part way
+    leaves the current save untouched. Restored INIs replace the live copy and the INI
+    staging together, so the next start applies exactly what the backup held.
+    """
+    maps = backup.maps if restore_world else []
+    configs = dict(backup.config_members) if restore_config else {}
+    if not maps and not configs:
+        raise ValueError("Nothing selected to restore from this backup.")
+
+    res = BackupRestoreResult()
+    saves_root = server_saves_root(server_dir, alt_save_directory_name)
+    res.destination = saves_root
+
+    if safety_root is not None:
+        res.safety_zip = create_pre_restore_backup(
+            server_dir, alt_save_directory_name, safety_root, logger, server_id, server_name
+        )
+
+    with zipfile.ZipFile(backup.path) as z:
+        names = [n for n in dict.fromkeys(z.namelist()) if not n.endswith("/") and n != BACKUP_MANIFEST_NAME]
+
+        for map_name in maps:
+            prefix = backup.map_prefixes[map_name]
+            members = [n for n in names if n.startswith(prefix)]
+            if not members:
+                continue
+
+            ensure_dir(saves_root)
+            dest = saves_root / map_name
+            incoming = saves_root / f".{map_name}.restoring"
+            outgoing = saves_root / f".{map_name}.replaced"
+            for leftover in (incoming, outgoing):
+                if leftover.exists():
+                    shutil.rmtree(leftover, ignore_errors=True)
+            ensure_dir(incoming)
+
+            written = 0
+            try:
+                for n in members:
+                    target = _member_target(incoming, n[len(prefix):])
+                    ensure_dir(target.parent)
+                    with z.open(n) as src, open(target, "wb") as out:
+                        shutil.copyfileobj(src, out, 1024 * 1024)
+                    stamp = time.mktime(z.getinfo(n).date_time + (0, 0, -1))
+                    os.utime(target, (stamp, stamp))
+                    written += 1
+
+                if dest.exists():
+                    os.replace(dest, outgoing)
+                try:
+                    os.replace(incoming, dest)
+                except Exception:
+                    if outgoing.exists() and not dest.exists():
+                        os.replace(outgoing, dest)
+                    raise
+            except Exception:
+                shutil.rmtree(incoming, ignore_errors=True)
+                raise
+
+            shutil.rmtree(outgoing, ignore_errors=True)
+            res.files_written += written
+            res.maps_restored.append(map_name)
+            logger.info(f"Restored {written} file(s) of {map_name} from {backup.path.name}")
+
+        for key, member in configs.items():
+            data = z.read(member)
+            paths = ini_stage_paths(app_base, server_id, server_dir, key)
+            for target in (paths.live, paths.stage, paths.stage_base):
+                atomic_write_bytes(target, data)
+            if paths.baseline.exists():
+                atomic_write_bytes(paths.baseline, data)
+            res.config_restored.append(paths.live.name)
+            logger.info(f"Restored {paths.live.name} from {backup.path.name}")
+
+    return res
+
+
+def find_server_processes(server_dir: Path) -> List[int]:
+    """PIDs of ArkAscendedServer.exe running from this install, including ones the manager did not start."""
+    if os.name != "nt":
+        return []
+    script = (
+        "Get-CimInstance Win32_Process -Filter \"Name='ArkAscendedServer.exe'\" | "
+        "ForEach-Object { \"$($_.ProcessId)|$($_.ExecutablePath)\" }"
+    )
+    try:
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+            capture_output=True,
+            text=True,
+            timeout=20,
+            creationflags=CREATE_NO_WINDOW,
+        ).stdout
+    except Exception:
+        return []
+
+    want = os.path.normcase(os.path.normpath(str(ark_server_exe(server_dir))))
+    pids: List[int] = []
+    for line in (out or "").splitlines():
+        pid, _, exe = line.strip().partition("|")
+        if pid.isdigit() and exe and os.path.normcase(os.path.normpath(exe)) == want:
+            pids.append(int(pid))
+    return pids
 
 # =============================================================================
 # GUI LOGGING
@@ -3750,7 +4201,6 @@ class SinglePlayerImportRequest:
     import_save: bool = True
     include_profiles: bool = True
     include_tribes: bool = True
-    target_player_id: str = ""
     backup_first: bool = True
     set_server_map: bool = True
     import_gus: bool = True
@@ -3771,8 +4221,6 @@ def _format_size(num_bytes: int) -> str:
 class SinglePlayerImportDialog(tk.Toplevel):
     """Pick a single player world and/or its settings and bring them onto the active server."""
 
-    PLAYER_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
-
     def __init__(self, app: "ServerManagerApp") -> None:
         super().__init__(app.root)
         self.app = app
@@ -3784,8 +4232,6 @@ class SinglePlayerImportDialog(tk.Toplevel):
         self.var_import_save = tk.BooleanVar(master=self, value=True)
         self.var_include_profiles = tk.BooleanVar(master=self, value=True)
         self.var_include_tribes = tk.BooleanVar(master=self, value=True)
-        self.var_rename_profile = tk.BooleanVar(master=self, value=False)
-        self.var_player_id = tk.StringVar(master=self, value="")
         self.var_backup_first = tk.BooleanVar(master=self, value=True)
         self.var_set_map = tk.BooleanVar(master=self, value=True)
         self.var_import_gus = tk.BooleanVar(master=self, value=True)
@@ -3796,15 +4242,17 @@ class SinglePlayerImportDialog(tk.Toplevel):
         self._sp_mods: List[str] = []
         self.var_selection_info = tk.StringVar(master=self, value="No save selected.")
         self.var_resolved_info = tk.StringVar(master=self, value="")
-        self.var_rename_claim = tk.StringVar(master=self, value="")
+        self.var_tribe_hint = tk.StringVar(master=self, value="")
+        self._guide_vars: List[tk.StringVar] = []
+        self._rendered_tribe_ids: Optional[List[str]] = None
         self.var_mods_detail = tk.StringVar(master=self, value="")
         self.var_destination = tk.StringVar(master=self, value="")
 
         self.title("Import Single Player Save")
         self.transient(app.root)
         self.configure(background=THEME_COLORS["bg"])
-        apply_initial_window_geometry(self, 860, 800)
-        apply_min_window_size(self, 760, 620)
+        apply_initial_window_geometry(self, 1200, 800)
+        apply_min_window_size(self, 1040, 640)
 
         self._build()
         self.protocol("WM_DELETE_WINDOW", self.destroy)
@@ -3819,15 +4267,17 @@ class SinglePlayerImportDialog(tk.Toplevel):
     # -- layout ------------------------------------------------------------
     def _build(self) -> None:
         theme = THEME_COLORS
+        wrap = 660
         root = ttk.Frame(self, padding=12)
         root.grid(row=0, column=0, sticky="nsew")
         self.columnconfigure(0, weight=1)
         self.rowconfigure(0, weight=1)
         root.columnconfigure(0, weight=1)
+        root.columnconfigure(1, weight=0, minsize=380)
         root.rowconfigure(1, weight=1)
 
         lf_source = ttk.LabelFrame(root, text="Single Player Location", padding=10)
-        lf_source.grid(row=0, column=0, sticky="ew")
+        lf_source.grid(row=0, column=0, columnspan=2, sticky="ew")
         lf_source.columnconfigure(1, weight=1)
 
         ttk.Label(lf_source, text="Saved Folder").grid(row=0, column=0, sticky="w")
@@ -3839,14 +4289,14 @@ class SinglePlayerImportDialog(tk.Toplevel):
             text=r"Usually %LOCALAPPDATA%\ArkSurvivalAscended\Saved (worlds live in SavedArksLocal). "
                  "The folder is used as given. Stop the game before importing.",
             foreground=theme["muted"],
-            wraplength=740,
+            wraplength=1080,
             justify="left",
         ).grid(row=1, column=0, columnspan=4, sticky="w", pady=(4, 0))
         ttk.Label(
             lf_source,
             textvariable=self.var_resolved_info,
             foreground=theme["muted"],
-            wraplength=740,
+            wraplength=1080,
             justify="left",
         ).grid(row=2, column=0, columnspan=4, sticky="w", pady=(4, 0))
 
@@ -3859,17 +4309,17 @@ class SinglePlayerImportDialog(tk.Toplevel):
             lf_saves,
             columns=("map", "played", "size", "contents"),
             show="headings",
-            height=7,
+            height=6,
             selectmode="browse",
         )
         self.tree.heading("map", text="Map")
         self.tree.heading("played", text="Last Played")
         self.tree.heading("size", text="Size")
         self.tree.heading("contents", text="Contents")
-        self.tree.column("map", width=220, anchor="w")
-        self.tree.column("played", width=150, anchor="w")
-        self.tree.column("size", width=90, anchor="e")
-        self.tree.column("contents", width=220, anchor="w")
+        self.tree.column("map", width=200, anchor="w")
+        self.tree.column("played", width=140, anchor="w")
+        self.tree.column("size", width=80, anchor="e")
+        self.tree.column("contents", width=200, anchor="w")
         self.tree.grid(row=0, column=0, sticky="nsew")
         self.tree.bind("<<TreeviewSelect>>", lambda _e: self._on_select())
 
@@ -3877,7 +4327,7 @@ class SinglePlayerImportDialog(tk.Toplevel):
         yscroll.grid(row=0, column=1, sticky="ns")
         self.tree.configure(yscrollcommand=yscroll.set)
 
-        ttk.Label(lf_saves, textvariable=self.var_selection_info, foreground=theme["muted"], wraplength=740, justify="left") \
+        ttk.Label(lf_saves, textvariable=self.var_selection_info, foreground=theme["muted"], wraplength=wrap, justify="left") \
             .grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
         lf_world = ttk.LabelFrame(root, text="World Import", padding=10)
@@ -3911,33 +4361,8 @@ class SinglePlayerImportDialog(tk.Toplevel):
         )
         self.chk_set_map.grid(row=3, column=0, columnspan=3, sticky="w", padx=(20, 0))
 
-        self.chk_rename = ttk.Checkbutton(
-            lf_world,
-            text="Rename LocalPlayer profile to player ID",
-            variable=self.var_rename_profile,
-            command=self._sync_enabled_state,
-        )
-        self.chk_rename.grid(row=4, column=0, sticky="w", padx=(20, 0), pady=(4, 0))
-        self.ent_player_id = ttk.Entry(lf_world, textvariable=self.var_player_id)
-        self.ent_player_id.grid(row=4, column=1, columnspan=2, sticky="ew", padx=6, pady=(4, 0))
-        HoverTooltip(
-            self.ent_player_id,
-            "Your EOS / Steam ID on the server - run 'whoami' in the in-game console to get it.\n"
-            "The best matching profile is copied in as <ID>.arkprofile, which is what a\n"
-            "dedicated server loads. This restores the survivor's profile only; the body\n"
-            "already standing in the world is not re-bound to your new account.",
-        )
-
-        ttk.Label(
-            lf_world,
-            textvariable=self.var_rename_claim,
-            foreground=theme["muted"],
-            wraplength=740,
-            justify="left",
-        ).grid(row=5, column=0, columnspan=3, sticky="w", padx=(38, 0), pady=(2, 0))
-
-        self.lbl_destination = ttk.Label(lf_world, textvariable=self.var_destination, foreground=theme["muted"], wraplength=740, justify="left")
-        self.lbl_destination.grid(row=6, column=0, columnspan=3, sticky="w", padx=(20, 0), pady=(6, 0))
+        self.lbl_destination = ttk.Label(lf_world, textvariable=self.var_destination, foreground=theme["muted"], wraplength=wrap, justify="left")
+        self.lbl_destination.grid(row=4, column=0, columnspan=3, sticky="w", padx=(20, 0), pady=(6, 0))
 
         lf_settings = ttk.LabelFrame(root, text="Settings and Mods Import", padding=10)
         lf_settings.grid(row=3, column=0, sticky="ew", pady=(10, 0))
@@ -3963,7 +4388,7 @@ class SinglePlayerImportDialog(tk.Toplevel):
             lf_settings,
             textvariable=self.var_mods_detail,
             foreground=theme["muted"],
-            wraplength=740,
+            wraplength=wrap,
             justify="left",
         ).grid(row=3, column=0, sticky="w", padx=(20, 0), pady=(2, 0))
 
@@ -3979,7 +4404,7 @@ class SinglePlayerImportDialog(tk.Toplevel):
                  "picked 1 - rounding those off changes the value very slightly, so untick the box to "
                  "import them exactly as the game wrote them.",
             foreground=theme["muted"],
-            wraplength=740,
+            wraplength=wrap,
             justify="left",
         ).grid(row=5, column=0, sticky="w", padx=(20, 0), pady=(2, 0))
         ttk.Label(
@@ -3989,15 +4414,127 @@ class SinglePlayerImportDialog(tk.Toplevel):
                  "Note that single player applies extra hidden multipliers the server does not, so some "
                  "rates will still feel different.",
             foreground=theme["muted"],
-            wraplength=740,
+            wraplength=wrap,
             justify="left",
         ).grid(row=6, column=0, sticky="w", pady=(6, 0))
 
+        self._build_guide(root)
+
         buttons = ttk.Frame(root)
-        buttons.grid(row=4, column=0, sticky="e", pady=(12, 0))
+        buttons.grid(row=4, column=0, columnspan=2, sticky="e", pady=(12, 0))
         self.btn_import = ttk.Button(buttons, text="Import", command=self._on_import)
         self.btn_import.grid(row=0, column=0, padx=(0, 8))
         ttk.Button(buttons, text="Cancel", command=self.destroy).grid(row=0, column=1)
+
+    def _build_guide(self, parent: ttk.Frame) -> None:
+        """Step by step for bringing the survivor across, which the world copy cannot do."""
+        theme = THEME_COLORS
+        wrap = 340
+        lf = ttk.LabelFrame(parent, text="Moving Your Character", padding=10)
+        lf.grid(row=1, column=1, rowspan=3, sticky="nsew", padx=(10, 0), pady=(10, 0))
+        lf.columnconfigure(0, weight=1)
+
+        def para(row: int, text: str, muted: bool = False, top: int = 8) -> int:
+            ttk.Label(
+                lf,
+                text=text,
+                foreground=(theme["muted"] if muted else theme["text"]),
+                wraplength=wrap,
+                justify="left",
+            ).grid(row=row, column=0, columnspan=2, sticky="w", pady=(top, 0))
+            return row + 1
+
+        row = para(
+            0,
+            "Your survivor does not come across with the world: the server rebuilds player data "
+            "for its own accounts on its first save. Bring it over through an obelisk instead.",
+            muted=True,
+            top=0,
+        )
+        row = para(
+            row,
+            "1. Before importing, load this world in single player and upload your survivor at an "
+            "obelisk or supply terminal. Put anything you want to keep in your base first - the base "
+            "comes across with the world.",
+        )
+        row = para(row, "2. Exit the game, import the world here, then start the server and join it.")
+        row = para(row, "3. Download that survivor at an obelisk or terminal on the server.")
+        row = para(
+            row,
+            "4. Your base and tames still belong to the single player tribe. Open the console, "
+            "enable admin, then take them over:",
+        )
+        row = self._guide_command(lf, row, "enablecheats <admin password>")
+
+        self.guide_tribe_frame = ttk.Frame(lf)
+        self.guide_tribe_frame.grid(row=row, column=0, columnspan=2, sticky="ew")
+        self.guide_tribe_frame.columnconfigure(0, weight=1)
+        row += 1
+        ttk.Label(
+            lf,
+            textvariable=self.var_tribe_hint,
+            foreground=theme["muted"],
+            wraplength=wrap,
+            justify="left",
+        ).grid(row=row, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        row += 1
+
+        row = para(row, "Or look at one of your structures or tames and run:", muted=True)
+        row = self._guide_command(lf, row, "cheat TakeAllStructure")
+        row = self._guide_command(lf, row, "cheat TakeAllDino")
+        para(
+            row,
+            "Each takes everything of the tribe you are looking at, not only that one structure or tame.",
+            muted=True,
+            top=4,
+        )
+
+        self._render_tribe_commands([])
+
+    def _guide_command(self, parent: tk.Misc, row: int, command: str) -> int:
+        var = tk.StringVar(master=self, value=command)
+        self._guide_vars.append(var)
+        ttk.Entry(parent, textvariable=var, state="readonly", font=("Consolas", 10)) \
+            .grid(row=row, column=0, sticky="ew", pady=(4, 0))
+        btn = ttk.Button(parent, text="Copy", width=7)
+        btn.configure(command=lambda: self._copy_command(var.get(), btn))
+        btn.grid(row=row, column=1, sticky="e", padx=(6, 0), pady=(4, 0))
+        return row + 1
+
+    def _copy_command(self, command: str, button: ttk.Button) -> None:
+        self.clipboard_clear()
+        self.clipboard_append(command)
+        button.configure(text="Copied")
+
+        def reset() -> None:
+            try:
+                button.configure(text="Copy")
+            except tk.TclError:
+                pass
+
+        self.after(1200, reset)
+
+    def _render_tribe_commands(self, tribe_ids: List[str]) -> None:
+        # Selecting a row fires <<TreeviewSelect>> on top of the direct call; rebuilding
+        # identical rows would drop a pending "Copied" confirmation for nothing.
+        if tribe_ids == self._rendered_tribe_ids and self.guide_tribe_frame.winfo_children():
+            return
+        self._rendered_tribe_ids = list(tribe_ids)
+        for child in self.guide_tribe_frame.winfo_children():
+            child.destroy()
+        shown = tribe_ids[:3]
+        commands = [f"cheat TakeTribe {tid}" for tid in shown] or ["cheat TakeTribe <tribe id>"]
+        row = 0
+        for command in commands:
+            row = self._guide_command(self.guide_tribe_frame, row, command)
+
+        if tribe_ids:
+            hint = "Takes every structure and tame of the tribe in one go - no need to find them. The id comes from this save's tribe file."
+            if len(tribe_ids) > len(shown):
+                hint += f" This save has {len(tribe_ids) - len(shown)} more tribe(s)."
+        else:
+            hint = "This save has no tribe file, so use the look-at commands below instead."
+        self.var_tribe_hint.set(hint)
 
     # -- data --------------------------------------------------------------
     def _browse_root(self) -> None:
@@ -4107,28 +4644,16 @@ class SinglePlayerImportDialog(tk.Toplevel):
         if save is None:
             if self._saves:
                 self.var_selection_info.set("No save selected.")
+            self._render_tribe_commands([])
             self._update_destination()
             return
 
-        profile_names = [p.name for p in save.profiles]
+        tribe_ids = singleplayer_tribe_ids(save)
         detail = f"Source: {save.folder}"
-        if profile_names:
-            detail += f"  |  Profiles: {', '.join(profile_names[:4])}"
-            if len(profile_names) > 4:
-                detail += f" (+{len(profile_names) - 4} more)"
+        if tribe_ids:
+            detail += f"  |  Tribe ID: {', '.join(tribe_ids[:3])}"
         self.var_selection_info.set(detail)
-
-        local_profile = pick_local_player_profile(save.profiles)
-        if local_profile is not None:
-            if profile_carries_progression(local_profile):
-                detail = "carries level and engrams"
-            else:
-                detail = "name only - no level or engrams, you will spawn at level 1"
-            self.var_rename_claim.set(f"Will claim {local_profile.name} ({detail}).")
-            if not self.var_player_id.get().strip():
-                self.var_rename_profile.set(True)
-        else:
-            self.var_rename_claim.set("No LocalPlayer profile in this save; nothing to rename.")
+        self._render_tribe_commands(tribe_ids)
         self._update_destination()
         self._sync_enabled_state()
 
@@ -4144,11 +4669,8 @@ class SinglePlayerImportDialog(tk.Toplevel):
     def _sync_enabled_state(self) -> None:
         importing = bool(self.var_import_save.get())
         state = "normal" if importing else "disabled"
-        for widget in (self.chk_profiles, self.chk_tribes, self.chk_backup, self.chk_set_map, self.chk_rename):
+        for widget in (self.chk_profiles, self.chk_tribes, self.chk_backup, self.chk_set_map):
             widget.configure(state=state)
-        self.ent_player_id.configure(
-            state=("normal" if importing and bool(self.var_rename_profile.get()) else "disabled")
-        )
         self._update_destination()
 
     # -- submit ------------------------------------------------------------
@@ -4172,19 +4694,6 @@ class SinglePlayerImportDialog(tk.Toplevel):
             messagebox.showwarning("Import Single Player", "Select a world to import.", parent=self)
             return
 
-        player_id = self.var_player_id.get().strip() if self.var_rename_profile.get() else ""
-        if import_save and self.var_rename_profile.get():
-            if not player_id:
-                messagebox.showerror("Import Single Player", "Enter the player ID to rename the profile to.", parent=self)
-                return
-            if not self.PLAYER_ID_RE.match(player_id):
-                messagebox.showerror(
-                    "Import Single Player",
-                    "Player ID may only contain letters, digits, '-' and '_'.",
-                    parent=self,
-                )
-                return
-
         summary = []
         if import_save and save is not None:
             dest = server_saves_root(Path(self.app.cfg.server_dir), self.app.cfg.alt_save_directory_name) / save.map_name
@@ -4195,7 +4704,7 @@ class SinglePlayerImportDialog(tk.Toplevel):
             summary.append("Single player GameUserSettings.ini merged into staging.")
         if import_game:
             summary.append("Single player Game.ini merged into staging.")
-        if self.var_import_mods.get() and self._sp_mods:
+        if import_mods:
             summary.append(f"Mods field replaced with {len(self._sp_mods)} mod id(s).")
 
         if not messagebox.askyesno("Import Single Player", "\n".join(summary) + "\n\nContinue?", parent=self):
@@ -4207,17 +4716,414 @@ class SinglePlayerImportDialog(tk.Toplevel):
             import_save=import_save,
             include_profiles=bool(self.var_include_profiles.get()),
             include_tribes=bool(self.var_include_tribes.get()),
-            target_player_id=player_id,
             backup_first=bool(self.var_backup_first.get()),
             set_server_map=bool(self.var_set_map.get()),
             import_gus=import_gus,
             import_game=import_game,
-            import_mods=bool(self.var_import_mods.get()) and bool(self._sp_mods),
+            import_mods=import_mods,
             snap_floats=bool(self.var_snap_floats.get()),
         )
 
         self.destroy()
         self.app.start_singleplayer_import(req)
+
+
+@dataclass
+class BackupRestoreRequest:
+    backup: ServerBackup
+    restore_world: bool = True
+    restore_config: bool = False
+    safety_backup: bool = True
+
+
+class BackupManagerDialog(tk.Toplevel):
+    """List this server's backup zips, make new ones, and put one back."""
+
+    KIND_LABELS = {
+        BACKUP_KIND_FULL: "Full backup",
+        BACKUP_KIND_PRE_IMPORT: "Before import",
+        BACKUP_KIND_PRE_RESTORE: "Before restore",
+        BACKUP_KIND_AUTO_SAVE: "Auto-save",
+    }
+
+    def __init__(self, app: "ServerManagerApp") -> None:
+        super().__init__(app.root)
+        self.app = app
+        self.backup_root = resolve_backup_root(app.cfg, app.app_base)
+        self._backups: List[ServerBackup] = []
+        self._picked: List[ServerBackup] = []
+        self._iid_to_backup: Dict[str, ServerBackup] = {}
+
+        self.var_folder = tk.StringVar(master=self, value=str(self.backup_root))
+        self.var_only_mine = tk.BooleanVar(master=self, value=True)
+        self.var_show_auto_saves = tk.BooleanVar(master=self, value=True)
+        self.var_hidden = tk.StringVar(master=self, value="")
+        self.var_detail = tk.StringVar(master=self, value="")
+        self.var_warning = tk.StringVar(master=self, value="")
+        self.var_restore_world = tk.BooleanVar(master=self, value=True)
+        self.var_restore_config = tk.BooleanVar(master=self, value=False)
+        self.var_safety = tk.BooleanVar(master=self, value=True)
+
+        self.title(f"Backups - {app.cfg.server_name}")
+        self.transient(app.root)
+        self.configure(background=THEME_COLORS["bg"])
+        apply_initial_window_geometry(self, 1000, 680)
+        apply_min_window_size(self, 840, 560)
+
+        self._build()
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
+        self.bind("<Escape>", lambda _e: self.destroy())
+
+        self._refresh()
+
+        self.grab_set()
+        self.focus_set()
+
+    # -- layout ------------------------------------------------------------
+    def _build(self) -> None:
+        theme = THEME_COLORS
+        root = ttk.Frame(self, padding=12)
+        root.grid(row=0, column=0, sticky="nsew")
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(0, weight=1)
+        root.columnconfigure(0, weight=1)
+        root.rowconfigure(1, weight=1)
+
+        lf_folder = ttk.LabelFrame(root, text="Backup Folder", padding=10)
+        lf_folder.grid(row=0, column=0, sticky="ew")
+        lf_folder.columnconfigure(0, weight=1)
+        ttk.Label(lf_folder, textvariable=self.var_folder, wraplength=760, justify="left").grid(row=0, column=0, sticky="w")
+        ttk.Button(lf_folder, text="Open Folder", command=self._open_folder).grid(row=0, column=1, padx=(6, 0))
+        ttk.Button(lf_folder, text="Refresh", command=self._refresh).grid(row=0, column=2, padx=(6, 0))
+        filters = ttk.Frame(lf_folder)
+        filters.grid(row=1, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        ttk.Checkbutton(
+            filters,
+            text="Only show this server's backups",
+            variable=self.var_only_mine,
+            command=self._populate,
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Checkbutton(
+            filters,
+            text="Show auto-saves",
+            variable=self.var_show_auto_saves,
+            command=self._populate,
+        ).grid(row=0, column=1, sticky="w", padx=(16, 0))
+        ttk.Label(lf_folder, textvariable=self.var_hidden, foreground=theme["muted"], wraplength=900, justify="left") \
+            .grid(row=2, column=0, columnspan=3, sticky="w")
+
+        lf_list = ttk.LabelFrame(root, text="Backups", padding=10)
+        lf_list.grid(row=1, column=0, sticky="nsew", pady=(10, 0))
+        lf_list.columnconfigure(0, weight=1)
+        lf_list.rowconfigure(0, weight=1)
+
+        self.tree = ttk.Treeview(
+            lf_list,
+            columns=("created", "kind", "server", "contents", "size"),
+            show="headings",
+            height=10,
+            selectmode="browse",
+        )
+        for col, label, width, anchor in (
+            ("created", "Created", 140, "w"),
+            ("kind", "Type", 110, "w"),
+            ("server", "Server", 150, "w"),
+            ("contents", "Contents", 320, "w"),
+            ("size", "Size", 90, "e"),
+        ):
+            self.tree.heading(col, text=label)
+            self.tree.column(col, width=width, anchor=anchor)
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        self.tree.bind("<<TreeviewSelect>>", lambda _e: self._on_select())
+
+        yscroll = ttk.Scrollbar(lf_list, orient="vertical", command=self.tree.yview)
+        yscroll.grid(row=0, column=1, sticky="ns")
+        self.tree.configure(yscrollcommand=yscroll.set)
+
+        ttk.Label(lf_list, textvariable=self.var_detail, foreground=theme["muted"], wraplength=900, justify="left") \
+            .grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+        lf_restore = ttk.LabelFrame(root, text="Restore", padding=10)
+        lf_restore.grid(row=2, column=0, sticky="ew", pady=(10, 0))
+        lf_restore.columnconfigure(0, weight=1)
+
+        self.chk_world = ttk.Checkbutton(
+            lf_restore,
+            text="World save - replaces the map folder on this server",
+            variable=self.var_restore_world,
+            command=self._sync_state,
+        )
+        self.chk_world.grid(row=0, column=0, sticky="w")
+        self.chk_config = ttk.Checkbutton(
+            lf_restore,
+            text="Server settings - GameUserSettings.ini and Game.ini, replacing anything staged in the INI Editor",
+            variable=self.var_restore_config,
+            command=self._sync_state,
+        )
+        self.chk_config.grid(row=1, column=0, sticky="w")
+        ttk.Checkbutton(
+            lf_restore,
+            text="Zip the current save and settings first (recommended)",
+            variable=self.var_safety,
+        ).grid(row=2, column=0, sticky="w", pady=(4, 0))
+        ttk.Label(
+            lf_restore,
+            text="The server must be stopped. Server name, passwords, RCON and max players come from this "
+                 "profile and are applied again on the next start, whatever the backup holds.",
+            foreground=theme["muted"],
+            wraplength=900,
+            justify="left",
+        ).grid(row=3, column=0, sticky="w", pady=(6, 0))
+        ttk.Label(lf_restore, textvariable=self.var_warning, foreground=theme["warning"], wraplength=900, justify="left") \
+            .grid(row=4, column=0, sticky="w", pady=(4, 0))
+
+        buttons = ttk.Frame(root)
+        buttons.grid(row=3, column=0, sticky="ew", pady=(12, 0))
+        buttons.columnconfigure(3, weight=1)
+        self.btn_backup = ttk.Button(buttons, text="Backup Now", command=self._backup_now)
+        self.btn_backup.grid(row=0, column=0)
+        ttk.Button(buttons, text="Restore From Zip...", command=self._pick_zip).grid(row=0, column=1, padx=(8, 0))
+        self.btn_delete = ttk.Button(buttons, text="Delete", command=self._delete)
+        self.btn_delete.grid(row=0, column=2, padx=(8, 0))
+        self.btn_restore = ttk.Button(buttons, text="Restore", command=self._on_restore)
+        self.btn_restore.grid(row=0, column=4, padx=(0, 8))
+        ttk.Button(buttons, text="Close", command=self.destroy).grid(row=0, column=5)
+
+    # -- data --------------------------------------------------------------
+    def _owner(self, backup: ServerBackup) -> Optional[bool]:
+        return backup_owner_match(backup, self.app.active_server_id, self.app.cfg.server_name)
+
+    def _is_picked(self, backup: ServerBackup) -> bool:
+        return any(p.path == backup.path for p in self._picked)
+
+    def _refresh(self) -> None:
+        try:
+            self._backups = list_server_backups(self.backup_root)
+        except Exception as e:
+            self._backups = []
+            self.var_detail.set(f"Could not read the backup folder: {e}")
+        self._populate()
+
+    def _row_values(self, backup: ServerBackup) -> Tuple[str, str, str, str, str]:
+        created = datetime.fromtimestamp(backup.created).strftime("%Y-%m-%d %H:%M") if backup.created else ""
+        kind = self.KIND_LABELS.get(backup.kind, "Other zip")
+        if self._is_picked(backup):
+            kind += " (picked)"
+        if backup.error:
+            contents = backup.error
+        else:
+            parts = []
+            if backup.maps:
+                parts.append(", ".join(backup.maps))
+            if backup.config_members:
+                parts.append("settings")
+            contents = " + ".join(parts)
+        return created, kind, backup.server_name or "unknown", contents, _format_size(backup.size_bytes)
+
+    def _populate(self, select_path: Optional[Path] = None) -> None:
+        current = self._selected()
+        want = select_path or (current.path if current is not None else None)
+
+        self.tree.delete(*self.tree.get_children())
+        self._iid_to_backup.clear()
+
+        only_mine = bool(self.var_only_mine.get())
+        show_auto = bool(self.var_show_auto_saves.get())
+        hidden = 0
+        chosen_iid = ""
+        for backup in self._picked + self._backups:
+            if only_mine and not self._is_picked(backup) and self._owner(backup) is False:
+                hidden += 1
+                continue
+            if not show_auto and not self._is_picked(backup) and backup.kind == BACKUP_KIND_AUTO_SAVE:
+                continue
+            iid = self.tree.insert("", "end", values=self._row_values(backup))
+            self._iid_to_backup[iid] = backup
+            if want is not None and backup.path == want and not chosen_iid:
+                chosen_iid = iid
+
+        if not self._backups and not self._picked:
+            self.var_hidden.set("No backups in this folder yet.")
+        elif hidden:
+            self.var_hidden.set(f"{hidden} backup(s) from other servers sharing this folder are hidden.")
+        else:
+            self.var_hidden.set("")
+
+        children = self.tree.get_children()
+        target = chosen_iid or (children[0] if children else "")
+        if target:
+            self.tree.selection_set(target)
+            self.tree.focus(target)
+            self.tree.see(target)
+        self._on_select()
+
+    def _selected(self) -> Optional[ServerBackup]:
+        try:
+            sel = self.tree.selection()
+        except tk.TclError:
+            return None
+        return self._iid_to_backup.get(sel[0]) if sel else None
+
+    def _on_select(self) -> None:
+        backup = self._selected()
+        if backup is None:
+            self.var_detail.set("Select a backup." if self.tree.get_children() else "")
+            self.var_warning.set("")
+            self._sync_state()
+            return
+
+        lines = [str(backup.path)]
+        if backup.error:
+            lines.append(backup.error)
+        else:
+            settings = "included" if backup.config_members else "not included"
+            lines.append(
+                f"{backup.file_count} file(s). World: {', '.join(backup.maps) or 'none'}. Settings: {settings}."
+            )
+        self.var_detail.set("\n".join(lines))
+
+        owner = self._owner(backup)
+        if owner is False:
+            self.var_warning.set(
+                f"This backup belongs to '{backup.server_name or 'another server'}', not to {self.app.cfg.server_name}."
+            )
+        elif owner is None and backup.restorable:
+            self.var_warning.set("This backup does not record which server it came from - check the date before restoring.")
+        else:
+            self.var_warning.set("")
+        self._sync_state()
+
+    def _sync_state(self) -> None:
+        backup = self._selected()
+        busy = self.app._is_busy()
+        has_world = bool(backup is not None and backup.restorable and backup.maps)
+        has_config = bool(backup is not None and backup.restorable and backup.config_members)
+        self.chk_world.configure(state=("normal" if has_world else "disabled"))
+        self.chk_config.configure(state=("normal" if has_config else "disabled"))
+        wanted = (has_world and bool(self.var_restore_world.get())) or (has_config and bool(self.var_restore_config.get()))
+        self.btn_restore.configure(state=("normal" if wanted and not busy else "disabled"))
+        can_delete = backup is not None and not self._is_picked(backup) and not busy
+        self.btn_delete.configure(state=("normal" if can_delete else "disabled"))
+        self.btn_backup.configure(state=("disabled" if busy else "normal"))
+
+    # -- actions -----------------------------------------------------------
+    def _open_folder(self) -> None:
+        open_folder(self.backup_root)
+
+    def _backup_now(self) -> None:
+        if self.app._is_busy():
+            messagebox.showinfo("Backups", "Another task is running. Try again when it finishes.", parent=self)
+            return
+        for button in (self.btn_backup, self.btn_restore, self.btn_delete):
+            button.configure(state="disabled")
+        self.var_detail.set("Creating backup...")
+        self.app.backup_now(on_done=self._after_backup)
+
+    def _after_backup(self, path: Optional[Path]) -> None:
+        try:
+            if not self.winfo_exists():
+                return
+        except tk.TclError:
+            return
+        try:
+            self._backups = list_server_backups(self.backup_root)
+        except Exception:
+            pass
+        self._populate(select_path=path)
+
+    def _pick_zip(self) -> None:
+        chosen = filedialog.askopenfilename(
+            parent=self,
+            title="Select a backup zip to restore",
+            filetypes=[("Zip archives", "*.zip"), ("All files", "*.*")],
+            initialdir=str(self.backup_root) if self.backup_root.is_dir() else None,
+        )
+        if not chosen:
+            return
+        backup = read_server_backup(Path(chosen))
+        if not backup.restorable:
+            messagebox.showerror("Backups", f"{Path(chosen).name}: {backup.error}", parent=self)
+            return
+        in_folder = any(b.path.resolve() == backup.path.resolve() for b in self._backups)
+        if not in_folder:
+            self._picked = [backup] + [p for p in self._picked if p.path != backup.path]
+        self._populate(select_path=backup.path)
+
+    def _delete(self) -> None:
+        backup = self._selected()
+        if backup is None or self._is_picked(backup):
+            return
+        if not messagebox.askyesno(
+            "Delete Backup",
+            f"Delete {backup.path.name}?\n\nThis cannot be undone.",
+            icon="warning",
+            parent=self,
+        ):
+            return
+        try:
+            backup.path.unlink()
+        except Exception as e:
+            messagebox.showerror("Delete Backup", f"Could not delete {backup.path.name}: {e}", parent=self)
+            return
+        self.app.logger.info(f"Deleted backup {backup.path.name}")
+        self._refresh()
+
+    def _on_restore(self) -> None:
+        backup = self._selected()
+        if backup is None or not backup.restorable:
+            return
+        restore_world = bool(self.var_restore_world.get()) and bool(backup.maps)
+        restore_config = bool(self.var_restore_config.get()) and bool(backup.config_members)
+        if not (restore_world or restore_config):
+            messagebox.showwarning("Restore Backup", "Nothing selected to restore.", parent=self)
+            return
+        if self.app._is_server_running():
+            messagebox.showwarning("Restore Backup", "Stop the server before restoring a backup.", parent=self)
+            return
+        # The task runner drops requests while busy; say so instead of closing on nothing.
+        if self.app._is_busy():
+            messagebox.showinfo("Restore Backup", "Another task is running. Try again when it finishes.", parent=self)
+            return
+
+        cfg = self.app.cfg
+        saves_root = server_saves_root(Path(cfg.server_dir), cfg.alt_save_directory_name)
+        created = datetime.fromtimestamp(backup.created).strftime("%Y-%m-%d %H:%M") if backup.created else "unknown date"
+        safety = bool(self.var_safety.get())
+        owner = self._owner(backup)
+
+        lines = [f"Restore {backup.path.name} ({created})?"]
+        if restore_world:
+            for map_name in backup.maps:
+                lines.append(f"World '{map_name}' replaces:\n{saves_root / map_name}")
+        if restore_config:
+            lines.append(
+                "GameUserSettings.ini and Game.ini replace this server's settings, "
+                "including anything staged in the INI Editor."
+            )
+        if safety:
+            lines.append("The current save and settings are zipped first.")
+        else:
+            lines.append("No safety backup will be made: the current save is lost.")
+        if owner is False:
+            lines.append(f"WARNING: this backup belongs to '{backup.server_name}', not to {cfg.server_name}.")
+
+        risky = owner is False or not safety
+        if not messagebox.askyesno(
+            "Restore Backup",
+            "\n\n".join(lines),
+            icon=("warning" if risky else "question"),
+            parent=self,
+        ):
+            return
+
+        req = BackupRestoreRequest(
+            backup=backup,
+            restore_world=restore_world,
+            restore_config=restore_config,
+            safety_backup=safety,
+        )
+        self.destroy()
+        self.app.start_backup_restore(req)
 
 
 class ServerManagerApp:
@@ -4257,6 +5163,11 @@ class ServerManagerApp:
 
         self._auto_update_thread: Optional[threading.Thread] = None
         self._auto_update_stop = threading.Event()
+        self._auto_save = AutoSaveScheduler()
+        self._auto_save_thread: Optional[threading.Thread] = None
+        self._auto_save_stop = threading.Event()
+        self._auto_save_waiting = False
+        self._auto_save_last: Optional[Tuple[datetime, bool]] = None
 
         self._rcon_factory = create_rcon_client
 
@@ -4327,6 +5238,8 @@ class ServerManagerApp:
         self._hook_autosave()
         self._refresh_buttons()
         self._sync_auto_update_scheduler()
+        self._start_auto_save_scheduler()
+        self._sync_auto_save_hint()
         self.root.after(800, self._auto_start_on_launch)
 
     # ---------------------------------------------------------------------
@@ -4924,6 +5837,10 @@ class ServerManagerApp:
         self.var_backup_on_stop = tk.BooleanVar(master=m)
         self.var_backup_dir = tk.StringVar(master=m)
         self.var_backup_retention = tk.StringVar(master=m)
+        self.var_auto_save_enabled = tk.BooleanVar(master=m)
+        self.var_auto_save_interval = tk.StringVar(master=m)
+        self.var_auto_save_keep = tk.StringVar(master=m)
+        self.var_auto_save_hint = tk.StringVar(master=m, value="")
 
         self.var_auto_update_restart = tk.BooleanVar(master=m)
         self.var_auto_start_on_launch = tk.BooleanVar(master=m)
@@ -5210,6 +6127,63 @@ class ServerManagerApp:
 
         ttk.Label(backup_frame, text="Retention (zip count)").grid(row=2, column=0, sticky="w")
         ttk.Entry(backup_frame, textvariable=self.var_backup_retention, validate="key", validatecommand=vcmd).grid(row=2, column=1, sticky="ew", padx=6)
+
+        auto_row = ttk.Frame(backup_frame)
+        auto_row.grid(row=3, column=0, columnspan=3, sticky="w", pady=(8, 0))
+        self.chk_auto_save = ttk.Checkbutton(
+            auto_row,
+            text="Auto-save every",
+            variable=self.var_auto_save_enabled,
+        )
+        self.chk_auto_save.grid(row=0, column=0, sticky="w")
+        self.ent_auto_save_interval = ttk.Entry(
+            auto_row,
+            textvariable=self.var_auto_save_interval,
+            width=6,
+            validate="key",
+            validatecommand=vcmd,
+        )
+        self.ent_auto_save_interval.grid(row=0, column=1, padx=6)
+        ttk.Label(auto_row, text="minutes while the server is running").grid(row=0, column=2, sticky="w")
+        ttk.Label(auto_row, text="Keep").grid(row=1, column=0, sticky="e", pady=(4, 0))
+        self.ent_auto_save_keep = ttk.Entry(
+            auto_row,
+            textvariable=self.var_auto_save_keep,
+            width=6,
+            validate="key",
+            validatecommand=vcmd,
+        )
+        self.ent_auto_save_keep.grid(row=1, column=1, padx=6, pady=(4, 0))
+        ttk.Label(auto_row, text="auto-saves, in their own slots apart from backups").grid(
+            row=1, column=2, sticky="w", pady=(4, 0)
+        )
+        HoverTooltip(
+            self.chk_auto_save,
+            "While the server runs: saves the world over RCON, then zips it into the\n"
+            "backup folder as ASA_AutoSave_*.zip. Auto-saves rotate in their own slots,\n"
+            "so they never push manual or on-stop backups out of retention.\n"
+            f"Minimum {AUTO_SAVE_MIN_INTERVAL_MIN} minutes. Not the same as ARK's Auto-Save Interval\n"
+            "in the INI Editor, which only writes the world to disk.",
+        )
+        ttk.Label(
+            backup_frame,
+            textvariable=self.var_auto_save_hint,
+            foreground=THEME_COLORS["muted"],
+            wraplength=380,
+            justify="left",
+        ).grid(row=4, column=0, columnspan=3, sticky="w", padx=(24, 0))
+
+        self.btn_manage_backups = ttk.Button(
+            backup_frame,
+            text="Manage / Restore Backups...",
+            command=self.open_backup_manager,
+        )
+        self.btn_manage_backups.grid(row=5, column=0, columnspan=3, sticky="ew", pady=(8, 0))
+        HoverTooltip(
+            self.btn_manage_backups,
+            "List this server's backup zips, make a new one, and restore a world save\n"
+            "or its settings. The current save is zipped first.",
+        )
 
         sp_frame = ttk.LabelFrame(lf_ops, text="Single Player", padding=8)
         sp_frame.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(10, 0))
@@ -5732,6 +6706,9 @@ class ServerManagerApp:
             backup_dir = ""
         self.var_backup_dir.set(backup_dir)
         self.var_backup_retention.set(str(cfg.backup_retention))
+        self.var_auto_save_enabled.set(bool(cfg.auto_save_enabled))
+        self.var_auto_save_interval.set(str(clamp_auto_save_minutes(cfg.auto_save_interval_minutes)))
+        self.var_auto_save_keep.set(str(clamp_auto_save_keep(cfg.auto_save_retention)))
 
         self.var_auto_update_restart.set(cfg.auto_update_restart)
         self.var_auto_update_time.set(cfg.auto_update_time or DEFAULT_SCHEDULE_TIME)
@@ -5816,6 +6793,9 @@ class ServerManagerApp:
         cfg.backup_on_stop = bool(self.var_backup_on_stop.get())
         cfg.backup_dir = self.var_backup_dir.get().strip()
         cfg.backup_retention = safe_int(self.var_backup_retention.get(), 20) or 20
+        cfg.auto_save_enabled = bool(self.var_auto_save_enabled.get())
+        cfg.auto_save_interval_minutes = clamp_auto_save_minutes(self.var_auto_save_interval.get())
+        cfg.auto_save_retention = clamp_auto_save_keep(self.var_auto_save_keep.get())
         cfg.backup_include_configs = True
 
         cfg.auto_update_restart = bool(self.var_auto_update_restart.get())
@@ -5907,6 +6887,7 @@ class ServerManagerApp:
             self.var_discord_notify_leave, self.var_discord_notify_crash, self.var_discord_include_player_id,
             self.var_discord_mention_mode, self.var_discord_mention_map_json,
             self.var_backup_on_stop, self.var_backup_dir, self.var_backup_retention,
+            self.var_auto_save_enabled, self.var_auto_save_interval, self.var_auto_save_keep,
             self.var_auto_update_restart, self.var_auto_update_time, self.var_update_on_startup,
             self.var_hide_gameanalytics_console_logs,
             self.var_cluster_enable, self.var_cluster_id, self.var_cluster_custom_path_enable, self.var_cluster_dir_override,
@@ -5936,6 +6917,11 @@ class ServerManagerApp:
             self.var_backup_on_stop.trace_add("write", lambda *_: self._sync_backup_label_texts())
         except Exception:
             pass
+        for v in (self.var_auto_save_enabled, self.var_auto_save_interval, self.var_auto_save_keep):
+            try:
+                v.trace_add("write", lambda *_: self._sync_auto_save_hint())
+            except Exception:
+                pass
 
     def _schedule_autosave(self) -> None:
         if self._autosave_after_id:
@@ -5991,6 +6977,7 @@ class ServerManagerApp:
         self.btn_stop.configure(state=("disabled" if busy or not running else "normal"))
         self.btn_backup_now.configure(state=("disabled" if busy else "normal"))
         self.btn_sp_import.configure(state=("disabled" if busy or running else "normal"))
+        self.btn_manage_backups.configure(state=("disabled" if busy else "normal"))
 
         self.btn_rcon_send.configure(state=("disabled" if busy else "normal"))
         self.btn_auto_update_test.configure(state=("disabled" if busy else "normal"))
@@ -6007,9 +6994,16 @@ class ServerManagerApp:
         except Exception:
             pass
 
-    def _run_task(self, name: str, fn: Callable[[], None]) -> None:
-        if self._is_busy():
-            return
+    def _run_task(self, name: str, fn: Callable[[], None]) -> bool:
+        """Start fn on a worker thread; False when another task already runs.
+
+        Claims the busy flag before returning: the auto-save timer calls this from its
+        own thread, so a check here and a set on the worker would let two tasks slip in.
+        """
+        with self._busy_lock:
+            if self._busy:
+                return False
+            self._busy = True
 
         def worker() -> None:
             self._set_busy(True)
@@ -6024,7 +7018,12 @@ class ServerManagerApp:
             finally:
                 self._set_busy(False)
 
-        threading.Thread(target=worker, daemon=True).start()
+        try:
+            threading.Thread(target=worker, daemon=True).start()
+        except Exception:
+            self._set_busy(False)
+            raise
+        return True
 
     # ---------------------------------------------------------------------
     # UX
@@ -6438,7 +7437,7 @@ class ServerManagerApp:
         self.logger.info("Server stopped.")
 
         if self.cfg.backup_on_stop:
-            backup_path = backup_server(self.cfg, self.app_base, self.logger)
+            backup_path = backup_server(self.cfg, self.app_base, self.logger, self.active_server_id)
             self._ui(lambda: self._set_backup_status(backup_path, label="Backup on stop"))
 
         restore_baseline_to_server(self.app_base, self.active_server_id, Path(self.cfg.server_dir), self.logger)
@@ -6524,12 +7523,14 @@ class ServerManagerApp:
             self._discord_start_notifications(pid)
         self._ui(self._refresh_buttons)
 
-    def backup_now(self) -> None:
+    def backup_now(self, on_done: Optional[Callable[[Optional[Path]], None]] = None) -> None:
         def job() -> None:
             self.cfg = self._collect_vars_to_cfg()
             self._save_active_server_config(self.cfg)
-            backup_path = backup_server(self.cfg, self.app_base, self.logger)
+            backup_path = backup_server(self.cfg, self.app_base, self.logger, self.active_server_id)
             self._ui(lambda: self._set_backup_status(backup_path, label="Backup created"))
+            if on_done is not None:
+                self._ui(lambda: on_done(backup_path))
 
         self._run_task("Backup", job)
 
@@ -6570,12 +7571,14 @@ class ServerManagerApp:
         server_dir = Path(cfg.server_dir)
         server_id = self.active_server_id
         app_base = self.app_base
-        backup_root = Path(cfg.backup_dir.strip()) if cfg.backup_dir.strip() else (app_base / BACKUP_DIR_NAME)
+        backup_root = resolve_backup_root(cfg, app_base)
 
         def job() -> None:
             result = SinglePlayerImportResult()
 
             if req.import_save and req.save is not None:
+                if find_server_processes(server_dir):
+                    raise RuntimeError("An ARK server is still running from this folder. Stop it before importing.")
                 import_singleplayer_save(
                     req.save,
                     server_dir,
@@ -6583,8 +7586,10 @@ class ServerManagerApp:
                     self.logger,
                     include_profiles=req.include_profiles,
                     include_tribes=req.include_tribes,
-                    target_player_id=req.target_player_id,
                     backup_root=backup_root if req.backup_first else None,
+                    backup_info=backup_manifest(
+                        BACKUP_KIND_PRE_IMPORT, server_id, cfg.server_name, req.save.map_name
+                    ),
                     result=result,
                 )
 
@@ -6651,10 +7656,17 @@ class ServerManagerApp:
             lines.append(f"Copied {result.files_copied} save file(s) to:\n{result.destination}")
             if result.backup_zip is not None:
                 lines.append(f"Previous server save archived to:\n{result.backup_zip}")
-            if result.renamed_profiles:
-                lines.append("Local player profile imported as " + ", ".join(result.renamed_profiles) + ".")
             if req.set_server_map and req.save is not None:
                 lines.append(f"Server map set to {req.save.map_name}.")
+            character = (
+                "Your survivor does not come across with the world: upload it at an obelisk in "
+                "single player and download it on the server."
+            )
+            if result.tribe_ids:
+                character += " Then take back the base and tames with:\n" + "\n".join(
+                    f"cheat TakeTribe {tid}" for tid in result.tribe_ids[:3]
+                )
+            lines.append(character)
 
         if result.settings_source is not None:
             lines.append(f"Settings read from:\n{result.settings_source}")
@@ -6688,6 +7700,185 @@ class ServerManagerApp:
 
         self._set_status(f"Single player import done ({self._status_timestamp()})")
         messagebox.showinfo("Import Single Player", "\n\n".join(lines) if lines else "Nothing was imported.")
+
+    # ---------------------------------------------------------------------
+    # Backups
+    # ---------------------------------------------------------------------
+    def open_backup_manager(self) -> None:
+        if self._is_busy():
+            return
+        try:
+            self.cfg = self._collect_vars_to_cfg()
+            self._save_active_server_config(self.cfg)
+        except Exception as e:
+            messagebox.showerror("Backups", f"Current configuration is invalid: {e}")
+            return
+        BackupManagerDialog(self)
+
+    def start_backup_restore(self, req: BackupRestoreRequest) -> None:
+        if self._is_server_running():
+            messagebox.showwarning("Restore Backup", "Stop the server before restoring a backup.")
+            return
+        if self._is_busy():
+            messagebox.showwarning("Restore Backup", "Another task is running. Try the restore again when it finishes.")
+            return
+
+        cfg = self.cfg
+        server_dir = Path(cfg.server_dir)
+        server_id = self.active_server_id
+        app_base = self.app_base
+        safety_root = resolve_backup_root(cfg, app_base) if req.safety_backup else None
+
+        def job() -> None:
+            if find_server_processes(server_dir):
+                raise RuntimeError("An ARK server is still running from this folder. Stop it before restoring.")
+            result = restore_server_backup(
+                req.backup,
+                server_dir,
+                cfg.alt_save_directory_name,
+                app_base,
+                server_id,
+                self.logger,
+                restore_world=req.restore_world,
+                restore_config=req.restore_config,
+                safety_root=safety_root,
+                server_name=cfg.server_name,
+            )
+            self._ui(lambda: self._finish_backup_restore(req, result))
+
+        self._run_task("Restore Backup", job)
+
+    def _finish_backup_restore(self, req: BackupRestoreRequest, result: BackupRestoreResult) -> None:
+        if result.config_restored:
+            try:
+                if self._ini_loaded_target:
+                    self._ini_load_target(self._ini_loaded_target)
+                self._ini_visual_refresh_all()
+            except Exception as e:
+                self.logger.error(f"Refreshing INI editor after restore failed: {e}")
+
+        lines: List[str] = [f"Restored from {req.backup.path.name}."]
+        if result.maps_restored:
+            lines.append(
+                f"World: {', '.join(result.maps_restored)} ({result.files_written} file(s)) in:\n{result.destination}"
+            )
+            current_map = (self.cfg.map_name or "").strip()
+            if current_map and current_map not in result.maps_restored:
+                lines.append(
+                    f"This server is set to run {current_map}; switch the map to "
+                    f"{result.maps_restored[0]} to load the restored world."
+                )
+        if result.config_restored:
+            lines.append(
+                f"Settings: {', '.join(result.config_restored)}. Server name, passwords, RCON and max "
+                "players from this profile are applied again on the next start."
+            )
+        if result.safety_zip is not None:
+            lines.append(f"The previous save and settings were zipped to:\n{result.safety_zip}")
+
+        self._set_status(f"Backup restored ({self._status_timestamp()})")
+        messagebox.showinfo("Restore Backup", "\n\n".join(lines))
+
+    # ---------------------------------------------------------------------
+    # Auto-save
+    # ---------------------------------------------------------------------
+    def _start_auto_save_scheduler(self) -> None:
+        if self._auto_save_thread is not None and self._auto_save_thread.is_alive():
+            return
+        self._auto_save_stop.clear()
+        self._auto_save_thread = threading.Thread(
+            target=self._auto_save_loop, daemon=True, name="auto-save"
+        )
+        self._auto_save_thread.start()
+
+    def _auto_save_loop(self) -> None:
+        # Reads self.cfg on every pass, so profile switches and edits apply without a restart.
+        while not self._auto_save_stop.wait(AUTO_SAVE_TICK_SEC):
+            try:
+                now = time.monotonic()
+                due = self._auto_save.tick(now, auto_save_interval_seconds(self.cfg), self._is_server_running())
+                if not due:
+                    self._auto_save_waiting = False
+                elif self._run_task("Auto-save", self._auto_save_job):
+                    self._auto_save.mark_started(now)
+                    self._auto_save_waiting = False
+                elif not self._auto_save_waiting:
+                    self._auto_save_waiting = True
+                    self.logger.info("Auto-save is due; waiting for the current task to finish.")
+            except Exception as e:
+                self.logger.info(f"Auto-save scheduler: {e}")
+            self._ui(self._sync_auto_save_hint)
+
+    def _auto_save_job(self) -> None:
+        cfg = self.cfg
+        if not self._is_server_running():
+            self.logger.info("Auto-save skipped: the server is no longer running.")
+            return
+
+        if cfg.enable_rcon:
+            try:
+                self.logger.info("Auto-save: RCON SaveWorld")
+                self._rcon_try("SaveWorld", timeout=30.0)
+                time.sleep(AUTO_SAVE_SETTLE_SEC)
+            except Exception as e:
+                self.logger.info(f"Auto-save: SaveWorld failed ({e}); zipping the last save on disk.")
+        else:
+            self.logger.info("Auto-save: RCON is off, so this zips the server's last autosave.")
+
+        # A timer should not throw a dialog at the user; failures go to the log and status bar.
+        try:
+            path = auto_save_server(cfg, self.app_base, self.logger, self.active_server_id)
+        except Exception as e:
+            err = str(e)
+            self.logger.error(f"Auto-save failed: {err}")
+            self._auto_save_last = (datetime.now(), False)
+            self._ui(lambda: self._set_status(f"Auto-save failed: {err}"))
+            return
+
+        self._auto_save_last = (datetime.now(), path is not None)
+        self._ui(lambda: self._set_backup_status(path, label="Auto-save"))
+
+    def _auto_save_hint_text(self) -> str:
+        if not bool(self.var_auto_save_enabled.get()):
+            return ""
+
+        typed = safe_int(self.var_auto_save_interval.get(), 0)
+        minutes = clamp_auto_save_minutes(typed)
+        keep = clamp_auto_save_keep(self.var_auto_save_keep.get())
+        parts: List[str] = []
+        if 0 < typed < AUTO_SAVE_MIN_INTERVAL_MIN:
+            parts.append(f"The minimum is {AUTO_SAVE_MIN_INTERVAL_MIN} minutes.")
+
+        wait = self._auto_save.seconds_until_due(time.monotonic())
+        if not self._is_server_running():
+            parts.append("Starts counting when the server is running.")
+        elif self._auto_save_waiting:
+            parts.append("Due now - waiting for the current task to finish.")
+        elif wait is not None:
+            parts.append(f"Next one at {(datetime.now() + timedelta(seconds=wait)):%H:%M}.")
+        else:
+            parts.append(f"First one {minutes} minutes after the server is seen running.")
+
+        if self._auto_save_last is not None:
+            when, ok = self._auto_save_last
+            parts.append(f"Last one {'at' if ok else 'failed at'} {when:%H:%M}.")
+
+        parts.append(
+            f"Keeping {keep} covers about the last {describe_span(minutes * 60 * keep)}; "
+            "backups are never touched."
+        )
+        return " ".join(parts)
+
+    def _sync_auto_save_hint(self) -> None:
+        try:
+            text = self._auto_save_hint_text()
+            if text != self.var_auto_save_hint.get():
+                self.var_auto_save_hint.set(text)
+            state = "normal" if self.var_auto_save_enabled.get() else "disabled"
+            self.ent_auto_save_interval.configure(state=state)
+            self.ent_auto_save_keep.configure(state=state)
+        except Exception:
+            pass
 
     def _sync_auto_update_scheduler(self) -> None:
         try:

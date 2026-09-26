@@ -84,14 +84,18 @@ This manager separates *edit time* and *runtime*:
 
 ### Backups + retention
 - Optional backup on stop
-- Zip retention policy
-- Optional “include configs” mode
+- Optional **auto-saves** every N minutes (minimum 5) while the server is running: the world is saved over RCON first, then zipped as `ASA_AutoSave_*.zip`; if RCON is off or fails, the last save on disk is zipped. Auto-saves keep their own count (default 12), separate from backup retention, so they never push manual or on-stop backups out. They count from when the server starts, wait for any running task, and log failures instead of popping up a dialog. The Server tab shows the next run and how far back the kept auto-saves reach. Not to be confused with ARK's own Auto-Save Interval in the INI Editor, which only writes the world to disk
+- Zip retention policy, counted per server: profiles that share a backup folder no longer prune each other's zips
+- **Manage / Restore Backups** window: lists this server's zips (full, before-import and before-restore), makes a new one, deletes old ones, and restores a world save and/or its `GameUserSettings.ini` / `Game.ini`
+- A restore rebuilds the map folder beside the live one and swaps it in, so a failure part way leaves the current save untouched; the current save and settings are zipped first by default
+- Restored settings replace the INI staging too, so the next start applies exactly what the backup held; server name, passwords, RCON and max players still come from the profile
+- Each zip records which server made it, and the window warns before restoring another server's backup
 
 ### Single player import
 - Auto-detects the game folder across every Steam library, plus `%LOCALAPPDATA%` and Game Pass installs
 - The folder you pick is used as given — point at the game folder, at `Saved`, at `SavedArksLocal`, or straight at a single map folder
 - Copies the selected world (plus profiles and tribes) into the server save folder, honouring `AltSaveDirectoryName`
-- Optionally claims your single player character: the newest `LocalPlayer*` profile is copied in as `<YourID>.arkprofile`, which is what a dedicated server loads
+- Your survivor does not come across with the world — the server rebuilds player data for its own accounts on its first save. The import screen walks through moving it with an obelisk upload/download, and shows the exact `cheat TakeTribe <id>` for the selected save to take back the base and tames
 - Zips the server save it is about to overwrite into the backup folder first
 - Optionally merges the single player `GameUserSettings.ini` / `Game.ini` into staging; server name, passwords, RCON, ports and max players are kept
 - Cleans up ARK's float spew (`0.00999999978` becomes `0.01`), and optionally rounds off its slider noise (`0.999989986` becomes `1`)
