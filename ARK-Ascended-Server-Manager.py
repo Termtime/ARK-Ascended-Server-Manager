@@ -4481,7 +4481,13 @@ class ServerLogTag(logging.Filter):
                 name = self._name_fn() or self.server_id
             except Exception:
                 name = self.server_id
-            record.msg = f"[{name}] {record.msg}"
+            # Formatted here, so a '%' in the name cannot clash with the record's own args.
+            try:
+                text = record.getMessage()
+            except Exception:
+                text = str(record.msg)
+            record.msg = f"[{name}] {text}"
+            record.args = None
         return True
 
 
@@ -4616,12 +4622,18 @@ class ServerRuntime:
         self.auto_save_waiting = False
         self.auto_save_last: Optional[Tuple[datetime, bool]] = None
         self.auto_update_next: Optional[datetime] = None
+        self.auto_update_waiting = False
         self.auto_update_time = ""  # the HH:MM auto_update_next was computed from
 
     def is_running(self) -> bool:
         with self.proc_lock:
             p = self.proc
         return p is not None and p.poll() is None
+
+    def live_cfg(self) -> AppConfig:
+        """The settings the running process uses (as started), else the saved profile."""
+        run = self.run_cfg
+        return run if run is not None and self.is_running() else self.cfg
 
     def pid(self) -> Optional[int]:
         with self.proc_lock:
@@ -6098,6 +6110,8 @@ class ServerManagerApp:
         self._scheduler_thread: Optional[threading.Thread] = None
         self._scheduler_stop = threading.Event()
         self._auto_update_announced: Dict[str, bool] = {}
+        # One Update & Restart at a time across servers (see update_and_restart_for).
+        self._update_slot = threading.Lock()
 
         self._initialize_profiles()
 
@@ -6663,18 +6677,21 @@ class ServerManagerApp:
         return (ref.display_name if ref else "") or server_id
 
     def _runtime(self, server_id: str) -> ServerRuntime:
-        """The runtime of a profile, made on first use with the profile as saved on disk."""
+        """The runtime of a profile, made on first use with the profile as saved on disk.
+
+        Always from disk, never from the form: the scheduler thread can get here while the
+        window is between profiles, when self.cfg still belongs to the previous one.
+        """
         with self._runtimes_lock:
             rt = self._runtimes.get(server_id)
             if rt is not None:
                 return rt
-            if server_id == self.active_server_id:
-                cfg = self.cfg
-            else:
-                cfg = ServerConfigStore(server_config_path(self.app_base, server_id), server_lock_path(self.app_base, server_id)).load().cfg
-                ref = self._server_ref_by_id(server_id)
-                if ref and ref.server_dir:
-                    cfg.server_dir = ref.server_dir
+            ref = self._server_ref_by_id(server_id)
+            if ref is None:
+                raise KeyError(f"No server profile {server_id}")
+            cfg = ServerConfigStore(server_config_path(self.app_base, server_id), server_lock_path(self.app_base, server_id)).load().cfg
+            if ref.server_dir:
+                cfg.server_dir = ref.server_dir
             logger = make_server_logger(
                 self.logger,
                 server_id,
@@ -6691,8 +6708,15 @@ class ServerManagerApp:
         return self._runtime(self.active_server_id)
 
     def _all_runtimes(self) -> List[ServerRuntime]:
-        """Runtimes of every profile, in profile order."""
-        return [self._runtime(ref.id) for ref in self.global_cfg.servers]
+        """Runtimes of every profile, in profile order. A profile removed meanwhile is skipped,
+        so a pass that started before the removal cannot bring its runtime back."""
+        out: List[ServerRuntime] = []
+        for ref in list(self.global_cfg.servers):
+            try:
+                out.append(self._runtime(ref.id))
+            except KeyError:
+                continue
+        return out
 
     def _running_runtimes(self) -> List[ServerRuntime]:
         with self._runtimes_lock:
@@ -8048,12 +8072,21 @@ class ServerManagerApp:
             messagebox.showerror(title, f"Current configuration is invalid: {e}")
             return False
 
-    def _run_task(self, name: str, fn: Callable[[], None], rt: Optional[ServerRuntime] = None) -> bool:
+    def _run_task(
+        self,
+        name: str,
+        fn: Callable[[], None],
+        rt: Optional[ServerRuntime] = None,
+        *,
+        quiet: bool = False,
+    ) -> bool:
         """Start fn on a worker thread for one server; False when that server already runs a task.
 
         Claims the server before returning: the scheduler calls this from its own thread,
         so a check here and a claim on the worker would let two tasks slip in. Tasks of
-        different servers run side by side.
+        different servers run side by side. quiet tasks (unattended ones: timers, crash
+        restarts) report failures in the log and status bar, never in a modal dialog that
+        would sit there blocking the window until someone comes back.
         """
         rt = rt or self.rt
         if not rt.try_claim(name):
@@ -8071,7 +8104,10 @@ class ServerManagerApp:
             except Exception as e:
                 err = str(e)
                 rt.logger.error(f"{name} failed: {err}")
-                self._ui(lambda _err=err: messagebox.showerror(title, _err))
+                if quiet:
+                    self._ui(lambda _err=err: self._set_status_for(rt, f"{name} failed: {_err}"))
+                else:
+                    self._ui(lambda _err=err: messagebox.showerror(title, _err))
             finally:
                 rt.release()
                 self._ui(self._refresh_buttons)
@@ -8092,11 +8128,12 @@ class ServerManagerApp:
     def _status_timestamp(self) -> str:
         return datetime.now().strftime("%H:%M:%S")
 
-    def _set_backup_status(self, backup_path: Optional[Path], label: str) -> None:
-        if backup_path:
-            self._set_status(f"{label}: {backup_path.name}")
+    def _set_backup_status(self, backup_path: Optional[Path], label: str, rt: Optional[ServerRuntime] = None) -> None:
+        text = f"{label}: {backup_path.name}" if backup_path else f"{label}: skipped (Saved folder missing)"
+        if rt is None:
+            self._set_status(text)
         else:
-            self._set_status(f"{label}: skipped (Saved folder missing)")
+            self._set_status_for(rt, text)
 
     def _sync_backup_label_texts(self) -> None:
         backup_enabled = bool(self.var_backup_on_stop.get())
@@ -8286,7 +8323,7 @@ class ServerManagerApp:
             self._start_server_inline(rt, check_install=False)
 
         # As a task, so the window sees it and closing asks before cutting it off.
-        if not self._run_task("Auto-restart", job, rt):
+        if not self._run_task("Auto-restart", job, rt, quiet=True):
             rt.logger.error("Auto-restart skipped: another task runs for this server; the server stays down.")
 
     def start_server(self) -> bool:
@@ -8341,7 +8378,8 @@ class ServerManagerApp:
 
     def _rcon_try(self, cmd: str, *, timeout: float = 4.0, rt: Optional[ServerRuntime] = None) -> str:
         rt = rt or self.rt
-        if not rt.cfg.enable_rcon:
+        # What the running server listens on, not what the form says since it started.
+        if not rt.live_cfg().enable_rcon:
             raise RCONError("RCON is disabled in this profile.")
 
         host, port, password = self._rcon_params(rt)
@@ -8483,7 +8521,7 @@ class ServerManagerApp:
 
         if cfg.backup_on_stop:
             backup_path = backup_server(cfg, self.app_base, log, rt.server_id)
-            self._ui(lambda: self._set_backup_status(backup_path, label="Backup on stop"))
+            self._ui(lambda: self._set_backup_status(backup_path, label="Backup on stop", rt=rt))
 
         restore_baseline_to_server(self.app_base, rt.server_id, Path(cfg.server_dir), log)
         self._ui(self._refresh_buttons)
@@ -8511,22 +8549,39 @@ class ServerManagerApp:
             return
         self.update_and_restart_for(self.rt)
 
-    def update_and_restart_for(self, rt: ServerRuntime) -> bool:
+    def update_and_restart_for(self, rt: ServerRuntime, *, quiet: bool = False) -> bool:
         def job() -> None:
-            # Before stopping our own server: if another server holds the install, the update
-            # cannot run, and stopping first would only leave this map down until someone looks.
-            self._ensure_install_free(rt, Path(rt.cfg.server_dir), confirm=False)
+            # Maps updating at the same time take turns here, while still running: stopping
+            # first and then queueing for SteamCMD would keep every waiting map down.
+            if not self._update_slot.acquire(blocking=False):
+                rt.logger.info("Update & Restart: waiting for another server's update to finish.")
+                self._update_slot.acquire()
+            try:
+                # Before stopping our own server: if another server holds the install, the update
+                # cannot run, and stopping first would only leave this map down until someone looks.
+                self._ensure_install_free(rt, Path(rt.cfg.server_dir), confirm=False)
 
-            if rt.is_running():
-                rt.logger.info("Server running -> performing safe stop before update.")
-                self._safe_stop(rt)
+                was_running = rt.is_running()
+                if was_running:
+                    rt.logger.info("Server running -> performing safe stop before update.")
+                    self._safe_stop(rt)
 
-            self._update_server_install(rt, validate=None, check_install=False)
+                try:
+                    self._update_server_install(rt, validate=None, check_install=False)
+                except Exception as e:
+                    if not was_running:
+                        raise
+                    # A failed update must not leave a map down: bring it back on what is installed.
+                    rt.logger.error(f"Update failed ({e}); starting the server again on the installed version.")
+                    self._start_server_inline(rt, check_install=False)
+                    raise
+            finally:
+                self._update_slot.release()
 
             rt.logger.info("Restarting server after update...")
             self._start_server_inline(rt, check_install=False)
 
-        return self._run_task("Update & Restart", job, rt)
+        return self._run_task("Update & Restart", job, rt, quiet=quiet)
 
     def restart_server_safe(self) -> bool:
         """Save, stop and start again with the current profile settings. False if another task runs."""
@@ -8625,7 +8680,7 @@ class ServerManagerApp:
 
         def job() -> None:
             backup_path = backup_server(rt.cfg, self.app_base, rt.logger, rt.server_id)
-            self._ui(lambda: self._set_backup_status(backup_path, label="Backup created"))
+            self._ui(lambda: self._set_backup_status(backup_path, label="Backup created", rt=rt))
             if on_done is not None:
                 self._ui(lambda: on_done(backup_path))
 
@@ -8976,11 +9031,8 @@ class ServerManagerApp:
         stopped: bool = False,
     ) -> None:
         if server_id != self.active_server_id:
-            messagebox.showerror(
-                "Cluster",
-                "The active profile changed while the cluster setup ran, so nothing was saved. "
-                "Switch back and run Set Up / Join Cluster again.",
-            )
+            # The window moved to another profile while this ran: finish on the profile itself.
+            self._finish_cluster_setup_offscreen(req, server_id, stopped)
             return
         if not self._save_cluster_vars((True, req.cluster_id, True, str(req.cluster_dir)), "Cluster"):
             if stopped:
@@ -9022,6 +9074,53 @@ class ServerManagerApp:
         else:
             lines.append("Takes effect the next time you start the server.")
             messagebox.showinfo("Cluster", "\n\n".join(lines))
+
+    def _save_profile_fields(self, server_id: str, **values: Any) -> AppConfig:
+        """Change and save fields of a profile that is not on screen; its form is not involved."""
+        store = ServerConfigStore(server_config_path(self.app_base, server_id), server_lock_path(self.app_base, server_id))
+        cfg = store.load().cfg
+        ref = self._server_ref_by_id(server_id)
+        if ref and ref.server_dir:
+            cfg.server_dir = ref.server_dir
+        for key, value in values.items():
+            setattr(cfg, key, value)
+        store.save(cfg)
+        rt = self._runtimes.get(server_id)
+        if rt is not None:
+            rt.cfg = cfg
+        return cfg
+
+    def _finish_cluster_setup_offscreen(self, req: ClusterSetupRequest, server_id: str, stopped: bool) -> None:
+        name = self._display_name(server_id)
+        try:
+            self._save_profile_fields(
+                server_id,
+                cluster_enable=True,
+                cluster_id=req.cluster_id,
+                cluster_custom_path_enable=True,
+                cluster_dir_override=str(req.cluster_dir),
+            )
+        except Exception as e:
+            msg = f"Saving the cluster settings of {name} failed, nothing was changed: {e}"
+            if stopped:
+                msg += "\n\nThe server was stopped for the copy; start it again from its profile."
+            messagebox.showerror("Cluster", msg)
+            return
+        rt = self._runtime(server_id)
+        rt.logger.info(f"[CLUSTER] Now in cluster '{req.cluster_id}' (data folder {req.cluster_dir}).")
+        if stopped:
+            if not self.start_server_for(rt):
+                messagebox.showwarning("Cluster", f"{name} is in cluster '{req.cluster_id}' but was stopped for the copy; start it from its profile.")
+                return
+            messagebox.showinfo("Cluster", f"{name} is in cluster '{req.cluster_id}' and is starting again.")
+        elif rt.is_running():
+            messagebox.showinfo(
+                "Cluster",
+                f"{name} is in cluster '{req.cluster_id}'. It still runs with its old start options; restart it "
+                "from its profile to bring it in.",
+            )
+        else:
+            messagebox.showinfo("Cluster", f"{name} is in cluster '{req.cluster_id}'. Takes effect on its next start.")
 
     def leave_cluster(self) -> None:
         _enable, old_id, _custom, folder = self._cluster_vars()
@@ -9155,6 +9254,18 @@ class ServerManagerApp:
             if choice is None:
                 return
             if choice is True:
+                # Tasks of servers that are not running (an install, a restore) die with the
+                # window just the same once the running ones are down.
+                idle_busy = [rt for rt in self._all_runtimes() if rt.is_busy() and rt not in running]
+                if idle_busy and not messagebox.askyesno(
+                    "Task running",
+                    "A task is still running for " + ", ".join(self._display_name(rt.server_id) for rt in idle_busy)
+                    + ". It is cut off when the window closes, which can leave it half done.\n\n"
+                    "Stop the servers and close anyway?",
+                    icon="warning",
+                    default="no",
+                ):
+                    return
                 self._stop_and_close(running)
                 return
         # Workers are daemon threads: closing kills them mid-write (INIs, zips, SteamCMD, a
@@ -9221,21 +9332,23 @@ class ServerManagerApp:
                 self.logger.info(f"Scheduler: {e}")
                 continue
             for rt in runtimes:
-                try:
-                    self._tick_auto_save(rt, time.monotonic())
-                except Exception as e:
-                    rt.logger.info(f"Auto-save scheduler: {e}")
+                # The update first: in a tick where both are due, an auto-save claiming the
+                # server would only make the update wait for it.
                 try:
                     self._tick_auto_update(rt, datetime.now())
                 except Exception as e:
                     rt.logger.info(f"Auto update scheduler: {e}")
+                try:
+                    self._tick_auto_save(rt, time.monotonic())
+                except Exception as e:
+                    rt.logger.info(f"Auto-save scheduler: {e}")
             self._ui(self._sync_auto_save_hint)
 
     def _tick_auto_save(self, rt: ServerRuntime, now: float) -> None:
         due = rt.auto_save.tick(now, auto_save_interval_seconds(rt.cfg), rt.is_running())
         if not due:
             rt.auto_save_waiting = False
-        elif self._run_task("Auto-save", lambda: self._auto_save_job(rt), rt):
+        elif self._run_task("Auto-save", lambda: self._auto_save_job(rt), rt, quiet=True):
             rt.auto_save.mark_started(now)
             rt.auto_save_waiting = False
         elif not rt.auto_save_waiting:
@@ -9254,15 +9367,19 @@ class ServerManagerApp:
             return
         if now < rt.auto_update_next:
             return
-        rt.auto_update_next = next_scheduled_datetime(now, when)
-        if rt.is_busy():
-            rt.logger.info("Auto update skipped: a task is running for this server.")
+        # Due. A busy server keeps it due and is tried again on the next tick, so a task
+        # running at 03:00 delays tonight's update instead of skipping it.
+        if not self.update_and_restart_for(rt, quiet=True):
+            if not rt.auto_update_waiting:
+                rt.auto_update_waiting = True
+                rt.logger.info("Auto update is due; waiting for the current task to finish.")
             return
+        rt.auto_update_waiting = False
         rt.logger.info("Auto update trigger reached -> Update & Restart (Safe).")
-        self.update_and_restart_for(rt)
+        rt.auto_update_next = next_scheduled_datetime(now, when)
 
     def _auto_save_job(self, rt: ServerRuntime) -> None:
-        cfg = rt.cfg
+        cfg = rt.live_cfg()  # zip the folder the running server writes, whatever the form says now
         log = rt.logger
         if not rt.is_running():
             log.info("Auto-save skipped: the server is no longer running.")
@@ -9289,7 +9406,7 @@ class ServerManagerApp:
             return
 
         rt.auto_save_last = (datetime.now(), path is not None)
-        self._ui(lambda: self._set_backup_status(path, label="Auto-save") if rt is self.rt else None)
+        self._ui(lambda: self._set_backup_status(path, label="Auto-save", rt=rt))
 
     def _set_status_for(self, rt: ServerRuntime, text: str) -> None:
         """Status bar text about a server; prefixed when it is not the one on screen."""
@@ -9350,9 +9467,11 @@ class ServerManagerApp:
             return
         rt = self.rt
         enabled = bool(rt.cfg.auto_update_restart)
-        rt.auto_update_next = None  # recomputed from the current time on the next tick
+        # Only a change of the checkbox resets the schedule; the tick itself notices a new
+        # time. Resetting on every save would push an update due right now to tomorrow.
         if self._auto_update_announced.get(rt.server_id) != enabled:
             self._auto_update_announced[rt.server_id] = enabled
+            rt.auto_update_next = None
             rt.logger.info(f"Auto Update & Restart scheduler {'enabled' if enabled else 'disabled'}.")
 
     # ---------------------------------------------------------------------
