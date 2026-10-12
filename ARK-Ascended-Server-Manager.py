@@ -121,6 +121,8 @@ LOG_ROTATE_KEEP = 3
 UPDATE_SLOT_WAIT_SEC = 3 * 60 * 60
 # How long a cluster-wide start waits for one map to load (RCON answers) before the next.
 READY_WAIT_SEC = 15 * 60
+# How long a stop waits for the server to save and exit before ending the process.
+STOP_WAIT_SEC = 120
 # A planned restart or update found more than this late (the PC slept, the clock jumped)
 # is skipped until its next time rather than kicking players at a random hour.
 SCHEDULE_GRACE = timedelta(hours=2)
@@ -3634,6 +3636,22 @@ def cluster_health(
                 servers=sids,
             ))
 
+    worlds: Dict[Tuple[str, str, str], List[str]] = {}
+    for sid, _name, cfg in members + others:
+        key = (os.path.normcase(os.path.normpath(cfg.server_dir)), cfg.map_name.strip().lower(),
+               (cfg.alt_save_directory_name or "").strip().lower())
+        worlds.setdefault(key, []).append(sid)
+    all_names = dict(names)
+    all_names.update({sid: name for sid, name, _c in others})
+    for sids in worlds.values():
+        if len(sids) > 1 and any(s in names for s in sids):
+            issues.append(HealthIssue(
+                "error",
+                "These profiles run the same world (same install, map and save folder); started together they "
+                "overwrite each other's saves: " + ", ".join(all_names[s] for s in sids),
+                servers=[s for s in sids if s in names],
+            ))
+
     dirs: Dict[str, List[str]] = {}
     for sid, _name, cfg in members:
         dirs.setdefault(os.path.normcase(os.path.normpath(cfg.server_dir)), []).append(sid)
@@ -4997,6 +5015,47 @@ def find_all_server_processes() -> Dict[str, List[FoundProcess]]:
     return query_server_processes() or {}
 
 
+def process_image_path(pid: int) -> str:
+    """Full path of a process's executable, also for one running with more rights; "" if unknown."""
+    if os.name != "nt":
+        return ""
+    try:
+        k = ctypes.windll.kernel32
+        k.OpenProcess.restype = wintypes.HANDLE
+        k.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        k.QueryFullProcessImageNameW.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)]
+        k.CloseHandle.argtypes = [wintypes.HANDLE]
+        handle = k.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not handle:
+            return ""
+        try:
+            size = wintypes.DWORD(1024)
+            buf = ctypes.create_unicode_buffer(size.value)
+            return buf.value if k.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size)) else ""
+        finally:
+            k.CloseHandle(handle)
+    except Exception:
+        return ""
+
+
+def pid_exists(pid: int) -> bool:
+    """A process with this ID exists (even one this manager may not open)."""
+    if os.name != "nt":
+        return False
+    try:
+        k = ctypes.WinDLL("kernel32", use_last_error=True)
+        k.OpenProcess.restype = wintypes.HANDLE
+        k.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        k.CloseHandle.argtypes = [wintypes.HANDLE]
+        handle = k.OpenProcess(0x1000, False, pid)
+        if handle:
+            k.CloseHandle(handle)
+            return True
+        return ctypes.get_last_error() == 5  # access denied: it exists
+    except Exception:
+        return False
+
+
 def query_server_processes() -> Optional[Dict[str, List[FoundProcess]]]:
     """Like find_all_server_processes, but None when the query itself failed, so a
     caller can tell "none running" from "could not look"."""
@@ -5009,22 +5068,29 @@ def query_server_processes() -> Optional[Dict[str, List[FoundProcess]]]:
         "$($_.ExecutablePath)|$($_.CommandLine)\" }"
     )
     try:
-        out = subprocess.run(
+        res = subprocess.run(
             ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
             capture_output=True,
             text=True,
             timeout=20,
             creationflags=CREATE_NO_WINDOW,
-        ).stdout
+        )
     except Exception:
         return None
-    if out is None:
+    # A query that failed prints nothing, which must not read as "no server running".
+    if res.returncode != 0 or (res.stderr or "").strip() or res.stdout is None:
         return None
+    out = res.stdout
     found: Dict[str, List[FoundProcess]] = {}
     for line in (out or "").splitlines():
         parts = line.strip().split("|", 3)
-        if len(parts) < 3 or not parts[0].isdigit() or not parts[2]:
+        if len(parts) < 3 or not parts[0].isdigit():
             continue
+        if not parts[2]:
+            # WMI hides the path of a process running with more rights; Windows still tells it.
+            parts[2] = process_image_path(int(parts[0]))
+            if not parts[2]:
+                continue
         started = None
         with contextlib.suppress(ValueError):
             started = datetime.strptime(parts[1], "%Y-%m-%d %H:%M:%S")
@@ -5042,6 +5108,24 @@ def find_server_process_details(server_dir: Path) -> List[FoundProcess]:
 def find_server_processes(server_dir: Path) -> List[int]:
     """PIDs of ArkAscendedServer.exe running from this install, including ones the manager did not start."""
     return [proc.pid for proc in find_server_process_details(server_dir)]
+
+
+def command_line_world(command_line: str) -> Optional[Tuple[str, str]]:
+    """(map, AltSaveDirectoryName) of an ARK server command line, lowercased; None if unreadable."""
+    try:
+        args = shlex.split(command_line or "", posix=False)
+    except ValueError:
+        args = (command_line or "").split()
+    url = next((a.strip('"') for a in args[1:] if "?" in a), "")
+    if not url:
+        return None
+    parts = url.split("?")
+    alt = ""
+    for part in parts[1:]:
+        key, _, value = part.partition("=")
+        if key.strip().lower() == "altsavedirectoryname":
+            alt = value.strip()
+    return parts[0].strip().lower(), alt.lower()
 
 
 def command_line_port(command_line: str) -> Optional[int]:
@@ -8176,11 +8260,19 @@ class ServerManagerApp:
 
     def _show_active_profile(self) -> None:
         """Fill the window from the profile that just became active."""
+        # A visual INI edit still waiting to be written belongs to the profile left behind.
+        if getattr(self, "_ini_visual_debounce_id", None):
+            with contextlib.suppress(Exception):
+                self.root.after_cancel(self._ini_visual_debounce_id)
+            self._ini_visual_debounce_id = None
         self._autosave_guard = True
         self._apply_cfg_to_vars(self.cfg)
         self._autosave_guard = False
         self._sync_map_mode()
         self._reset_ini_state()
+        # The visual editor shows this profile's staged INIs, not the last profile's values.
+        with contextlib.suppress(Exception):
+            self._ini_visual_refresh_all()
         self._sync_console_server_filter()
         self._sync_cluster_summary()
         self._sync_auto_save_hint()
@@ -10256,17 +10348,24 @@ class ServerManagerApp:
 
         runtimes = [rt for rt in self._all_runtimes() if not rt.is_running()]
         all_found = {proc.pid: (key, proc) for key, procs in everything.items() for proc in procs}
-        # 1) Our own launches, by the PID they recorded.
+        # 1) Our own launches, by the PID they recorded. Asked of Windows directly, not of the
+        # WMI list, which can miss a server running with more rights than this manager.
         for rt in runtimes:
             state = read_run_state(self.app_base, rt.server_id)
             if state is None:
                 continue
-            hit = all_found.get(int(state["pid"]))
+            pid = int(state["pid"])
             run = cfg_from_run_state(rt.cfg, state)
-            if hit is None or hit[0] != _exe_key(str(ark_server_exe(Path(run.server_dir)))):
-                clear_run_state(self.app_base, rt.server_id)  # that process is gone
-                continue
-            attach(rt, hit[1], run, ours=True)
+            image = process_image_path(pid)
+            if image and _exe_key(image) == _exe_key(str(ark_server_exe(Path(run.server_dir)))):
+                hit = all_found.get(pid)
+                proc = hit[1] if hit is not None else FoundProcess(pid=pid, command_line="")
+                attach(rt, proc, run, ours=True)
+            elif not image and pid_exists(pid):
+                # Running, but not even its path can be read: leave the record for a later look.
+                rt.logger.info(f"Its server (PID {pid}) still runs but cannot be examined; it was not reattached.")
+            else:
+                clear_run_state(self.app_base, rt.server_id)  # that process is gone (or is not ARK)
         # 2) Everything else, by install folder and game port.
         by_dir: Dict[str, List[ServerRuntime]] = {}
         for rt in runtimes:
@@ -10403,7 +10502,7 @@ class ServerManagerApp:
         if cfg.enable_rcon:
             try:
                 log.info("RCON: SaveWorld")
-                _ = self._rcon_try("SaveWorld", timeout=6.0, rt=rt)
+                _ = self._rcon_try("SaveWorld", timeout=30.0, rt=rt)
             except Exception as e:
                 log.info(f"RCON SaveWorld failed: {e}")
 
@@ -10413,7 +10512,9 @@ class ServerManagerApp:
             except Exception as e:
                 log.info(f"RCON DoExit failed -> terminate process: {e}")
 
-        t_end = time.time() + 20
+        # Ends as soon as the server has exited; the time is only there for big worlds on a
+        # busy disk (several maps stopping at once), so it is not cut off mid-save.
+        t_end = time.time() + STOP_WAIT_SEC
         while time.time() < t_end and p.poll() is None:
             time.sleep(0.5)
 
@@ -11234,9 +11335,44 @@ class ServerManagerApp:
         files a running server holds open. confirm=False refuses outright.
         """
         own = rt.pid()
-        pids = [p for p in find_server_processes(server_dir) if p != own]
+        found = query_server_processes()
+        if found is None:
+            msg = (f"Could not check whether another ARK server runs from {server_dir} "
+                   "(the Windows process query failed).")
+            if not confirm:
+                raise RuntimeError(msg + " Try again in a moment.")
+            if not self._ask_on_ui("Running servers unknown", msg + "\n\nStart anyway?"):
+                raise TaskCancelled("Start cancelled: running servers could not be checked.")
+            found = {}
+        # A server this manager launched earlier and has not reattached still counts.
+        state = read_run_state(self.app_base, rt.server_id)
+        image = process_image_path(int(state["pid"])) if state is not None and int(state["pid"]) != own else ""
+        if image and _exe_key(image) == _exe_key(str(ark_server_exe(server_dir))):
+            raise RuntimeError(
+                f"This server still seems to run from an earlier session (PID {state['pid']}). Restart the manager "
+                "to reconnect to it, or stop it first."
+            )
+        procs = [x for x in found.get(_exe_key(str(ark_server_exe(server_dir))), []) if x.pid != own]
+        pids = [x.pid for x in procs]
         if not pids:
             return
+        # Never two servers on one world: same install, same map, same save folder.
+        mine = (rt.cfg.map_name.strip().lower(), (rt.cfg.alt_save_directory_name or "").strip().lower())
+        for other in self._running_runtimes():
+            if other is not rt and other.pid() in pids:
+                ocfg = other.live_cfg()
+                if (ocfg.map_name.strip().lower(), (ocfg.alt_save_directory_name or "").strip().lower()) == mine:
+                    raise RuntimeError(
+                        f"{self._display_name(other.server_id)} already runs {rt.cfg.map_name} from this install with "
+                        "the same save folder; two servers on one world overwrite each other's saves. Give this "
+                        "profile its own install folder (or its own AltSaveDirectoryName)."
+                    )
+        for proc in procs:
+            if command_line_world(proc.command_line) == mine:
+                raise RuntimeError(
+                    f"An ARK server (PID {proc.pid}) already runs {rt.cfg.map_name} from this install with the same "
+                    "save folder; two servers on one world overwrite each other's saves."
+                )
         ours = [self._display_name(o.server_id) for o in self._running_runtimes() if o.pid() in pids]
         who = f"the profile {', '.join(ours)}" if ours else "another profile or another manager window"
         where = (
@@ -11306,8 +11442,7 @@ class ServerManagerApp:
                     default="no",
                 ):
                     return
-                self._cancel_groups()
-                self._stop_and_close(running)
+                self._stop_and_close(running)  # cancels cluster actions once it is sure to go on
                 return
         # A countdown has told players a restart is coming; leaving it to die with the window
         # would leave them waiting for nothing.
@@ -11352,6 +11487,7 @@ class ServerManagerApp:
             )
             return
 
+        self._cancel_groups()
         for rt in running:
             self._cancel_countdown(rt)  # they are being stopped now; nothing left to count down to
         state = {"left": len(running), "failed": []}
@@ -12008,7 +12144,10 @@ class ServerManagerApp:
                 warn = bool(choice)
 
             def restart_all(cancel: threading.Event) -> None:
-                todo = [rt for rt in members if rt.is_running()]
+                pending_update = [rt for rt in members if rt.is_running() and rt.countdown_kind == "update"]
+                for rt in pending_update:
+                    rt.logger.info("Restart All: skipped, a planned update restarts this map soon anyway.")
+                todo = [rt for rt in members if rt.is_running() and rt not in pending_update]
                 # Restart All replaces each map's own planned restart (it would restart the map a
                 # second time); a planned update stays, since it still has to update.
                 for rt in todo:
@@ -13595,6 +13734,7 @@ class ServerManagerApp:
                 self.root.after_cancel(self._ini_visual_debounce_id)
             except Exception:
                 pass
+        self._ini_visual_write_for = self.active_server_id
         self._ini_visual_debounce_id = self.root.after(INI_VISUAL_DEBOUNCE_MS, self._ini_visual_write_all)
 
     def _ini_visual_load(self, target: str) -> None:
@@ -13739,6 +13879,8 @@ class ServerManagerApp:
     def _ini_visual_write_all(self) -> None:
         """Write all visual control values to staged INI files."""
         self._ini_visual_debounce_id = None
+        if getattr(self, "_ini_visual_write_for", self.active_server_id) != self.active_server_id:
+            return  # the edits were for a profile no longer on screen; never write them into this one
 
         self.cfg = self._collect_vars_to_cfg()
         self._save_active_server_config(self.cfg)
@@ -14179,9 +14321,11 @@ def acquire_single_instance(app_base: Path) -> bool:
         k.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
         tag = hashlib.sha1(os.path.normcase(str(app_base)).encode("utf-8")).hexdigest()[:16]
         handle = k.CreateMutexW(None, False, f"Local\\ARKASAManager-{tag}")
+        err = ctypes.get_last_error()
         if not handle:
-            return True  # cannot tell; do not lock anyone out
-        if ctypes.get_last_error() == 183:  # ERROR_ALREADY_EXISTS
+            # Access denied: a manager running with more rights holds it.
+            return err != 5
+        if err == 183:  # ERROR_ALREADY_EXISTS
             return False
         _INSTANCE_MUTEX = handle  # held for the life of the process
         return True

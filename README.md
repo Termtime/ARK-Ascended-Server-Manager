@@ -207,6 +207,17 @@ Get-FileHash -Algorithm SHA256 ".\ARK-ASA-Manager.exe"
 
 ---
 
+## Upgrading from an earlier version
+
+Existing profiles keep working; a few things behave differently:
+- **The nightly Auto Update & Restart only updates servers that are running.** It no longer starts a server that was stopped (on purpose or by a crash); update a stopped server with Update / Validate
+- **In-game restart warnings are on by default** (15, 5 and 1 minutes, over RCON). With the nightly update at 03:00, players see the first warning at 02:45 and the update happens at 03:00. Untick *Warn players first* on the Server tab to turn them off
+- **-ClusterDirOverride is only passed while *Enable Cluster* is on.** A profile with a custom cluster path but the cluster off no longer gets it
+- **Running servers are asked for their player count over RCON once a minute**, for the Dashboard
+- **Only one manager runs at a time.** Opening it a second time shows a message instead of a second window
+- **Two profiles never run the same world**: starting a profile is refused while another server runs the same map from the same install with the same save folder
+- Closing the window while servers run now asks whether to stop them or leave them running; servers left running are reconnected the next time the manager opens
+
 ## Running a cluster, step by step
 
 ### Turn the server you already run into a cluster
