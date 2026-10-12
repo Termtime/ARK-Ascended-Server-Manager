@@ -3451,12 +3451,14 @@ def cluster_health(
             servers=[sid for sid, _n, _c in members],
         ))
     for sid, name, cfg in members:
-        for w in cluster_config_warnings(cfg):
+        config_warnings = cluster_config_warnings(cfg)
+        for w in config_warnings:
             sev = "error" if ("spaces" in w or "relative path" in w) else "warning"
-            fix = "own_folder" if "inside this install" in w else ""
+            fix = "own_folder" if "inside this install" in w else ("same_folder" if "contains" in w else "")
             issues.append(HealthIssue(sev, f"{name}: {w}", fix=fix, servers=[sid]))
         folder = effective_cluster_dir(cfg)
-        if folder is not None and cfg.cluster_custom_path_enable:
+        already = any("contains" in w or "spaces" in w or "relative path" in w for w in config_warnings)
+        if folder is not None and cfg.cluster_custom_path_enable and not already:
             installs = [Path(c.server_dir) for _s, _n, c in members + others]
             problem = cluster_folder_problem(folder, installs, backup_roots, allow_own_saved=False)
             if problem and "spaces" not in problem and "full path" not in problem:
@@ -3483,18 +3485,18 @@ def cluster_health(
             servers=[sid for sid, _n, _c in members],
         ))
 
-    seen_ports: Dict[int, str] = {}
+    seen_ports: Dict[int, Tuple[str, str]] = {}  # port -> (server id, name) of its first user
     for sid, name, cfg in others + members:
         ports = [int(cfg.port), int(cfg.query_port)] + ([int(cfg.rcon_port)] if cfg.enable_rcon else [])
         for port in ports:
             owner = seen_ports.get(port)
-            if owner is not None and owner != name and sid in names:
+            if owner is not None and owner[0] != sid and sid in names:
                 issues.append(HealthIssue(
-                    "error", f"{name} uses port {port}, which {owner} uses too; they cannot run at the same time.",
+                    "error", f"{name} uses port {port}, which {owner[1]} uses too; they cannot run at the same time.",
                     fix="new_ports", servers=[sid],
                 ))
                 break
-            seen_ports.setdefault(port, name)
+            seen_ports.setdefault(port, (sid, name))
 
     sessions: Dict[str, List[str]] = {}
     for sid, _name, cfg in members:
@@ -4148,6 +4150,7 @@ def copy_ini_settings(
     include_gus: bool = True,
     include_game: bool = True,
     include_map_specific: bool = False,
+    sync_source: bool = True,
 ) -> IniCopyResult:
     """Merge one server's staged INI settings into another server's staging.
 
@@ -4163,7 +4166,8 @@ def copy_ini_settings(
         if not enabled:
             continue
         src_paths = ini_stage_paths(app_base, source_id, source_dir, target)
-        ensure_ini_staging_synced(src_paths, server_running=source_running, logger=logger)
+        if sync_source:  # off when the caller synced it once for several copies running at once
+            ensure_ini_staging_synced(src_paths, server_running=source_running, logger=logger)
         dst_paths = ini_stage_paths(app_base, target_id, target_dir, target)
         ensure_ini_staging_synced(dst_paths, server_running=target_running, logger=logger)
         dest_doc = read_ini(dst_paths.stage)
@@ -4741,33 +4745,6 @@ def restore_server_backup(
     return res
 
 
-def find_server_processes(server_dir: Path) -> List[int]:
-    """PIDs of ArkAscendedServer.exe running from this install, including ones the manager did not start."""
-    if os.name != "nt":
-        return []
-    script = (
-        "Get-CimInstance Win32_Process -Filter \"Name='ArkAscendedServer.exe'\" | "
-        "ForEach-Object { \"$($_.ProcessId)|$($_.ExecutablePath)\" }"
-    )
-    try:
-        out = subprocess.run(
-            ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
-            capture_output=True,
-            text=True,
-            timeout=20,
-            creationflags=CREATE_NO_WINDOW,
-        ).stdout
-    except Exception:
-        return []
-
-    want = os.path.normcase(os.path.normpath(str(ark_server_exe(server_dir))))
-    pids: List[int] = []
-    for line in (out or "").splitlines():
-        pid, _, exe = line.strip().partition("|")
-        if pid.isdigit() and exe and os.path.normcase(os.path.normpath(exe)) == want:
-            pids.append(int(pid))
-    return pids
-
 @dataclass
 class FoundProcess:
     pid: int
@@ -4775,11 +4752,15 @@ class FoundProcess:
     started: Optional[datetime] = None
 
 
-def find_server_process_details(server_dir: Path) -> List[FoundProcess]:
-    """ArkAscendedServer.exe processes running from this install, with their command lines,
-    so each can be told apart by the ports it was started with."""
+def _exe_key(path: str) -> str:
+    return os.path.normcase(os.path.normpath(path))
+
+
+def find_all_server_processes() -> Dict[str, List[FoundProcess]]:
+    """Every ArkAscendedServer.exe on the machine, by normalized executable path: one
+    query, however many installs are looked at."""
     if os.name != "nt":
-        return []
+        return {}
     script = (
         "Get-CimInstance Win32_Process -Filter \"Name='ArkAscendedServer.exe'\" | "
         "ForEach-Object { \"$($_.ProcessId)|$($_.CreationDate.ToString('yyyy-MM-dd HH:mm:ss'))|"
@@ -4794,21 +4775,29 @@ def find_server_process_details(server_dir: Path) -> List[FoundProcess]:
             creationflags=CREATE_NO_WINDOW,
         ).stdout
     except Exception:
-        return []
-    want = os.path.normcase(os.path.normpath(str(ark_server_exe(server_dir))))
-    found: List[FoundProcess] = []
+        return {}
+    found: Dict[str, List[FoundProcess]] = {}
     for line in (out or "").splitlines():
         parts = line.strip().split("|", 3)
-        if len(parts) < 3 or not parts[0].isdigit():
-            continue
-        exe = parts[2]
-        if not exe or os.path.normcase(os.path.normpath(exe)) != want:
+        if len(parts) < 3 or not parts[0].isdigit() or not parts[2]:
             continue
         started = None
         with contextlib.suppress(ValueError):
             started = datetime.strptime(parts[1], "%Y-%m-%d %H:%M:%S")
-        found.append(FoundProcess(pid=int(parts[0]), command_line=parts[3] if len(parts) > 3 else "", started=started))
+        proc = FoundProcess(pid=int(parts[0]), command_line=parts[3] if len(parts) > 3 else "", started=started)
+        found.setdefault(_exe_key(parts[2]), []).append(proc)
     return found
+
+
+def find_server_process_details(server_dir: Path) -> List[FoundProcess]:
+    """ArkAscendedServer.exe processes running from this install, with their command lines,
+    so each can be told apart by the ports it was started with."""
+    return find_all_server_processes().get(_exe_key(str(ark_server_exe(server_dir))), [])
+
+
+def find_server_processes(server_dir: Path) -> List[int]:
+    """PIDs of ArkAscendedServer.exe running from this install, including ones the manager did not start."""
+    return [proc.pid for proc in find_server_process_details(server_dir)]
 
 
 def command_line_port(command_line: str) -> Optional[int]:
@@ -4864,8 +4853,12 @@ class AttachedProcess:
         if self.returncode is not None:
             return self.returncode
         ms = self._INFINITE if timeout is None else max(0, int(timeout * 1000))
-        if self._k.WaitForSingleObject(self._handle, ms) == self._WAIT_TIMEOUT:
+        result = self._k.WaitForSingleObject(self._handle, ms)
+        if result == self._WAIT_TIMEOUT:
             raise subprocess.TimeoutExpired("ArkAscendedServer.exe", timeout or 0)
+        if result != self._WAIT_OBJECT_0:
+            # WAIT_FAILED and the like: nothing is known about the process, least of all that it ended.
+            raise OSError(f"Waiting for process {self.pid} failed (result {result}, error {ctypes.GetLastError()}).")
         return self.poll()
 
     def terminate(self) -> None:
@@ -7125,6 +7118,9 @@ class ServerManagerApp:
         # servers. Reentrant: Update & Restart holds it across stop, update and start.
         self._update_slot = threading.RLock()
 
+        # Bumped on every profile save, so cached per-profile results know they are stale.
+        self._cfg_generation = 0
+        self._health_cache: Dict[Tuple[str, Tuple[str, ...]], Tuple[int, float, List[HealthIssue]]] = {}
         self._initialize_profiles()
 
         self._autosave_after_id: Optional[str] = None
@@ -7465,10 +7461,12 @@ class ServerManagerApp:
         rt = self._runtimes.get(self.active_server_id)
         if rt is not None:
             rt.cfg = cfg
+        self._cfg_generation += 1
 
     def _save_global_config(self, cfg: Optional[GlobalConfig] = None) -> None:
         self.global_cfg = cfg or self.global_cfg
         self.global_store.save(self.global_cfg)
+        self._cfg_generation += 1  # profiles added or removed
 
     # ---------------------------------------------------------------------
     # Profile actions
@@ -9419,6 +9417,7 @@ class ServerManagerApp:
         def job() -> None:
             if rt.is_running():
                 raise RuntimeError("Server already running")
+            self._wait_reattach_scan(rt)
             if rt.cfg.update_on_startup:
                 rt.logger.info("Update on startup enabled -> updating server install.")
                 self._update_server_install(rt, validate=None)  # refuses an install a server runs from
@@ -9446,7 +9445,15 @@ class ServerManagerApp:
         try:
             p.wait()
         except Exception as e:
-            rt.logger.info(f"Watching the reattached server stopped: {e}")
+            # The handle cannot be waited on: look for the process by its install instead,
+            # rather than taking a live server for a stopped one.
+            rt.logger.info(f"Watching the reattached server by its handle failed ({e}); checking its process instead.")
+            server_dir = Path(rt.live_cfg().server_dir)
+            while p.pid in find_server_processes(server_dir):
+                with rt.proc_lock:
+                    if rt.proc is not p:
+                        return  # stopped (and cleaned up) by the manager meanwhile
+                time.sleep(10)
         self._on_process_exit(rt, p)
 
     def _on_process_exit(self, rt: ServerRuntime, p: Any) -> None:
@@ -9485,8 +9492,9 @@ class ServerManagerApp:
             key = os.path.normcase(os.path.normpath(rt.cfg.server_dir))
             by_dir.setdefault(key, []).append(rt)
         attached: List[str] = []
+        everything = find_all_server_processes() if by_dir else {}
         for runtimes in by_dir.values():
-            found = find_server_process_details(Path(runtimes[0].cfg.server_dir))
+            found = everything.get(_exe_key(str(ark_server_exe(Path(runtimes[0].cfg.server_dir)))), [])
             if not found:
                 continue
             for proc in found:
@@ -9773,7 +9781,18 @@ class ServerManagerApp:
         self.rt.logger.info("Auto update test triggered -> Update / Restart (Safe).")
         self.update_and_restart_safe()
 
+    def _wait_reattach_scan(self, rt: ServerRuntime) -> None:
+        """Right after launch the scan for servers left running is still going: a start must
+        not race it and launch a second process for a server that is already up."""
+        done = getattr(self, "_reattach_done", None)
+        if done is not None and not done.is_set():
+            rt.logger.info("Waiting for the check for servers that are already running...")
+            done.wait(timeout=90)
+        if rt.is_running():
+            raise TaskCancelled("The server is already running (it was found running and reattached).")
+
     def _start_server_inline(self, rt: ServerRuntime, *, check_install: bool = True) -> None:
+        self._wait_reattach_scan(rt)
         # Read once: the form may be saved while this runs, and the staged INIs, the RCON
         # snapshot and the command line must all come from the same settings.
         cfg = copy.deepcopy(rt.cfg)
@@ -10272,6 +10291,7 @@ class ServerManagerApp:
         rt = self._runtimes.get(server_id)
         if rt is not None:
             rt.cfg = cfg
+        self._cfg_generation += 1
         return cfg
 
     def _finish_cluster_setup_offscreen(
@@ -10741,7 +10761,7 @@ class ServerManagerApp:
             if op:
                 status += f" - {op}"
             try:
-                n_issues = sum(1 for i in self._cluster_health(view) if i.severity in ("error", "warning"))
+                n_issues = sum(1 for i in self._cluster_health_cached(view) if i.severity in ("error", "warning"))
             except Exception:
                 n_issues = 0
             if n_issues:
@@ -11212,6 +11232,20 @@ class ServerManagerApp:
         "session_names": "Rename servers",
     }
 
+    HEALTH_CACHE_SEC = 30.0
+
+    def _cluster_health_cached(self, view: ClusterView) -> List[HealthIssue]:
+        """For the dashboard's 2-second refresh: recomputed when profiles change, at most
+        every HEALTH_CACHE_SEC otherwise (an install finishing, say)."""
+        key = (view.cluster_id, tuple(view.members))
+        hit = self._health_cache.get(key)
+        now = time.monotonic()
+        if hit is not None and hit[0] == self._cfg_generation and now - hit[1] < self.HEALTH_CACHE_SEC:
+            return hit[2]
+        issues = self._cluster_health(view)
+        self._health_cache[key] = (self._cfg_generation, now, issues)
+        return issues
+
     def _cluster_health(self, view: ClusterView) -> List[HealthIssue]:
         members = [(sid, self._display_name(sid), self._runtime(sid).cfg) for sid in view.members]
         member_ids = set(view.members)
@@ -11231,18 +11265,26 @@ class ServerManagerApp:
 
     def _cluster_common_folder(self, view: ClusterView) -> Path:
         """The data folder a cluster should use: the one most members chose, if it is safe."""
-        installs = [Path(self._runtime(r.id).cfg.server_dir) for r in self.global_cfg.servers]
+        cfgs = [self._runtime(r.id).cfg for r in self.global_cfg.servers]
+        installs = [Path(c.server_dir) for c in cfgs]
+        roots = [Path(r) for r in {str(resolve_backup_root(c, self.app_base)) for c in cfgs}]
         counts: Dict[str, int] = {}
         for sid in view.members:
             cfg = self._runtime(sid).cfg
             if cfg.cluster_custom_path_enable and cfg.cluster_dir_override.strip():
                 folder = Path(cfg.cluster_dir_override.strip())
-                if cluster_folder_problem(folder, installs, [], allow_own_saved=False) is None:
+                if cluster_folder_problem(folder, installs, roots, allow_own_saved=False) is None:
                     counts[str(folder)] = counts.get(str(folder), 0) + 1
         if counts:
             return Path(max(counts, key=lambda k: counts[k]))
         first = self._runtime(view.members[0]).cfg
-        return default_cluster_dir(self.app_base, view.cluster_id, Path(first.server_dir))
+        fallback = default_cluster_dir(self.app_base, view.cluster_id, Path(first.server_dir))
+        problem = cluster_folder_problem(fallback, installs, roots, allow_own_saved=False)
+        if problem:
+            raise RuntimeError(
+                f"No safe shared folder could be picked for this cluster ({problem}). Choose one with Cluster... on one of its maps."
+            )
+        return fallback
 
     def _fix_health_issue(self, view: ClusterView, issue: HealthIssue, *, parent: Any = None, ask: bool = True) -> None:
         members = [self._runtime(sid) for sid in view.members]
@@ -11312,6 +11354,15 @@ class ServerManagerApp:
     def copy_settings(self, source_id: str, targets: List[str], **opts: bool) -> None:
         src_rt = self._runtime(source_id)
         src_dir = Path(src_rt.cfg.server_dir)
+        # Synced here, once: the copies below run in parallel and must only read the source.
+        source_running = self._install_running(str(src_dir))
+        try:
+            for target in ("gus", "game"):
+                ensure_ini_staging_synced(ini_stage_paths(self.app_base, source_id, src_dir, target),
+                                          server_running=source_running, logger=src_rt.logger)
+        except Exception as e:
+            messagebox.showerror("Copy Settings", f"Reading the settings of {self._display_name(source_id)} failed: {e}")
+            return
         refused: List[str] = []
         started: List[str] = []
         for sid in targets:
@@ -11320,8 +11371,9 @@ class ServerManagerApp:
             def job(_rt: ServerRuntime = rt) -> None:
                 copy_ini_settings(
                     self.app_base, source_id, src_dir, _rt.server_id, Path(_rt.cfg.server_dir), _rt.logger,
-                    source_running=self._install_running(str(src_dir)),
+                    source_running=source_running,
                     target_running=self._install_running(_rt.cfg.server_dir),
+                    sync_source=False,
                     **opts,
                 )
 
