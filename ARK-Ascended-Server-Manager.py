@@ -1774,8 +1774,11 @@ def copy_file_atomic(src: Path, dst: Path) -> bool:
         return False
     ensure_dir(dst.parent)
     part = dst.with_name(dst.name + ".part")
-    with contextlib.suppress(OSError):
-        part.unlink()  # left over from a copy that was killed
+    if part.exists():  # left over from a copy that was killed; it may carry a read-only bit
+        with contextlib.suppress(OSError):
+            os.chmod(part, stat.S_IWRITE)
+        with contextlib.suppress(OSError):
+            part.unlink()
     try:
         shutil.copy2(src, part)
         os.rename(part, dst)
@@ -1790,26 +1793,58 @@ def copy_file_atomic(src: Path, dst: Path) -> bool:
     return True
 
 
-# Parts of an install that belong to that server, not to the game: never copied to a new map.
+# Only the game's own folders at the top of an install are copied: anything else there (a
+# backup folder, notes, other tools) belongs to that server or its owner.
+INSTALL_COPY_TOP_DIRS = {"engine", "shootergame", "steamapps"}
+# Inside those, parts that belong to that server, not to the game: never copied to a new map.
 SERVER_STATE_DIRS = (
     ("ShooterGame", "Saved"),  # worlds, configs, logs, cluster data
+    ("ShooterGame", ".sentry-native"),  # crash reporter sessions
     ("ShooterGame", "Binaries", "Win64", "ArkApi"),  # ServerAPI plugins and their data
     ("ShooterGame", "Binaries", "Win64", "ShooterGame", "ModsUserData"),  # mods' per-server data
+    ("ShooterGame", "Binaries", "Win64", "logs"),  # Steam client logs
+    ("ShooterGame", "Binaries", "Win64", "config"),  # Steam client state
+    ("ShooterGame", "Binaries", "Win64", "appcache"),
+    ("steamapps", "downloading"),  # SteamCMD leftovers, can be gigabytes
+    ("steamapps", "temp"),
+    ("steamapps", "_repair_backup"),
 )
-COPY_MARKER_NAME = ".asa_manager_copying"  # present while a copy is unfinished
+COPY_MARKER_NAME = ".asa_manager_copying"  # present until a copied install has been validated
 
 
-def copy_server_install(src: Path, dst: Path, logger: logging.Logger) -> int:
+def server_installed(server_dir: Path) -> bool:
+    """The server is installed and complete: its executable is there and no copy into the
+    folder is still unfinished or unvalidated."""
+    return ark_server_exe(server_dir).exists() and not (server_dir / COPY_MARKER_NAME).exists()
+
+
+def copy_marker_source(server_dir: Path) -> Optional[Path]:
+    """Where an unfinished copy into this folder was copying from, if it says."""
+    try:
+        text = (server_dir / COPY_MARKER_NAME).read_text(encoding="utf-8")
+    except OSError:
+        return None
+    m = re.match(r"copying from (.+)", text.strip())
+    return Path(m.group(1).strip()) if m else None
+
+
+def copy_server_install(
+    src: Path, dst: Path, logger: logging.Logger, also_skip: Optional[List[Path]] = None
+) -> int:
     """Copy an ASA server install's program files to a new install folder, so SteamCMD only
     has to check and finish it instead of downloading the whole server.
 
-    What belongs to that server (SERVER_STATE_DIRS) is left out: the new server starts
-    clean. Files already in the target are kept, and a marker file stays until the copy
-    is complete, so an interrupted copy is resumed. Returns the number of files copied.
+    Only the game's folders are copied (INSTALL_COPY_TOP_DIRS), minus what belongs to that
+    server (SERVER_STATE_DIRS) and any folder in also_skip (its backup or cluster folder,
+    when they live in the install): the new server starts clean. Files already in the
+    target are kept. The marker file written here stays until the caller has had SteamCMD
+    validate the copy; while it is there the install does not count as complete, and an
+    interrupted copy is resumed. Returns the number of files copied.
     """
     if path_contains(src, dst):
         raise ValueError(f"The new install folder {dst} lies inside the install it would copy ({src}).")
     skip = {tuple(part.lower() for part in rel) for rel in SERVER_STATE_DIRS}
+    extra_skip = [p for p in (also_skip or []) if path_contains(src, p)]
     ensure_dir(dst)
     marker = dst / COPY_MARKER_NAME
     atomic_write_text(marker, f"copying from {src}\n", encoding="utf-8")
@@ -1820,10 +1855,21 @@ def copy_server_install(src: Path, dst: Path, logger: logging.Logger) -> int:
     copied = 0
     size = 0
     next_report = 2 * 1024 ** 3
+    seen: Set[str] = set()  # real folders already walked: a linked folder loop is walked once
     for root, dirs, files in os.walk(src, onerror=fail, followlinks=True):
+        real = os.path.normcase(os.path.realpath(root))
+        if real in seen:
+            dirs[:] = []
+            continue
+        seen.add(real)
         rel = Path(root).relative_to(src)
         rel_parts = tuple(part.lower() for part in rel.parts)
-        dirs[:] = [d for d in dirs if rel_parts + (d.lower(),) not in skip]
+        if not rel_parts:
+            dirs[:] = [d for d in dirs if d.lower() in INSTALL_COPY_TOP_DIRS]
+        dirs[:] = [
+            d for d in dirs
+            if rel_parts + (d.lower(),) not in skip and not any(same_path(Path(root) / d, x) for x in extra_skip)
+        ]
         for name in files:
             if copy_file_atomic(Path(root) / name, dst / rel / name):
                 copied += 1
@@ -1832,7 +1878,6 @@ def copy_server_install(src: Path, dst: Path, logger: logging.Logger) -> int:
                 if size >= next_report:
                     logger.info(f"Copying server files: {size / 1024 ** 3:.0f} GB so far...")
                     next_report += 2 * 1024 ** 3
-    marker.unlink()
     logger.info(f"Copied {copied} server file(s) ({size / 1024 ** 3:.1f} GB) from {src} to {dst}.")
     return copied
 
@@ -3609,8 +3654,8 @@ def cluster_health(
                 "and Broadcast and the player count do not work.",
                 servers=[sid],
             ))
-        if not ark_server_exe(Path(cfg.server_dir)).exists():
-            issues.append(HealthIssue("info", f"{name} is not installed yet (First Install on its Server tab).", servers=[sid]))
+        if not server_installed(Path(cfg.server_dir)):
+            issues.append(HealthIssue("info", f"{name} is not installed yet, or its install is unfinished (First Install on its Server tab).", servers=[sid]))
     return issues
 
 
@@ -9974,15 +10019,28 @@ class ServerManagerApp:
 
                 target = Path(rt.cfg.server_dir)
                 unfinished = (target / COPY_MARKER_NAME).exists()
-                copied = False
-                if (copy_from is not None and ark_server_exe(copy_from).exists() and not same_path(copy_from, target)
+                source = copy_from
+                if source is None and unfinished:
+                    source = copy_marker_source(target)  # resume a copy cut short in an earlier session
+                copied = unfinished
+                if (source is not None and server_installed(source) and not same_path(source, target)
                         and (unfinished or not ark_server_exe(target).exists())):
-                    log.info(f"{'Resuming the copy of' if unfinished else 'Copying'} the server files from {copy_from} "
+                    log.info(f"{'Resuming the copy of' if unfinished else 'Copying'} the server files from {source} "
                              "instead of downloading them...")
-                    copy_server_install(copy_from, target, log)
                     copied = True
-                elif unfinished:
-                    copied = True  # half a copy and nothing to finish it from: let SteamCMD check every file
+                    src_cfg = next((self._runtime(r.id).cfg for r in self.global_cfg.servers
+                                    if same_path(Path(self._runtime(r.id).cfg.server_dir), source)), None)
+                    keep_out = []
+                    if src_cfg is not None:
+                        keep_out.append(resolve_backup_root(src_cfg, self.app_base))
+                        folder = effective_cluster_dir(src_cfg)
+                        if folder is not None:
+                            keep_out.append(folder)
+                    try:
+                        copy_server_install(source, target, log, also_skip=keep_out)
+                    except OSError as e:
+                        # A locked or unreadable file: SteamCMD downloads what the copy did not get.
+                        log.info(f"Copying stopped ({e}); SteamCMD downloads the rest.")
 
                 # A copy carries the source's manifest, so SteamCMD would take it as complete:
                 # validate, which only reads the local files, catches anything missing or damaged.
@@ -9996,6 +10054,7 @@ class ServerManagerApp:
                     retries=2,
                 )
                 if copied:
+                    # Validated: only now is the copied install complete.
                     with contextlib.suppress(OSError):
                         (target / COPY_MARKER_NAME).unlink()
             finally:
@@ -10019,6 +10078,9 @@ class ServerManagerApp:
         if validate is None:
             validate = bool(cfg.validate_on_update)
 
+        # An unfinished copy is never trusted: it is always validated.
+        if (Path(cfg.server_dir) / COPY_MARKER_NAME).exists():
+            validate = True
         # One SteamCMD run at a time across every server: the self-check in ensure_steamcmd
         # may reinstall SteamCMD, which must never happen under another server's download.
         self._take_update_slot(rt)
@@ -10033,6 +10095,9 @@ class ServerManagerApp:
                 lock_root=self.app_base,
                 retries=2,
             )
+            if validate:
+                with contextlib.suppress(OSError):
+                    (Path(cfg.server_dir) / COPY_MARKER_NAME).unlink()
         finally:
             self._update_slot.release()
 
@@ -10544,6 +10609,8 @@ class ServerManagerApp:
         exe = ark_server_exe(server_dir)
         if not exe.exists():
             raise FileNotFoundError(f"Server EXE not found: {exe}")
+        if (server_dir / COPY_MARKER_NAME).exists():
+            raise RuntimeError("The install of this server is unfinished (a copy was cut short). Run First Install to finish it.")
 
         if cfg.enable_rcon and not (cfg.admin_password or "").strip():
             raise RuntimeError("Admin/RCON password is empty. Set 'Admin Password (RCON/Admin)' before starting.")
@@ -11490,6 +11557,8 @@ class ServerManagerApp:
             return "Running"
         if task:
             return f"{task}..."
+        if (Path(rt.cfg.server_dir) / COPY_MARKER_NAME).exists():
+            return "Install unfinished"
         if not ark_server_exe(Path(rt.cfg.server_dir)).exists():
             return "Not installed"
         return "Stopped"
@@ -11852,7 +11921,7 @@ class ServerManagerApp:
             for rt in members:
                 if rt.is_running():
                     ok = self.update_and_restart_for(rt)
-                elif ark_server_exe(Path(rt.cfg.server_dir)).exists():
+                elif server_installed(Path(rt.cfg.server_dir)) or (Path(rt.cfg.server_dir) / COPY_MARKER_NAME).exists():
                     ok = self._run_task("Update / Validate", lambda _rt=rt: self._update_server_install(_rt, validate=None), rt)
                 else:
                     continue  # not installed: First Install is a deliberate step
@@ -11900,8 +11969,8 @@ class ServerManagerApp:
                 for rt in members:
                     if rt.is_running():
                         continue
-                    if not ark_server_exe(Path(rt.cfg.server_dir)).exists():
-                        rt.logger.info("Start All: skipped, the server is not installed (use First Install).")
+                    if not server_installed(Path(rt.cfg.server_dir)):
+                        rt.logger.info("Start All: skipped, the server is not installed or its install is unfinished (use First Install).")
                         continue
                     todo.append(rt)
                 failed: List[str] = []
@@ -12025,15 +12094,33 @@ class ServerManagerApp:
             return
         ClusterWizardDialog(self, add_to)
 
+    def _install_chain(self, runtimes: List[ServerRuntime], source: Optional[Path]) -> None:
+        """Install maps one after another. Each copies from source when there is one; the
+        first map that installs becomes the source of the rest, and a map that fails does
+        not keep the others from installing."""
+        if not runtimes:
+            return
+        rt, rest = runtimes[0], runtimes[1:]
+
+        def next_one(ok: bool) -> None:
+            nxt = source
+            if nxt is None and ok and server_installed(Path(rt.cfg.server_dir)):
+                nxt = Path(rt.cfg.server_dir)
+            self._install_chain(rest, nxt)
+
+        if not self.first_install_for(rt, copy_from=source, after=next_one):
+            rt.logger.info("First Install skipped: a task is running for this server.")
+            self._install_chain(rest, source)
+
     def _installed_copy_source(self, template: AppConfig, exclude: Set[str]) -> Optional[Path]:
         """An install to copy the server files from: the template's, else any installed profile's."""
-        if ark_server_exe(Path(template.server_dir)).exists():
+        if server_installed(Path(template.server_dir)):
             return Path(template.server_dir)
         for ref in self.global_cfg.servers:
             if ref.id in exclude:
                 continue
             folder = Path(self._runtime(ref.id).cfg.server_dir)
-            if ark_server_exe(folder).exists() and not (folder / COPY_MARKER_NAME).exists():
+            if server_installed(folder):
                 return folder
         return None
 
@@ -12115,26 +12202,11 @@ class ServerManagerApp:
         if install and created:
             source = self._installed_copy_source(template, exclude=set(created))
             runtimes = [self._runtime(sid) for sid in created]
+            self._install_chain(runtimes, source)
             if source is not None:
-                # Every map copies the program files of an install that is already there.
-                for rt in runtimes:
-                    self.first_install_for(rt, copy_from=source)
-                how = f"by copying the server files from {source}, then letting SteamCMD bring them up to date"
+                how = f"one after another, by copying the server files from {source}, then letting SteamCMD check them"
             else:
-                # Nothing to copy from yet: the first map downloads, the others copy from it.
-                first = runtimes[0]
-                rest = runtimes[1:]
-
-                def install_rest(ok: bool) -> None:
-                    # Copied from the first map when it installed; downloaded each, if it did not.
-                    source_dir = Path(first.cfg.server_dir) if ok and ark_server_exe(Path(first.cfg.server_dir)).exists() else None
-                    if source_dir is None:
-                        self.logger.info("The first map did not install; the others are downloaded each.")
-                    for rt in rest:
-                        self.first_install_for(rt, copy_from=source_dir)
-
-                self.first_install_for(first, after=install_rest if rest else None)
-                how = "the first map with a full download, the others by copying it"
+                how = "the first map with a full download, the others by copying the first one that installed"
             lines.append(
                 f"They are being installed now ({how}); see the console. When they finish, use Start All "
                 "on the Dashboard."
