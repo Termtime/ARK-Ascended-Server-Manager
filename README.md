@@ -79,9 +79,10 @@ This manager separates *edit time* and *runtime*:
 ### Several servers in one window
 - Every profile has its own runtime: servers run side by side, and the profile selector only picks which one the window shows and edits. Switching never stops anything, and running servers are marked in the selector
 - Start, stop, restart, update, back up and send RCON to the server on screen while others keep running; each server runs one task at a time, different servers run theirs in parallel
-- Auto-saves and the nightly Auto Update & Restart run for every profile that has them on, not just the one on screen
+- Auto-saves and the nightly Auto Update & Restart run for every profile that has them on, not just the one on screen. The nightly update only touches servers that are running (it never starts a stopped one or installs into an unused profile), waits for a busy server instead of skipping the night, and servers take turns with SteamCMD while they keep running; a failed update brings the server back on the installed version
 - Starting refuses a game, query or RCON port another running server already uses
-- The console tags every line with its server and can show only the selected one; each server also logs to `servers/<id>/logs/server.log`
+- The console tags every line with its server and can show only the selected one; each server also logs to `servers/<id>/logs/server.log` (logs rotate at 20 MB, 3 kept)
+- Backups made in the same second by different servers get their own zip file
 - Closing the window offers to stop every running server safely (in parallel) before it closes
 
 ### Clusters

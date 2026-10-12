@@ -9,6 +9,7 @@ import copy
 import hashlib
 import json
 import logging
+import logging.handlers
 import os
 import queue
 import re
@@ -113,6 +114,11 @@ APPDATA_DIR_NAME = "ARK-Ascended-Server-Manager"
 LOG_DIR_NAME = "logs"
 LOG_FILE_NAME = "app.log"
 SERVER_LOG_FILE_NAME = "server.log"  # per server, under servers/<id>/logs
+LOG_ROTATE_BYTES = 20 * 1024 * 1024
+LOG_ROTATE_KEEP = 3
+# How long an Update & Restart waits, with its server still up, for another server's
+# SteamCMD run to finish before it gives up for this time.
+UPDATE_SLOT_WAIT_SEC = 3 * 60 * 60
 STAGING_DIR_NAME = "staging"
 BASELINE_DIR_NAME = "baseline"
 BACKUP_DIR_NAME = "backups"
@@ -709,6 +715,23 @@ def ensure_dir(p: Path) -> None:
 
 def now_ts() -> str:
     return time.strftime("%Y-%m-%d_%H-%M-%S")
+
+
+def reserve_zip_path(folder: Path, stem: str) -> Path:
+    """A new zip path in folder that no other writer can take: created here, exclusively.
+
+    Several servers can back up in the same second into one folder; the timestamp alone
+    would hand them the same name, and two writers on one zip silently lose one backup.
+    """
+    ensure_dir(folder)
+    for n in range(1000):
+        path = folder / (f"{stem}.zip" if n == 0 else f"{stem}-{n}.zip")
+        try:
+            with open(path, "xb"):
+                return path
+        except FileExistsError:
+            continue
+    raise RuntimeError(f"No free backup file name for {stem} in {folder}")
 
 
 def format_duration(total_seconds: int) -> str:
@@ -3620,7 +3643,7 @@ def backup_server_save_folder(
         return None
 
     ensure_dir(backup_root)
-    out_zip = backup_root / f"ASA_PreImport_{folder.name}_{now_ts()}.zip"
+    out_zip = reserve_zip_path(backup_root, f"ASA_PreImport_{folder.name}_{now_ts()}")
     with zipfile.ZipFile(out_zip, "w", compression=zipfile.ZIP_DEFLATED) as z:
         for p in files:
             z.write(p, arcname=p.relative_to(folder).as_posix())
@@ -4030,7 +4053,7 @@ def _write_server_zip(
 
     target_dir = resolve_backup_root(cfg, app_base)
     ensure_dir(target_dir)
-    out_zip = target_dir / f"{prefix}{now_ts()}.zip"
+    out_zip = reserve_zip_path(target_dir, f"{prefix}{now_ts()}")
 
     logger.info(f"Creating {label.lower()}: {out_zip}")
     # The config folder lives inside Saved, so zipping Saved already covers it. So does
@@ -4166,7 +4189,7 @@ class AutoSaveScheduler:
 SERVER_SAVED_ZIP_PREFIX = "ShooterGame/Saved/"
 _BACKUP_NAME_RE = re.compile(
     r"^ASA_(?:Backup|AutoSave|PreImport|PreRestore)_(?:(?P<map>.+)_)?"
-    r"(?P<ts>\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2})\.zip$",
+    r"(?P<ts>\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2})(?:-\d+)?\.zip$",
     re.IGNORECASE,
 )
 
@@ -4332,7 +4355,7 @@ def create_pre_restore_backup(
     if not roots:
         return None
     ensure_dir(backup_root)
-    out_zip = backup_root / f"ASA_PreRestore_{now_ts()}.zip"
+    out_zip = reserve_zip_path(backup_root, f"ASA_PreRestore_{now_ts()}")
     count = _zip_server_tree(
         out_zip, server_dir, roots, backup_manifest(BACKUP_KIND_PRE_RESTORE, server_id, server_name)
     )
@@ -4593,6 +4616,15 @@ class TkTextHandler(logging.Handler):
             pass  # widget destroyed: the app is closing
 
 
+# Settings a running process is bound to; changing them in the form only applies on the
+# next start, so actions on a running server read them from what it was started with.
+PROCESS_BOUND_FIELDS = (
+    "server_dir", "map_name", "alt_save_directory_name", "port", "query_port",
+    "enable_rcon", "rcon_host", "rcon_port", "admin_password",
+    "cluster_enable", "cluster_id", "cluster_custom_path_enable", "cluster_dir_override",
+)
+
+
 class ServerRuntime:
     """What one server profile has while the app runs: its process and background state.
 
@@ -4623,6 +4655,7 @@ class ServerRuntime:
         self.auto_save_last: Optional[Tuple[datetime, bool]] = None
         self.auto_update_next: Optional[datetime] = None
         self.auto_update_waiting = False
+        self.removed = False  # its profile was removed; nothing may start for it any more
         self.auto_update_time = ""  # the HH:MM auto_update_next was computed from
 
     def is_running(self) -> bool:
@@ -4631,9 +4664,19 @@ class ServerRuntime:
         return p is not None and p.poll() is None
 
     def live_cfg(self) -> AppConfig:
-        """The settings the running process uses (as started), else the saved profile."""
+        """Settings to act on for this server now.
+
+        While it runs, what the process is bound to (its folder, saves, ports, RCON,
+        cluster) comes from the settings it started with, since the form may have changed
+        since. Everything else, such as backup policy, follows the saved profile as usual.
+        """
         run = self.run_cfg
-        return run if run is not None and self.is_running() else self.cfg
+        if run is None or not self.is_running():
+            return self.cfg
+        merged = copy.copy(self.cfg)
+        for name in PROCESS_BOUND_FIELDS:
+            setattr(merged, name, getattr(run, name))
+        return merged
 
     def pid(self) -> Optional[int]:
         with self.proc_lock:
@@ -4646,7 +4689,7 @@ class ServerRuntime:
 
     def try_claim(self, name: str) -> bool:
         with self.task_lock:
-            if self.task is not None:
+            if self.task is not None or self.removed:
                 return False
             self.task = name
             return True
@@ -4682,7 +4725,9 @@ def make_server_logger(
     if log_dir is not None:
         try:
             ensure_dir(log_dir)
-            fh = logging.FileHandler(log_dir / SERVER_LOG_FILE_NAME, encoding="utf-8")
+            fh = logging.handlers.RotatingFileHandler(
+                log_dir / SERVER_LOG_FILE_NAME, maxBytes=LOG_ROTATE_BYTES, backupCount=LOG_ROTATE_KEEP, encoding="utf-8"
+            )
             fh.setLevel(LOG_LEVEL)
             fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%Y-%m-%d %H:%M:%S"))
             logger.addHandler(fh)
@@ -4705,7 +4750,10 @@ def build_logger(log_dir: Path, text_widget: tk.Text) -> Tuple[logging.Logger, T
     h_gui.start_pump()
     logger.addHandler(h_gui)
 
-    h_file = logging.FileHandler(log_dir / LOG_FILE_NAME, encoding="utf-8")
+    # Every server's output lands here too, so it rotates instead of growing for good.
+    h_file = logging.handlers.RotatingFileHandler(
+        log_dir / LOG_FILE_NAME, maxBytes=LOG_ROTATE_BYTES, backupCount=LOG_ROTATE_KEEP, encoding="utf-8"
+    )
     h_file.setLevel(LOG_LEVEL)
     h_file.setFormatter(fmt)
     logger.addHandler(h_file)
@@ -6110,13 +6158,17 @@ class ServerManagerApp:
         self._scheduler_thread: Optional[threading.Thread] = None
         self._scheduler_stop = threading.Event()
         self._auto_update_announced: Dict[str, bool] = {}
-        # One Update & Restart at a time across servers (see update_and_restart_for).
-        self._update_slot = threading.Lock()
+        # One SteamCMD run (install, update, validate) at a time across this manager's
+        # servers. Reentrant: Update & Restart holds it across stop, update and start.
+        self._update_slot = threading.RLock()
 
         self._initialize_profiles()
 
         self._autosave_after_id: Optional[str] = None
         self._autosave_guard = False
+        self._status_key: Optional[Tuple[Any, ...]] = None
+        # Ports of servers between their port check and their launch (see _reserve_ports).
+        self._starting_ports: Dict[str, Set[int]] = {}
 
         self._rcon_factory = create_rcon_client
 
@@ -6723,10 +6775,21 @@ class ServerManagerApp:
             items = list(self._runtimes.values())
         return [rt for rt in items if rt.is_running()]
 
+    def _install_running(self, server_dir: str) -> bool:
+        """A server of this manager runs from this install folder, whichever profile it is.
+
+        The INI editor asks this rather than whether the profile on screen runs: profiles
+        sharing an install share its live INIs, which must not be merged into another
+        profile's staging while a sibling server is using them.
+        """
+        target = Path(server_dir)
+        return any(same_path(Path(rt.live_cfg().server_dir), target) for rt in self._running_runtimes())
+
     def _drop_runtime(self, server_id: str) -> None:
         with self._runtimes_lock:
             rt = self._runtimes.pop(server_id, None)
         if rt is not None:
+            rt.removed = True
             if rt.discord is not None:
                 rt.discord.stop_polling()
             rt.close_logger()
@@ -6734,9 +6797,8 @@ class ServerManagerApp:
     # ---------------------------------------------------------------------
     # RCON FIX helpers
     # ---------------------------------------------------------------------
-    def _capture_runtime_rcon(self, rt: ServerRuntime) -> None:
+    def _capture_runtime_rcon(self, rt: ServerRuntime, cfg: AppConfig) -> None:
         # Capture values used to start the *running* server.
-        cfg = rt.cfg
         rt.rcon_snapshot = ((cfg.rcon_host or DEFAULT_RCON_HOST).strip(), int(cfg.rcon_port), str(cfg.admin_password or ""))
 
     def _rcon_params(self, rt: ServerRuntime) -> Tuple[str, int, str]:
@@ -6775,12 +6837,15 @@ class ServerManagerApp:
         coordinator.start_polling(rt.cfg)
 
     def _discord_request_stop(self, rt: ServerRuntime) -> None:
-        if not rt.cfg.discord_enable:
+        # A running notifier is told even if Discord was switched off since the start.
+        if not rt.cfg.discord_enable and rt.discord is None:
             return
         self._discord_get_coordinator(rt).request_stop()
 
     def _discord_stop_notifications(self, rt: ServerRuntime, requested: bool, exit_code: Optional[int] = None) -> None:
         if not rt.cfg.discord_enable:
+            if rt.discord is not None:
+                rt.discord.stop_polling()  # its poller must not outlive the server
             return
         coordinator = self._discord_get_coordinator(rt)
         coordinator.notify_stop(rt.cfg, requested=requested, exit_code=exit_code)
@@ -8048,6 +8113,12 @@ class ServerManagerApp:
         self._refresh_server_selector(self.active_server_id)
 
         others = [r for r in self._running_runtimes() if r.server_id != rt.server_id]
+        # The state line is written only when the state changes, so a message posted
+        # meanwhile ("Auto-save failed", "Backup created ...") stays until then.
+        key = (rt.server_id, running, rt.task if busy else None, len(others))
+        if key == self._status_key:
+            return
+        self._status_key = key
         also = f" | {len(others)} other server(s) running" if others else ""
         if running:
             self._set_status(f"Server: RUNNING{also}")
@@ -8062,14 +8133,15 @@ class ServerManagerApp:
         except Exception:
             pass
 
-    def _save_form(self, title: str = "Settings") -> bool:
+    def _save_form(self, title: str = "Settings", *, show_error: bool = True) -> bool:
         """Save the form into the profile it shows, so a job can start from the saved settings."""
         try:
             self.cfg = self._collect_vars_to_cfg()
             self._save_active_server_config(self.cfg)
             return True
         except Exception as e:
-            messagebox.showerror(title, f"Current configuration is invalid: {e}")
+            if show_error:
+                messagebox.showerror(title, f"Current configuration is invalid: {e}")
             return False
 
     def _run_task(
@@ -8079,6 +8151,7 @@ class ServerManagerApp:
         rt: Optional[ServerRuntime] = None,
         *,
         quiet: bool = False,
+        then: Optional[Callable[[], None]] = None,
     ) -> bool:
         """Start fn on a worker thread for one server; False when that server already runs a task.
 
@@ -8086,7 +8159,9 @@ class ServerManagerApp:
         so a check here and a claim on the worker would let two tasks slip in. Tasks of
         different servers run side by side. quiet tasks (unattended ones: timers, crash
         restarts) report failures in the log and status bar, never in a modal dialog that
-        would sit there blocking the window until someone comes back.
+        would sit there blocking the window until someone comes back. then runs on the
+        Tk thread once fn succeeded and the server is free again, so it may start the
+        next task for it.
         """
         rt = rt or self.rt
         if not rt.try_claim(name):
@@ -8095,10 +8170,12 @@ class ServerManagerApp:
 
         def worker() -> None:
             self._ui(self._refresh_buttons)
+            ok = False
             try:
                 rt.logger.info(f"=== {name} started ===")
                 fn()
                 rt.logger.info(f"=== {name} completed ===")
+                ok = True
             except TaskCancelled as e:
                 rt.logger.info(f"=== {name} cancelled: {e} ===")
             except Exception as e:
@@ -8111,6 +8188,8 @@ class ServerManagerApp:
             finally:
                 rt.release()
                 self._ui(self._refresh_buttons)
+                if ok and then is not None:
+                    self._ui(then)
 
         try:
             threading.Thread(target=worker, daemon=True, name=f"task-{name}").start()
@@ -8238,27 +8317,33 @@ class ServerManagerApp:
 
         def job() -> None:
             log = rt.logger
-            shared = _programdata_base()
-            if shared:
-                ensure_programdata_acl(shared, log)
+            # Installers download to fixed temp paths and SteamCMD may reinstall itself, so
+            # first installs of several servers take turns.
+            self._take_update_slot(rt)
+            try:
+                shared = _programdata_base()
+                if shared:
+                    ensure_programdata_acl(shared, log)
 
-            if not is_admin():
-                log.info("Warning: Not running as Administrator. Installs may fail.")
+                if not is_admin():
+                    log.info("Warning: Not running as Administrator. Installs may fail.")
 
-            self._ensure_dependencies_first_install(log)
-            install_asa_certificates(log)
+                self._ensure_dependencies_first_install(log)
+                install_asa_certificates(log)
 
-            steamcmd_exe = ensure_steamcmd(self.global_cfg.steamcmd_dir, log)
+                steamcmd_exe = ensure_steamcmd(self.global_cfg.steamcmd_dir, log)
 
-            steamcmd_app_update(
-                logger=log,
-                steamcmd_exe=steamcmd_exe,
-                install_dir=Path(rt.cfg.server_dir),
-                app_id=ARK_ASA_APP_ID,
-                validate=False,
-                lock_root=self.app_base,
-                retries=2,
-            )
+                steamcmd_app_update(
+                    logger=log,
+                    steamcmd_exe=steamcmd_exe,
+                    install_dir=Path(rt.cfg.server_dir),
+                    app_id=ARK_ASA_APP_ID,
+                    validate=False,
+                    lock_root=self.app_base,
+                    retries=2,
+                )
+            finally:
+                self._update_slot.release()
 
             exe = ark_server_exe(Path(rt.cfg.server_dir))
             log.info(f"Server executable: {exe if exe.exists() else 'NOT FOUND'}")
@@ -8275,29 +8360,33 @@ class ServerManagerApp:
         cfg = rt.cfg
         if check_install:
             self._ensure_install_free(rt, Path(cfg.server_dir), confirm=False)
-        steamcmd_exe = ensure_steamcmd(self.global_cfg.steamcmd_dir, rt.logger)
         if validate is None:
             validate = bool(cfg.validate_on_update)
 
-        # SteamCMD runs one at a time across every server (its own file lock), so maps
-        # that update together queue here instead of corrupting each other's downloads.
-        steamcmd_app_update(
-            logger=rt.logger,
-            steamcmd_exe=steamcmd_exe,
-            install_dir=Path(cfg.server_dir),
-            app_id=ARK_ASA_APP_ID,
-            validate=bool(validate),
-            lock_root=self.app_base,
-            retries=2,
-        )
+        # One SteamCMD run at a time across every server: the self-check in ensure_steamcmd
+        # may reinstall SteamCMD, which must never happen under another server's download.
+        self._take_update_slot(rt)
+        try:
+            steamcmd_exe = ensure_steamcmd(self.global_cfg.steamcmd_dir, rt.logger)
+            steamcmd_app_update(
+                logger=rt.logger,
+                steamcmd_exe=steamcmd_exe,
+                install_dir=Path(cfg.server_dir),
+                app_id=ARK_ASA_APP_ID,
+                validate=bool(validate),
+                lock_root=self.app_base,
+                retries=2,
+            )
+        finally:
+            self._update_slot.release()
 
     # ---------------------------------------------------------------------
     # Start / Stop / RCON
     # ---------------------------------------------------------------------
-    def _stage_required_configs_for_start(self, rt: ServerRuntime) -> None:
-        server_dir = Path(rt.cfg.server_dir)
+    def _stage_required_configs_for_start(self, rt: ServerRuntime, cfg: AppConfig) -> None:
+        server_dir = Path(cfg.server_dir)
         ensure_baseline(self.app_base, rt.server_id, server_dir, rt.logger, refresh=True)
-        ensure_required_server_settings(rt.cfg, self.app_base, rt.server_id, server_dir, rt.logger)
+        ensure_required_server_settings(cfg, self.app_base, rt.server_id, server_dir, rt.logger)
 
     def _should_auto_restart(self, rt: ServerRuntime, exit_code: Optional[int]) -> bool:
         if exit_code is None:
@@ -8463,7 +8552,7 @@ class ServerManagerApp:
             p = rt.proc
         # The install, INIs and backup settings it was started with: edits made in the
         # form while it ran must not redirect its shutdown to another folder.
-        cfg = rt.run_cfg or rt.cfg
+        cfg = rt.live_cfg()
         log = rt.logger
 
         if not p or p.poll() is not None:
@@ -8537,8 +8626,9 @@ class ServerManagerApp:
         self._discord_stop_notifications(rt, requested=True)
 
     def stop_server_safe(self) -> None:
-        if not self._save_form("Stop Server"):
-            return
+        # Stopping needs nothing from the form, so an invalid field must not keep a server up.
+        if not self._save_form("Stop Server", show_error=False):
+            self.rt.logger.info("Stop Server: the form has an invalid value; stopping with the saved settings.")
         self.stop_server_for(self.rt)
 
     def stop_server_for(self, rt: ServerRuntime) -> bool:
@@ -8549,31 +8639,42 @@ class ServerManagerApp:
             return
         self.update_and_restart_for(self.rt)
 
+    def _take_update_slot(self, rt: ServerRuntime) -> None:
+        """Wait for this manager's SteamCMD turn; raises after UPDATE_SLOT_WAIT_SEC."""
+        if self._update_slot.acquire(blocking=False):
+            return
+        rt.logger.info("Waiting for another server's SteamCMD run to finish...")
+        if not self._update_slot.acquire(timeout=UPDATE_SLOT_WAIT_SEC):
+            raise RuntimeError(
+                f"Another server's SteamCMD run took longer than {UPDATE_SLOT_WAIT_SEC // 60} minutes; "
+                "this one was left as it is. Try again later."
+            )
+
     def update_and_restart_for(self, rt: ServerRuntime, *, quiet: bool = False) -> bool:
         def job() -> None:
             # Maps updating at the same time take turns here, while still running: stopping
             # first and then queueing for SteamCMD would keep every waiting map down.
-            if not self._update_slot.acquire(blocking=False):
-                rt.logger.info("Update & Restart: waiting for another server's update to finish.")
-                self._update_slot.acquire()
+            self._take_update_slot(rt)
             try:
                 # Before stopping our own server: if another server holds the install, the update
                 # cannot run, and stopping first would only leave this map down until someone looks.
                 self._ensure_install_free(rt, Path(rt.cfg.server_dir), confirm=False)
 
                 was_running = rt.is_running()
-                if was_running:
-                    rt.logger.info("Server running -> performing safe stop before update.")
-                    self._safe_stop(rt)
-
                 try:
+                    if was_running:
+                        rt.logger.info("Server running -> performing safe stop before update.")
+                        self._safe_stop(rt)
                     self._update_server_install(rt, validate=None, check_install=False)
                 except Exception as e:
-                    if not was_running:
-                        raise
-                    # A failed update must not leave a map down: bring it back on what is installed.
-                    rt.logger.error(f"Update failed ({e}); starting the server again on the installed version.")
-                    self._start_server_inline(rt, check_install=False)
+                    # A failed stop or update must not leave a map down: bring it back on what
+                    # is installed, and report the original failure, not a follow-up one.
+                    if was_running and not rt.is_running():
+                        rt.logger.error(f"Update & Restart failed ({e}); starting the server again on the installed version.")
+                        try:
+                            self._start_server_inline(rt, check_install=False)
+                        except Exception as e2:
+                            rt.logger.error(f"Starting the server again failed too: {e2}")
                     raise
             finally:
                 self._update_slot.release()
@@ -8608,7 +8709,9 @@ class ServerManagerApp:
         self.update_and_restart_safe()
 
     def _start_server_inline(self, rt: ServerRuntime, *, check_install: bool = True) -> None:
-        cfg = rt.cfg
+        # Read once: the form may be saved while this runs, and the staged INIs, the RCON
+        # snapshot and the command line must all come from the same settings.
+        cfg = copy.deepcopy(rt.cfg)
         server_dir = Path(cfg.server_dir)
         exe = ark_server_exe(server_dir)
         if not exe.exists():
@@ -8617,15 +8720,22 @@ class ServerManagerApp:
         if cfg.enable_rcon and not (cfg.admin_password or "").strip():
             raise RuntimeError("Admin/RCON password is empty. Set 'Admin Password (RCON/Admin)' before starting.")
 
-        self._ensure_ports_free(rt)
+        self._reserve_ports(rt, cfg)
+        try:
+            self._launch_server(rt, cfg, server_dir, exe, check_install=check_install)
+        finally:
+            with self._runtimes_lock:
+                self._starting_ports.pop(rt.server_id, None)
+
+    def _launch_server(self, rt: ServerRuntime, cfg: AppConfig, server_dir: Path, exe: Path, *, check_install: bool) -> None:
         if check_install:
             self._ensure_install_free(rt, server_dir, confirm=True)
         self._prepare_cluster_for_start(cfg, rt.logger)
-        self._stage_required_configs_for_start(rt)
+        self._stage_required_configs_for_start(rt, cfg)
         apply_staging_to_server(self.app_base, rt.server_id, server_dir, rt.logger)
 
         # RCON FIX: capture runtime values for this running instance
-        self._capture_runtime_rcon(rt)
+        self._capture_runtime_rcon(rt, cfg)
         rt.stop_requested.clear()
 
         cmd = build_server_command(cfg)
@@ -8654,24 +8764,35 @@ class ServerManagerApp:
         self._discord_start_notifications(rt, p.pid)
         self._ui(self._refresh_buttons)
 
-    def _ensure_ports_free(self, rt: ServerRuntime) -> None:
-        """Refuse to start on a port another server of this manager is already running on."""
-        mine = {int(rt.cfg.port), int(rt.cfg.query_port)}
-        if rt.cfg.enable_rcon:
-            mine.add(int(rt.cfg.rcon_port))
+    @staticmethod
+    def _ports_of(cfg: AppConfig) -> Set[int]:
+        ports = {int(cfg.port), int(cfg.query_port)}
+        if cfg.enable_rcon:
+            ports.add(int(cfg.rcon_port))
+        return ports
+
+    def _ensure_ports_free(self, rt: ServerRuntime, cfg: Optional[AppConfig] = None) -> None:
+        """Refuse to start on a port another server of this manager runs, or is starting, on."""
+        mine = self._ports_of(cfg or rt.cfg)
+        with self._runtimes_lock:
+            starting = {sid: set(p) for sid, p in self._starting_ports.items() if sid != rt.server_id}
         for other in self._running_runtimes():
-            if other is rt:
-                continue
-            ocfg = other.run_cfg or other.cfg
-            theirs = {int(ocfg.port), int(ocfg.query_port)}
-            if ocfg.enable_rcon:
-                theirs.add(int(ocfg.rcon_port))
+            if other is not rt:
+                starting.setdefault(other.server_id, set()).update(self._ports_of(other.live_cfg()))
+        for sid, theirs in starting.items():
             clash = sorted(mine & theirs)
             if clash:
                 raise RuntimeError(
-                    f"Port(s) {', '.join(map(str, clash))} are in use by {self._display_name(other.server_id)}, "
-                    "which is running. Give this profile its own ports first."
+                    f"Port(s) {', '.join(map(str, clash))} are in use by {self._display_name(sid)}, "
+                    "which is running or starting. Give this profile its own ports first."
                 )
+
+    def _reserve_ports(self, rt: ServerRuntime, cfg: AppConfig) -> None:
+        """Check and claim this start's ports in one step, so two servers starting at the
+        same moment cannot both pass the check and then fight over a port."""
+        with self._runtimes_lock:
+            self._ensure_ports_free(rt, cfg)
+            self._starting_ports[rt.server_id] = self._ports_of(cfg)
 
     def backup_now(self, on_done: Optional[Callable[[Optional[Path]], None]] = None) -> None:
         if not self._save_form("Backup"):
@@ -8967,7 +9088,6 @@ class ServerManagerApp:
 
         def job() -> None:
             log = rt.logger
-            result = ClusterSetupResult()
             stopped = False
             if req.copy_from is not None and rt.is_running():
                 # Copy only while nothing serves the old folder: a download made after the copy
@@ -8990,9 +9110,16 @@ class ServerManagerApp:
             ensure_dir(req.cluster_dir)
             if req.copy_from is not None and req.copy_to is not None:
                 result.copied, result.skipped = copy_cluster_data(req.copy_from, req.copy_to, log)
-            self._ui(lambda: self._finish_cluster_setup(req, result, server_id, stopped))
+            outcome["stopped"] = stopped
 
-        if not self._run_task("Cluster Setup", job, rt):
+        outcome: Dict[str, bool] = {"stopped": False}
+        result = ClusterSetupResult()
+        if not self._run_task(
+            "Cluster Setup",
+            job,
+            rt,
+            then=lambda: self._finish_cluster_setup(req, result, server_id, outcome["stopped"]),
+        ):
             messagebox.showwarning("Cluster", "Another task is running. Try again when it finishes.")
 
     def _cluster_vars(self) -> Tuple[bool, str, bool, str]:
@@ -9032,7 +9159,7 @@ class ServerManagerApp:
     ) -> None:
         if server_id != self.active_server_id:
             # The window moved to another profile while this ran: finish on the profile itself.
-            self._finish_cluster_setup_offscreen(req, server_id, stopped)
+            self._finish_cluster_setup_offscreen(req, result, server_id, stopped)
             return
         if not self._save_cluster_vars((True, req.cluster_id, True, str(req.cluster_dir)), "Cluster"):
             if stopped:
@@ -9090,8 +9217,15 @@ class ServerManagerApp:
             rt.cfg = cfg
         return cfg
 
-    def _finish_cluster_setup_offscreen(self, req: ClusterSetupRequest, server_id: str, stopped: bool) -> None:
+    def _finish_cluster_setup_offscreen(
+        self, req: ClusterSetupRequest, result: ClusterSetupResult, server_id: str, stopped: bool
+    ) -> None:
         name = self._display_name(server_id)
+        extra = ""
+        if result.backup_zip is not None:
+            extra += f"\n\nBackup made first:\n{result.backup_zip}"
+        if req.copy_from is not None:
+            extra += f"\n\nCopied {result.copied} existing transfer file(s) to {req.copy_to}."
         try:
             self._save_profile_fields(
                 server_id,
@@ -9112,15 +9246,15 @@ class ServerManagerApp:
             if not self.start_server_for(rt):
                 messagebox.showwarning("Cluster", f"{name} is in cluster '{req.cluster_id}' but was stopped for the copy; start it from its profile.")
                 return
-            messagebox.showinfo("Cluster", f"{name} is in cluster '{req.cluster_id}' and is starting again.")
+            messagebox.showinfo("Cluster", f"{name} is in cluster '{req.cluster_id}' and is starting again.{extra}")
         elif rt.is_running():
             messagebox.showinfo(
                 "Cluster",
                 f"{name} is in cluster '{req.cluster_id}'. It still runs with its old start options; restart it "
-                "from its profile to bring it in.",
+                f"from its profile to bring it in.{extra}",
             )
         else:
-            messagebox.showinfo("Cluster", f"{name} is in cluster '{req.cluster_id}'. Takes effect on its next start.")
+            messagebox.showinfo("Cluster", f"{name} is in cluster '{req.cluster_id}'. Takes effect on its next start.{extra}")
 
     def leave_cluster(self) -> None:
         _enable, old_id, _custom, folder = self._cluster_vars()
@@ -9282,8 +9416,13 @@ class ServerManagerApp:
         self.root.destroy()
 
     def _stop_and_close(self, running: List[ServerRuntime]) -> None:
+        # No new timer tasks while closing: one could claim a server between the check
+        # below and its stop, or start something the closing window would then cut off.
+        self._scheduler_stop.set()
+        running = self._running_runtimes()  # what runs now, not when the question was asked
         busy = [rt for rt in running if rt.is_busy()]
         if busy:
+            self._start_scheduler()
             messagebox.showwarning(
                 "Server running",
                 "A task is running for " + ", ".join(self._display_name(rt.server_id) for rt in busy)
@@ -9291,26 +9430,49 @@ class ServerManagerApp:
             )
             return
 
-        left = {"n": len(running)}
+        state = {"left": len(running), "failed": []}
         lock = threading.Lock()
 
-        def one_done() -> None:
+        def one_done(rt: ServerRuntime, error: Optional[str]) -> None:
             with lock:
-                left["n"] -= 1
-                last = left["n"] == 0
+                state["left"] -= 1
+                if error is not None:
+                    state["failed"].append((rt, error))
+                last = state["left"] == 0
             if last:
-                self._ui(self.root.destroy)
+                self._ui(self._after_stop_all)
 
-        # Every server stops at the same time; the window closes after the last one.
+        self._close_state = state
+        # Every server stops at the same time; the window closes after the last one, and
+        # only if every stop went through.
         for rt in running:
             def job(_rt: ServerRuntime = rt) -> None:
                 try:
                     self._safe_stop(_rt)
-                finally:
-                    one_done()
+                except Exception as e:
+                    one_done(_rt, str(e))
+                    raise
+                one_done(_rt, None)
 
-            if not self._run_task("Stop Server", job, rt):
-                one_done()
+            if not self._run_task("Stop Server", job, rt, quiet=True):
+                one_done(rt, "another task claimed it first")
+
+    def _after_stop_all(self) -> None:
+        state = getattr(self, "_close_state", {"failed": []})
+        failed = state.get("failed") or []
+        still = self._running_runtimes()
+        if not failed and not still:
+            self.root.destroy()
+            return
+        # Keep the window: something did not stop cleanly, and closing would hide it.
+        self._start_scheduler()
+        lines = [f"- {self._display_name(rt.server_id)}: {err}" for rt, err in failed]
+        lines += [f"- {self._display_name(rt.server_id)}: still running" for rt in still if rt not in [f[0] for f in failed]]
+        messagebox.showwarning(
+            "Close",
+            "Not every server stopped cleanly, so the window stays open:\n\n" + "\n".join(lines)
+            + "\n\nSee the console for details, then close again.",
+        )
 
     # ---------------------------------------------------------------------
     # Scheduler (auto-saves and nightly updates)
@@ -9332,6 +9494,8 @@ class ServerManagerApp:
                 self.logger.info(f"Scheduler: {e}")
                 continue
             for rt in runtimes:
+                if rt.removed:
+                    continue
                 # The update first: in a tick where both are due, an auto-save claiming the
                 # server would only make the update wait for it.
                 try:
@@ -9359,13 +9523,22 @@ class ServerManagerApp:
         cfg = rt.cfg
         if not cfg.auto_update_restart:
             rt.auto_update_next = None
+            rt.auto_update_waiting = False
             return
         when = parse_time_hhmm(cfg.auto_update_time or DEFAULT_SCHEDULE_TIME) or dt_time(hour=3, minute=0)
-        if rt.auto_update_next is None or rt.auto_update_time != cfg.auto_update_time:
+        due = rt.auto_update_next  # read once: the Tk thread may change it meanwhile
+        if due is None or rt.auto_update_time != cfg.auto_update_time:
             rt.auto_update_time = cfg.auto_update_time
             rt.auto_update_next = next_scheduled_datetime(now, when)
             return
-        if now < rt.auto_update_next:
+        if now < due:
+            return
+        if not rt.is_running():
+            # The nightly update keeps running servers current; it never brings up a server
+            # someone stopped on purpose, nor installs into a profile nobody ran yet.
+            rt.logger.info("Auto update skipped: the server is not running.")
+            rt.auto_update_waiting = False
+            rt.auto_update_next = next_scheduled_datetime(now, when)
             return
         # Due. A busy server keeps it due and is tried again on the next tick, so a task
         # running at 03:00 delays tonight's update instead of skipping it.
@@ -9467,11 +9640,11 @@ class ServerManagerApp:
             return
         rt = self.rt
         enabled = bool(rt.cfg.auto_update_restart)
-        # Only a change of the checkbox resets the schedule; the tick itself notices a new
-        # time. Resetting on every save would push an update due right now to tomorrow.
-        if self._auto_update_announced.get(rt.server_id) != enabled:
+        # Only announced here. The tick clears the schedule when it is off and works out the
+        # next run when it comes back on or the time changes, so nothing here can push an
+        # update that is due right now to tomorrow.
+        if self._auto_update_announced.get(rt.server_id, False) != enabled:
             self._auto_update_announced[rt.server_id] = enabled
-            rt.auto_update_next = None
             rt.logger.info(f"Auto Update & Restart scheduler {'enabled' if enabled else 'disabled'}.")
 
     # ---------------------------------------------------------------------
@@ -10198,7 +10371,7 @@ class ServerManagerApp:
         paths = ini_stage_paths(self.app_base, self.active_server_id, server_dir, ini_file)
         if not paths.stage.exists() and not paths.live.exists():
             return None
-        ensure_ini_staging_synced(paths, server_running=self._is_server_running(), logger=self.logger)
+        ensure_ini_staging_synced(paths, server_running=self._install_running(self.cfg.server_dir), logger=self.logger)
         return read_ini(paths.stage)
 
     def _ini_visual_refresh_all(self) -> None:
@@ -10335,8 +10508,9 @@ class ServerManagerApp:
         gus_paths = ini_stage_paths(self.app_base, self.active_server_id, server_dir, "gus")
         game_paths = ini_stage_paths(self.app_base, self.active_server_id, server_dir, "game")
 
-        ensure_ini_staging_synced(gus_paths, server_running=self._is_server_running(), logger=self.logger)
-        ensure_ini_staging_synced(game_paths, server_running=self._is_server_running(), logger=self.logger)
+        install_running = self._install_running(self.cfg.server_dir)
+        ensure_ini_staging_synced(gus_paths, server_running=install_running, logger=self.logger)
+        ensure_ini_staging_synced(game_paths, server_running=install_running, logger=self.logger)
 
         gus_doc = read_ini(gus_paths.stage)
         game_doc = read_ini(game_paths.stage)
@@ -10464,7 +10638,7 @@ class ServerManagerApp:
         ensure_dir(server_root(self.app_base, self.active_server_id) / BASELINE_DIR_NAME)
 
         paths = ini_stage_paths(self.app_base, self.active_server_id, server_dir, target)
-        ensure_ini_staging_synced(paths, server_running=self._is_server_running(), logger=self.logger)
+        ensure_ini_staging_synced(paths, server_running=self._install_running(self.cfg.server_dir), logger=self.logger)
 
         self._ini_loaded_target = target
         self._ini_paths_current = paths
@@ -10496,7 +10670,7 @@ class ServerManagerApp:
     def _ini_resync_from_upstream(self) -> None:
         if not self._ini_paths_current:
             return
-        ensure_ini_staging_synced(self._ini_paths_current, server_running=self._is_server_running(), logger=self.logger)
+        ensure_ini_staging_synced(self._ini_paths_current, server_running=self._install_running(self.cfg.server_dir), logger=self.logger)
         self._ini_doc = read_ini(self._ini_paths_current.stage)
         self._ini_refresh_tree()
         self._set_status("INI resynced")
