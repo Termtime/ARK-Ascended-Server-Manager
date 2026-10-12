@@ -214,7 +214,7 @@ Existing profiles keep working; a few things behave differently:
 - **In-game restart warnings are on by default** (15, 5 and 1 minutes, over RCON). With the nightly update at 03:00, players see the first warning at 02:45 and the update happens at 03:00. Untick *Warn players first* on the Server tab to turn them off
 - **-ClusterDirOverride is only passed while *Enable Cluster* is on.** A profile with a custom cluster path but the cluster off no longer gets it
 - **Running servers are asked for their player count over RCON once a minute**, for the Dashboard
-- **Only one manager runs at a time.** Opening it a second time shows a message instead of a second window
+- **Only one manager runs at a time.** Opening it a second time brings the open manager's window up (also from the background) instead of starting a second one
 - **Two profiles never run the same world**: starting a profile is refused while another server runs the same map from the same install with the same save folder
 - Closing the window while servers run now asks whether to keep managing them in the background, stop them, or leave them running; opening the manager again while it runs in the background shows its window
 

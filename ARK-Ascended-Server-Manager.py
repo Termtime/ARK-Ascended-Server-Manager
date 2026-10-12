@@ -35,7 +35,8 @@ from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
 import tkinter as tk
-from tkinter import filedialog, messagebox, simpledialog
+import tkinter.messagebox as _tk_messagebox
+from tkinter import filedialog, simpledialog
 from tkinter import font as tkfont
 from tkinter import ttk
 import uuid
@@ -61,6 +62,32 @@ try:
     import winreg  # type: ignore
 except Exception:
     winreg = None
+
+_BEFORE_DIALOG: Optional[Callable[[], None]] = None
+
+
+class _MessageBoxes:
+    """tkinter.messagebox, except that a manager running in the background shows its window
+    first: a question asked into a hidden window would never be seen, and a worker waiting on
+    the answer would hold its server's task for good."""
+
+    def __getattr__(self, name: str) -> Any:
+        fn = getattr(_tk_messagebox, name)
+        if not (callable(fn) and name.startswith(("ask", "show"))):
+            return fn
+
+        def call(*args: Any, **kwargs: Any) -> Any:
+            hook = _BEFORE_DIALOG
+            if hook is not None:
+                with contextlib.suppress(Exception):
+                    hook()
+            return fn(*args, **kwargs)
+
+        return call
+
+
+messagebox: Any = _MessageBoxes()
+
 
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
@@ -7845,6 +7872,9 @@ class ServerManagerApp:
         self._autosave_after_id: Optional[str] = None
         self._autosave_guard = False
         self._in_background = False  # window hidden, servers still managed
+        self._was_zoomed = False  # maximized when it went to the background
+        self._close_asking = False
+        self._closing_stop = False  # "stop the servers and quit" is under way
         self._status_key: Optional[Tuple[Any, ...]] = None
         # Ports of servers between their port check and their launch (see _reserve_ports).
         self._starting_ports: Dict[str, Set[int]] = {}
@@ -7912,6 +7942,8 @@ class ServerManagerApp:
         self._start_player_poll()
         self._start_stats_sampler()
         self.root.after(700, self._poll_show_request)
+        global _BEFORE_DIALOG
+        _BEFORE_DIALOG = self._show_if_hidden
         self._reattach_done = threading.Event()
         threading.Thread(target=self._reattach_on_launch, daemon=True, name="reattach").start()
         self._dash_tick()
@@ -11403,10 +11435,22 @@ class ServerManagerApp:
             logger.info(f"[CLUSTER] Cluster '{cfg.cluster_id.strip()}', data folder {folder}")
 
     def _on_close(self) -> None:
+        if self._close_asking:
+            return  # the close question is already open
+        if self._closing_stop:
+            messagebox.showinfo(
+                "Closing",
+                "The servers are being saved and stopped; the window closes once they are all down.",
+            )
+            return
         running = self._running_runtimes()
         choice: Optional[str] = None
         if running:
-            choice = self._ask_close_choice(running)
+            self._close_asking = True
+            try:
+                choice = self._ask_close_choice(running)
+            finally:
+                self._close_asking = False
             if choice is None:
                 return
             if choice == "background":
@@ -11466,6 +11510,7 @@ class ServerManagerApp:
         if counting:
             self._cancel_countdowns_and_announce(counting)
         self._cancel_groups()
+        close_show_event()
         self.root.destroy()
 
     def _poll_show_request(self) -> None:
@@ -11479,18 +11524,31 @@ class ServerManagerApp:
 
     def _show_window(self) -> None:
         with contextlib.suppress(Exception):
-            self.root.deiconify()
-            self.root.state("normal")
+            if self.root.state() == "iconic":
+                self.root.state("normal")  # back to maximized if it was
+            else:
+                self.root.deiconify()
+                if self._in_background and self._was_zoomed:
+                    self.root.state("zoomed")  # withdraw forgets it
             self.root.lift()
+            # Briefly on top: Windows may refuse a plain focus change from a background process.
+            self.root.attributes("-topmost", True)
+            self.root.after(300, lambda: self.root.attributes("-topmost", False))
             self.root.focus_force()
         if self._in_background:
             self._in_background = False
             self.logger.info("Back from the background.")
 
+    def _show_if_hidden(self) -> None:
+        if self._in_background:
+            self._show_window()
+
     def _go_to_background(self) -> None:
         """Hide the window but keep managing: auto-saves, nightly updates, crash restarts and
         countdowns go on. Opening the manager again shows the window."""
         self._in_background = True
+        with contextlib.suppress(Exception):
+            self._was_zoomed = self.root.state() == "zoomed"
         self.logger.info("Running in the background: servers stay managed. Open the manager again to show this window.")
         self.root.withdraw()
 
@@ -11498,6 +11556,12 @@ class ServerManagerApp:
         """'stop', 'background', 'leave' or None (cancel), for closing while servers run."""
         names = ", ".join(self._display_name(rt.server_id) for rt in running)
         result: Dict[str, Optional[str]] = {"choice": None}
+        with contextlib.suppress(Exception):
+            if self.root.state() == "iconic":
+                self.root.state("normal")  # a dialog of a minimized window would stay hidden
+        prev_grab = None
+        with contextlib.suppress(Exception):
+            prev_grab = self.root.grab_current()  # an open dialog's; given back afterwards
         dlg = tk.Toplevel(self.root)
         dlg.title("Servers running")
         dlg.transient(self.root)
@@ -11506,14 +11570,14 @@ class ServerManagerApp:
         body.grid(row=0, column=0, sticky="nsew")
         ttk.Label(body, text=f"Still running: {names}", wraplength=520, justify="left",
                   font=("Segoe UI", 10, "bold")).grid(row=0, column=0, sticky="w")
-        options = (
+        options = tuple(o for o in (
             ("background", "Keep running in the background",
              "Hides this window; the servers stay managed (auto-saves, updates, crash restarts, countdowns). "
              "Open the manager again to show it."),
             ("stop", "Stop the servers and quit", "Saves and shuts down every running server, then quits."),
             ("leave", "Quit and leave the servers running",
              "The servers keep running without the manager; it reconnects to them when it is opened again."),
-        )
+        ) if o[0] != "background" or self._can_background())
         for i, (key, label, hint) in enumerate(options, start=1):
             ttk.Button(body, text=label, command=lambda k=key: (result.__setitem__("choice", k), dlg.destroy())) \
                 .grid(row=2 * i - 1, column=0, sticky="ew", pady=(10 if i == 1 else 6, 0))
@@ -11522,10 +11586,19 @@ class ServerManagerApp:
         ttk.Button(body, text="Cancel", command=dlg.destroy).grid(row=2 * len(options) + 1, column=0, sticky="e", pady=(12, 0))
         dlg.protocol("WM_DELETE_WINDOW", dlg.destroy)
         dlg.bind("<Escape>", lambda _e: dlg.destroy())
-        dlg.grab_set()
+        with contextlib.suppress(tk.TclError):
+            dlg.grab_set()
         dlg.focus_set()
         self.root.wait_window(dlg)
+        if prev_grab is not None:
+            with contextlib.suppress(Exception):
+                if prev_grab.winfo_exists():
+                    prev_grab.grab_set()
         return result["choice"]
+
+    def _can_background(self) -> bool:
+        """Only where opening the manager again can bring the hidden window back."""
+        return _SHOW_EVENT is not None
 
     def _stop_and_close(self, running: List[ServerRuntime]) -> None:
         # No new timer tasks while closing: one could claim a server between the check
@@ -11542,7 +11615,14 @@ class ServerManagerApp:
             )
             return
 
+        self._closing_stop = True
+        close_show_event()  # a launch from now on starts afresh instead of reaching this window
         self._cancel_groups()
+        if not running:
+            # Everything stopped while the questions were open: nothing to wait for.
+            self._close_state = {"left": 0, "failed": []}
+            self._after_stop_all()
+            return
         for rt in running:
             self._cancel_countdown(rt)  # they are being stopped now; nothing left to count down to
         state = {"left": len(running), "failed": []}
@@ -11580,6 +11660,8 @@ class ServerManagerApp:
             self.root.destroy()
             return
         # Keep the window: something did not stop cleanly, and closing would hide it.
+        self._closing_stop = False
+        create_show_event(self.app_base)
         self._start_scheduler()
         lines = [f"- {self._display_name(rt.server_id)}: {err}" for rt, err in failed]
         lines += [f"- {self._display_name(rt.server_id)}: still running" for rt in still if rt not in [f[0] for f in failed]]
@@ -14394,30 +14476,65 @@ def _instance_tag(app_base: Path) -> str:
     return hashlib.sha1(os.path.normcase(str(app_base)).encode("utf-8")).hexdigest()[:16]
 
 
+class _SecurityAttributes(ctypes.Structure):
+    _fields_ = [("nLength", wintypes.DWORD), ("lpSecurityDescriptor", ctypes.c_void_p), ("bInheritHandle", wintypes.BOOL)]
+
+
+_SHOW_WAIT: Any = None
+
+
 def create_show_event(app_base: Path) -> Any:
     """The running manager's "show your window" signal (a named auto-reset event)."""
-    global _SHOW_EVENT
+    global _SHOW_EVENT, _SHOW_WAIT
     if os.name != "nt":
         return None
     try:
         k = ctypes.WinDLL("kernel32", use_last_error=True)
         k.CreateEventW.restype = wintypes.HANDLE
         k.CreateEventW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.BOOL, wintypes.LPCWSTR]
-        _SHOW_EVENT = k.CreateEventW(None, False, False, f"Local\\ARKASAManager-show-{_instance_tag(app_base)}") or None
+        k.WaitForSingleObject.restype = wintypes.DWORD
+        k.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        k.LocalFree.argtypes = [ctypes.c_void_p]
+        # Anyone in this session may set it (it only shows the window), and a medium-integrity
+        # label lets a normal launch reach a manager that runs as Administrator.
+        sd = ctypes.c_void_p()
+        sa = None
+        try:
+            a = ctypes.WinDLL("advapi32", use_last_error=True)
+            a.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = [
+                wintypes.LPCWSTR, wintypes.DWORD, ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p]
+            if a.ConvertStringSecurityDescriptorToSecurityDescriptorW("D:(A;;0x100002;;;WD)S:(ML;;NW;;;ME)", 1, ctypes.byref(sd), None):
+                sa = _SecurityAttributes(ctypes.sizeof(_SecurityAttributes), sd, False)
+        except Exception:
+            sa = None
+        try:
+            name = f"Local\\ARKASAManager-show-{_instance_tag(app_base)}"
+            _SHOW_EVENT = k.CreateEventW(ctypes.byref(sa) if sa is not None else None, False, False, name) or None
+        finally:
+            if sd:
+                k.LocalFree(sd)
+        _SHOW_WAIT = k.WaitForSingleObject if _SHOW_EVENT else None
     except Exception:
         _SHOW_EVENT = None
     return _SHOW_EVENT
 
 
+def close_show_event() -> None:
+    """Stop answering second launches: this manager is on its way out, and a launch now
+    should not be swallowed by a window that is about to close."""
+    global _SHOW_EVENT, _SHOW_WAIT
+    handle, _SHOW_EVENT, _SHOW_WAIT = _SHOW_EVENT, None, None
+    if handle:
+        with contextlib.suppress(Exception):
+            ctypes.windll.kernel32.CloseHandle(wintypes.HANDLE(handle))
+
+
 def show_event_signaled() -> bool:
     """True once each time a second launch asked this manager to show itself."""
-    if _SHOW_EVENT is None:
+    if _SHOW_EVENT is None or _SHOW_WAIT is None:
         return False
     try:
-        k = ctypes.windll.kernel32
-        k.WaitForSingleObject.restype = wintypes.DWORD
-        k.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
-        return k.WaitForSingleObject(_SHOW_EVENT, 0) == 0
+        return _SHOW_WAIT(_SHOW_EVENT, 0) == 0
     except Exception:
         return False
 
@@ -14436,6 +14553,9 @@ def signal_show_event(app_base: Path) -> bool:
         if not handle:
             return False
         try:
+            # This launch may bring a window forward; let the running manager do it.
+            with contextlib.suppress(Exception):
+                ctypes.windll.user32.AllowSetForegroundWindow(wintypes.DWORD(0xFFFFFFFF))  # ASFW_ANY
             return bool(k.SetEvent(handle))
         finally:
             k.CloseHandle(handle)
@@ -14455,6 +14575,12 @@ def launch_gui(cli_options: Optional[RuntimeCliOptions] = None) -> None:
     apply_initial_window_geometry(root, 1220, 780)
 
     apply_window_icon(root)
+
+    # Already running (perhaps in the background): show it, before any question.
+    with contextlib.suppress(Exception):
+        if signal_show_event(resolve_storage_root()):
+            root.destroy()
+            return
 
     if os.name == "nt" and not is_admin() and not opts.no_admin_prompt:
         try:
