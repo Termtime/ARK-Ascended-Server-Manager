@@ -85,6 +85,12 @@ This manager separates *edit time* and *runtime*:
 - Other settings (backups, auto-saves, updates, Discord, advanced start options) are copied from a template profile you pick; game rates stay per map in each map's INI Editor
 - Cluster names and start delays are stored in the global config; which profiles belong to a cluster still comes from each profile's own cluster settings, so existing clusters show up without any migration
 
+### Planned restarts, warnings, moving clusters, resource use
+- **Daily restart** (Server tab, Update Options): restarts a running server every day at a set time (safe: save, stop, start); it never starts a stopped one, and is skipped when the nightly update restarts the server at that same time
+- **Warn players first**: in-game chat countdowns over RCON (default 15, 5 and 1 minutes) before the daily restart, the nightly update and, if you choose, a Restart All. The countdown starts early, so the restart itself happens at the time set. The Dashboard and status bar show it; stopping the server or Cancel Countdown on the Dashboard calls it off
+- **Export / Import Cluster**: a cluster file holds its name, start delay and each map's settings and staged INIs, without passwords, the Discord webhook or folders of this machine. Import recreates it on another machine as a new cluster: you pick the install folder, data folder and passwords, every map gets free ports and its INI settings staged for its first start, and it can install them right away
+- The Dashboard shows **CPU and memory** of every running server, and the memory of each cluster
+
 ### Cluster health, copying settings, reconnecting
 - **Health Check** (Dashboard, per cluster) lists what keeps a cluster from working: maps on different data folders, a folder kept inside one install, different mod lists or crossplay settings, ports another profile also uses, maps with the same server name, maps sharing one install, RCON off, maps not installed yet. Most have a one-click fix; Fix All applies the safe ones (ports, server names, platform) after one confirmation, while mod list and data folder fixes are done one at a time. The mod fix only ever adds the mods a map lacks, never removes any. Fixes change the saved profiles and apply on each map's next restart
 - The cluster row on the Dashboard shows how many issues it has, and **Start All** asks before starting a cluster with problems

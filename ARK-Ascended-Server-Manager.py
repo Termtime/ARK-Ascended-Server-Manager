@@ -342,6 +342,17 @@ def normalize_time_hhmm(value: str, fallback: str = DEFAULT_SCHEDULE_TIME) -> st
     return f"{parsed.hour:02d}:{parsed.minute:02d}"
 
 
+def parse_warning_minutes(raw: str) -> List[int]:
+    """'15, 5, 1' -> [15, 5, 1]: whole minutes, largest first, each at most two hours."""
+    out: Set[int] = set()
+    for part in re.split(r"[,; ]+", raw or ""):
+        if part.strip().isdigit():
+            minutes = int(part)
+            if 0 < minutes <= 120:
+                out.add(minutes)
+    return sorted(out, reverse=True)
+
+
 def next_scheduled_datetime(now: datetime, schedule_time: dt_time) -> datetime:
     candidate = now.replace(
         hour=schedule_time.hour,
@@ -1148,7 +1159,7 @@ class GlobalConfig:
 
 @dataclass
 class AppConfig:
-    schema_version: int = 12
+    schema_version: int = 13
     server_dir: str = DEFAULT_SERVER_DIR
 
     map_name: str = DEFAULT_MAP
@@ -1184,6 +1195,12 @@ class AppConfig:
 
     auto_update_restart: bool = False
     auto_update_time: str = DEFAULT_SCHEDULE_TIME
+    # A daily restart of a running server, and in-game warnings before planned restarts
+    # (that one and the nightly update) at these minutes before.
+    scheduled_restart_enabled: bool = False
+    scheduled_restart_time: str = "06:00"
+    restart_warnings_enabled: bool = True
+    restart_warning_minutes: str = "15,5,1"
     update_on_startup: bool = False
 
     install_optional_certificates: bool = True  # enforced True
@@ -3537,6 +3554,93 @@ def cluster_health(
     return issues
 
 
+CLUSTER_EXPORT_FORMAT = "ark-asa-manager-cluster"
+# Never in an export file: secrets, and what only makes sense on this machine.
+EXPORT_LEFT_OUT_FIELDS = {
+    "server_dir", "backup_dir", "cluster_dir_override", "admin_password", "join_password",
+    "discord_webhook_url", "discord_webhook_url_enc", "schema_version",
+}
+
+
+def cluster_export_document(
+    name: str,
+    cluster_id: str,
+    stagger_sec: int,
+    members: List[Tuple[str, AppConfig, Dict[str, str]]],
+) -> Dict[str, Any]:
+    """A portable cluster: name, delay, and per map its settings and staged INI text.
+    members: (display name, settings, {"GameUserSettings.ini": text, "Game.ini": text})."""
+    servers = []
+    for display_name, cfg, ini in members:
+        settings = {k: v for k, v in asdict(cfg).items() if k not in EXPORT_LEFT_OUT_FIELDS}
+        servers.append({
+            "display_name": display_name,
+            "settings": settings,
+            "ini": {name: strip_ini_secrets(text) for name, text in ini.items()},
+        })
+    return {
+        "format": CLUSTER_EXPORT_FORMAT,
+        "version": 1,
+        "exported": datetime.now().isoformat(timespec="seconds"),
+        "cluster": {"id": cluster_id, "name": name, "start_stagger_sec": int(stagger_sec)},
+        "servers": servers,
+    }
+
+
+INI_SECRET_KEYS = {"serveradminpassword", "serverpassword", "spectatorpassword"}
+
+
+def strip_ini_secrets(text: str) -> str:
+    """INI text without passwords, for a file meant to leave this machine. The manager
+    writes the admin and join password into staging again on every start anyway."""
+    doc = IniDocument.parse(text)
+    for section, entries in doc.kv_entries_by_section().items():
+        for key in {k for _i, k, _v in entries if k.strip().lower() in INI_SECRET_KEYS}:
+            doc.remove_all_kv(section, key)
+    return doc.to_text()
+
+
+def read_cluster_export(path: Path) -> Dict[str, Any]:
+    """Load and check an export file; raises ValueError with a readable reason."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as e:
+        raise ValueError(f"Not a readable cluster file: {e}") from e
+    if not isinstance(data, dict) or data.get("format") != CLUSTER_EXPORT_FORMAT:
+        raise ValueError("This file is not a cluster exported by this manager.")
+    servers = data.get("servers")
+    if not isinstance(servers, list) or not servers:
+        raise ValueError("The cluster file lists no servers.")
+    for item in servers:
+        if not isinstance(item, dict) or not isinstance(item.get("settings"), dict):
+            raise ValueError("A server in the cluster file has no settings.")
+        if not str(item["settings"].get("map_name") or "").strip():
+            raise ValueError("A server in the cluster file has no map.")
+    return data
+
+
+def settings_from_export(values: Dict[str, Any]) -> AppConfig:
+    """An AppConfig from exported settings: known fields only, each in its own type."""
+    cfg = AppConfig()
+    for f in fields(AppConfig):
+        if f.name in EXPORT_LEFT_OUT_FIELDS or f.name not in values:
+            continue
+        cur = getattr(cfg, f.name)
+        v = values[f.name]
+        try:
+            if isinstance(cur, bool):
+                setattr(cfg, f.name, safe_bool(v, cur))
+            elif isinstance(cur, int):
+                setattr(cfg, f.name, safe_int(v, cur))
+            elif isinstance(cur, list):
+                setattr(cfg, f.name, list(v) if isinstance(v, list) else cur)
+            else:
+                setattr(cfg, f.name, str(v))
+        except Exception:
+            pass
+    return cfg
+
+
 def pretty_map_name(map_name: str) -> str:
     """'ScorchedEarth_WP' -> 'Scorched Earth'."""
     base = re.sub(r"_WP$", "", (map_name or "").strip(), flags=re.IGNORECASE)
@@ -4920,6 +5024,55 @@ class AttachedProcess:
             if self._handle:
                 self._k.CloseHandle(self._handle)
 
+class _PROCESS_MEMORY_COUNTERS(ctypes.Structure):
+    _fields_ = [
+        ("cb", wintypes.DWORD),
+        ("PageFaultCount", wintypes.DWORD),
+        ("PeakWorkingSetSize", ctypes.c_size_t),
+        ("WorkingSetSize", ctypes.c_size_t),
+        ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+        ("QuotaPagedPoolUsage", ctypes.c_size_t),
+        ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+        ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+        ("PagefileUsage", ctypes.c_size_t),
+        ("PeakPagefileUsage", ctypes.c_size_t),
+    ]
+
+
+def process_usage(pid: int) -> Optional[Tuple[float, int]]:
+    """(CPU seconds used so far, working set in bytes) of a process, or None."""
+    if os.name != "nt":
+        return None
+    try:
+        k = ctypes.windll.kernel32
+        k.OpenProcess.restype = wintypes.HANDLE
+        k.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        k.GetProcessTimes.argtypes = [wintypes.HANDLE] + [ctypes.POINTER(wintypes.FILETIME)] * 4
+        k.CloseHandle.argtypes = [wintypes.HANDLE]
+        psapi = ctypes.windll.psapi
+        psapi.GetProcessMemoryInfo.argtypes = [wintypes.HANDLE, ctypes.POINTER(_PROCESS_MEMORY_COUNTERS), wintypes.DWORD]
+        handle = k.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not handle:
+            return None
+        try:
+            created, exited, kernel, user = (wintypes.FILETIME() for _ in range(4))
+            if not k.GetProcessTimes(handle, ctypes.byref(created), ctypes.byref(exited), ctypes.byref(kernel), ctypes.byref(user)):
+                return None
+
+            def ticks(ft: wintypes.FILETIME) -> int:
+                return (ft.dwHighDateTime << 32) | ft.dwLowDateTime
+
+            cpu = (ticks(kernel) + ticks(user)) / 10_000_000.0  # 100 ns units
+            mem = _PROCESS_MEMORY_COUNTERS()
+            mem.cb = ctypes.sizeof(mem)
+            working_set = int(mem.WorkingSetSize) if psapi.GetProcessMemoryInfo(handle, ctypes.byref(mem), mem.cb) else 0
+            return cpu, working_set
+        finally:
+            k.CloseHandle(handle)
+    except Exception:
+        return None
+
+
 # =============================================================================
 # GUI LOGGING
 # =============================================================================
@@ -5162,11 +5315,20 @@ class ServerRuntime:
         self.auto_save_last: Optional[Tuple[datetime, bool]] = None
         self.auto_update_next: Optional[datetime] = None
         self.auto_update_waiting = False
+        self.restart_next: Optional[datetime] = None
+        self.restart_time = ""  # the HH:MM restart_next was computed from
+        # A countdown warning players before a planned restart: its label, and its cancel.
+        self.countdown: Optional[str] = None
+        self.countdown_cancel: Optional[threading.Event] = None
         self.removed = False  # its profile was removed; nothing may start for it any more
         # True when this manager launched the running process (now, or in a session whose
         # run state it found). Only then are the install's INIs its to restore on stop.
         self.launched_by_us = False
         self.players: Optional[int] = None  # last ListPlayers count while running, None if unknown
+        # CPU (percent of the whole machine) and memory of the running process, sampled.
+        self.cpu_percent: Optional[float] = None
+        self.memory_bytes: Optional[int] = None
+        self._cpu_sample: Optional[Tuple[float, float, int]] = None  # (wall clock, cpu seconds, pid)
         self.auto_update_time = ""  # the HH:MM auto_update_next was computed from
 
     def is_running(self) -> bool:
@@ -6632,6 +6794,8 @@ class PlannedServer:
     port: int = 0
     query_port: int = 0
     rcon_port: int = 0
+    settings: Optional[AppConfig] = None  # its own settings instead of the template's (import)
+    ini: Dict[str, str] = field(default_factory=dict)  # staged INI text by file name (import)
 
 
 CROSSPLAY_PLATFORM = "PC+XSX+WINGDK"
@@ -7224,6 +7388,170 @@ class CopySettingsDialog(tk.Toplevel):
         self.app.copy_settings(self.source_id, targets, **opts)
 
 
+class ClusterImportDialog(tk.Toplevel):
+    """Recreate an exported cluster on this machine: new installs, new ports, same settings."""
+
+    def __init__(self, app: "ServerManagerApp", path: Path, data: Dict[str, Any]) -> None:
+        super().__init__(app.root)
+        self.app = app
+        self.path = path
+        self.data = data
+        info = data.get("cluster") or {}
+        name = str(info.get("name") or "Imported Cluster")
+        cid = str(info.get("id") or "")
+        existing = {c.cluster_id for c in app._cluster_views()[0]}
+        if not CLUSTER_ID_RE.match(cid) or cid in existing:
+            cid = make_cluster_id(name)  # never merge into a cluster that already exists here
+        self.var_name = tk.StringVar(master=self, value=name)
+        self.var_cid = tk.StringVar(master=self, value=cid)
+        self.var_root = tk.StringVar(master=self, value=str(Path(app.cfg.server_dir).parent / map_folder_name(name)))
+        self.var_dir = tk.StringVar(master=self, value=str(default_cluster_dir(app.app_base, cid, Path(app.cfg.server_dir))))
+        self.var_admin = tk.StringVar(master=self, value="")
+        self.var_join = tk.StringVar(master=self, value="")
+        self.var_install_now = tk.BooleanVar(master=self, value=True)
+        self.var_warning = tk.StringVar(master=self, value="")
+        self._plan: List[PlannedServer] = []
+        self._problems: List[str] = []
+        self.title(f"Import Cluster - {path.name}")
+        self.transient(app.root)
+        self.configure(background=THEME_COLORS["bg"])
+        apply_initial_window_geometry(self, 900, 600)
+        apply_min_window_size(self, 760, 520)
+        self._build()
+        for var in (self.var_name, self.var_cid, self.var_root, self.var_dir, self.var_admin):
+            var.trace_add("write", lambda *_: self._refresh())
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
+        self.bind("<Escape>", lambda _e: self.destroy())
+        self._refresh()
+        self.grab_set()
+        self.focus_set()
+
+    def _build(self) -> None:
+        theme = THEME_COLORS
+        root = ttk.Frame(self, padding=12)
+        root.grid(row=0, column=0, sticky="nsew")
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(0, weight=1)
+        root.columnconfigure(1, weight=1)
+        root.rowconfigure(7, weight=1)
+        rows = [
+            ("Cluster name", self.var_name),
+            ("Cluster ID", self.var_cid),
+            ("Install folder for the maps", self.var_root),
+            ("Cluster data folder", self.var_dir),
+            ("Admin password (RCON)", self.var_admin),
+            ("Join password", self.var_join),
+        ]
+        for r, (label, var) in enumerate(rows):
+            ttk.Label(root, text=label).grid(row=r, column=0, sticky="w", pady=(0 if r == 0 else 6, 0))
+            ttk.Entry(root, textvariable=var).grid(row=r, column=1, sticky="ew", padx=6, pady=(0 if r == 0 else 6, 0))
+        ttk.Label(
+            root,
+            text="Passwords and machine paths are not part of a cluster file; set them here. Every map gets its "
+                 "own install folder and free ports, and its INI settings from the file are staged for its first start.",
+            foreground=theme["muted"], wraplength=860, justify="left",
+        ).grid(row=6, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        self.tree = ttk.Treeview(root, columns=("map", "folder", "ports"), show="tree headings", height=8)
+        self.tree.heading("#0", text="Profile")
+        self.tree.heading("map", text="Map")
+        self.tree.heading("folder", text="Install folder")
+        self.tree.heading("ports", text="Game / Query / RCON")
+        self.tree.column("#0", width=220)
+        self.tree.column("folder", width=320)
+        self.tree.grid(row=7, column=0, columnspan=2, sticky="nsew", pady=(10, 0))
+        ttk.Checkbutton(root, text="Install the servers right away (one after another with SteamCMD)",
+                        variable=self.var_install_now).grid(row=8, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        ttk.Label(root, textvariable=self.var_warning, foreground=theme["warning"], wraplength=860, justify="left") \
+            .grid(row=9, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        buttons = ttk.Frame(root)
+        buttons.grid(row=10, column=0, columnspan=2, sticky="e", pady=(10, 0))
+        self.btn_import = ttk.Button(buttons, text="Import", command=self._on_import)
+        self.btn_import.grid(row=0, column=0, padx=(0, 8))
+        ttk.Button(buttons, text="Cancel", command=self.destroy).grid(row=0, column=1)
+
+    def _refresh(self) -> None:
+        problems: List[str] = []
+        name = self.var_name.get().strip()
+        cid = self.var_cid.get().strip()
+        if not name:
+            problems.append("Give the cluster a name.")
+        if not CLUSTER_ID_RE.match(cid):
+            problems.append("The cluster ID may only use letters, numbers, '-' and '_'.")
+        elif any(c.cluster_id == cid for c in self.app._cluster_views()[0]):
+            problems.append(f"A cluster with the ID '{cid}' exists already here.")
+        if not self.var_admin.get().strip():
+            problems.append("Set an admin password: the manager saves and stops the servers through RCON.")
+        root_raw = self.var_root.get().strip()
+        root_dir = Path(root_raw) if root_raw else None
+        plan: List[PlannedServer] = []
+        if root_dir is None or not root_dir.is_absolute():
+            problems.append("Choose a full path for the install folder.")
+        else:
+            existing_dirs = [Path(r.server_dir) for r in self.app.global_cfg.servers if r.server_dir]
+            taken = {(r.display_name or "").strip().lower() for r in self.app.global_cfg.servers}
+            used = self.app._collect_used_ports()
+            planned: Set[int] = set()
+            seen: Set[str] = set()
+            for item in self.data["servers"]:
+                cfg = settings_from_export(item["settings"])
+                server_dir = root_dir / map_folder_name(cfg.map_name)
+                key = os.path.normcase(os.path.normpath(str(server_dir)))
+                n = 2
+                while key in seen:  # the same map twice in one cluster: number the folders
+                    server_dir = root_dir / f"{map_folder_name(cfg.map_name)}{n}"
+                    key = os.path.normcase(os.path.normpath(str(server_dir)))
+                    n += 1
+                seen.add(key)
+                clash = next((d for d in existing_dirs if path_contains(d, server_dir) or path_contains(server_dir, d)), None)
+                if clash is not None:
+                    problems.append(f"{server_dir} overlaps the install folder of another profile ({clash}).")
+                display = str(item.get("display_name") or pretty_map_name(cfg.map_name))
+                base_name, n = display, 2
+                while display.lower() in taken:
+                    display, n = f"{base_name} {n}", n + 1
+                taken.add(display.lower())
+                planned_item = PlannedServer(cfg.map_name, display, cfg.server_name, server_dir)
+                planned_item.settings = cfg
+                planned_item.ini = {k: str(v) for k, v in (item.get("ini") or {}).items()}
+                try:
+                    planned_item.port, planned_item.query_port, planned_item.rcon_port = self.app.auto_assign_ports(
+                        copy.deepcopy(cfg), stride=10, max_tries=300, extra_used=planned, used=used
+                    )
+                    planned |= {planned_item.port, planned_item.query_port, planned_item.rcon_port}
+                except Exception as e:
+                    problems.append(f"No free ports for {display}: {e}")
+                plan.append(planned_item)
+            problem = cluster_folder_problem(
+                Path(self.var_dir.get().strip()) if self.var_dir.get().strip() else None,
+                [p.server_dir for p in plan] + existing_dirs,
+                [resolve_backup_root(self.app.cfg, self.app.app_base)],
+                allow_own_saved=False,
+            )
+            if problem:
+                problems.append(problem)
+        self._plan, self._problems = plan, problems
+        self.tree.delete(*self.tree.get_children())
+        for p in plan:
+            ports = f"{p.port} / {p.query_port} / {p.rcon_port}" if p.port else "-"
+            self.tree.insert("", "end", text=p.display_name, values=(p.map_name, str(p.server_dir), ports))
+        self.var_warning.set("\n".join(problems))
+        self.btn_import.configure(state="disabled" if problems or not plan else "normal")
+
+    def _on_import(self) -> None:
+        self._refresh()
+        if self._problems or not self._plan:
+            return
+        info = self.data.get("cluster") or {}
+        shared = {"admin_password": self.var_admin.get().strip(), "join_password": self.var_join.get().strip()}
+        cluster = {"cluster_id": self.var_cid.get().strip(), "cluster_dir": self.var_dir.get().strip(),
+                   "name": self.var_name.get().strip()}
+        stagger = max(0, safe_int(info.get("start_stagger_sec"), DEFAULT_START_STAGGER_SEC))
+        install = bool(self.var_install_now.get())
+        plan = self._plan
+        self.destroy()
+        self.app.create_cluster_profiles(plan, self.app.cfg, shared, cluster, install=install, adding=False, stagger_sec=stagger)
+
+
 class ServerManagerApp:
     def __init__(self, root: tk.Tk, app_base: Path):
         self.root = root
@@ -7336,6 +7664,7 @@ class ServerManagerApp:
         self._sync_auto_update_scheduler()
         self._start_scheduler()
         self._start_player_poll()
+        self._start_stats_sampler()
         self._reattach_done = threading.Event()
         threading.Thread(target=self._reattach_on_launch, daemon=True, name="reattach").start()
         self._dash_tick()
@@ -8039,6 +8368,10 @@ class ServerManagerApp:
         self.var_auto_start_on_launch = tk.BooleanVar(master=m)
         self.var_auto_update_time = tk.StringVar(master=m)
         self.var_update_on_startup = tk.BooleanVar(master=m)
+        self.var_scheduled_restart_enabled = tk.BooleanVar(master=m)
+        self.var_scheduled_restart_time = tk.StringVar(master=m)
+        self.var_restart_warnings_enabled = tk.BooleanVar(master=m)
+        self.var_restart_warning_minutes = tk.StringVar(master=m)
 
         # Hide GameAnalytics spam (console only)
         self.var_hide_gameanalytics_console_logs = tk.BooleanVar(master=m)
@@ -8307,6 +8640,26 @@ class ServerManagerApp:
         ttk.Entry(update_frame, textvariable=self.var_auto_update_time).grid(row=6, column=1, sticky="ew", padx=6, pady=(6, 0))
         self.btn_auto_update_test = ttk.Button(update_frame, text="Test", command=self.auto_update_test)
         self.btn_auto_update_test.grid(row=6, column=2, padx=(6, 0), pady=(6, 0))
+
+        ttk.Checkbutton(update_frame, text="Daily restart at (HH:MM)", variable=self.var_scheduled_restart_enabled) \
+            .grid(row=7, column=0, sticky="w", pady=(8, 0))
+        ttk.Entry(update_frame, textvariable=self.var_scheduled_restart_time).grid(row=7, column=1, sticky="ew", padx=6, pady=(8, 0))
+        ttk.Label(
+            update_frame,
+            text="Restarts the server every day while it is running (safe: save, stop, start). Never starts a stopped one.",
+            wraplength=380,
+            justify="left",
+        ).grid(row=8, column=0, columnspan=3, sticky="w", padx=(24, 0))
+        ttk.Checkbutton(update_frame, text="Warn players first, minutes before", variable=self.var_restart_warnings_enabled) \
+            .grid(row=9, column=0, sticky="w", pady=(8, 0))
+        ttk.Entry(update_frame, textvariable=self.var_restart_warning_minutes).grid(row=9, column=1, sticky="ew", padx=6, pady=(8, 0))
+        ttk.Label(
+            update_frame,
+            text="In-game chat warnings over RCON before the daily restart, the nightly update and a warned Restart All, "
+                 "for example 15,5,1. Stopping the server cancels the countdown.",
+            wraplength=380,
+            justify="left",
+        ).grid(row=10, column=0, columnspan=3, sticky="w", padx=(24, 0))
 
         backup_frame = ttk.LabelFrame(lf_ops, text="Backup", padding=8)
         backup_frame.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(10, 0))
@@ -8957,6 +9310,10 @@ class ServerManagerApp:
         self.var_auto_update_restart.set(cfg.auto_update_restart)
         self.var_auto_update_time.set(cfg.auto_update_time or DEFAULT_SCHEDULE_TIME)
         self.var_update_on_startup.set(cfg.update_on_startup)
+        self.var_scheduled_restart_enabled.set(cfg.scheduled_restart_enabled)
+        self.var_scheduled_restart_time.set(cfg.scheduled_restart_time or "06:00")
+        self.var_restart_warnings_enabled.set(cfg.restart_warnings_enabled)
+        self.var_restart_warning_minutes.set(cfg.restart_warning_minutes)
 
         self.var_hide_gameanalytics_console_logs.set(bool(cfg.hide_gameanalytics_console_logs))
         self._sync_console_log_filter_state()
@@ -9045,6 +9402,10 @@ class ServerManagerApp:
         cfg.auto_update_restart = bool(self.var_auto_update_restart.get())
         cfg.auto_update_time = normalize_time_hhmm(self.var_auto_update_time.get(), DEFAULT_SCHEDULE_TIME)
         cfg.update_on_startup = bool(self.var_update_on_startup.get())
+        cfg.scheduled_restart_enabled = bool(self.var_scheduled_restart_enabled.get())
+        cfg.scheduled_restart_time = normalize_time_hhmm(self.var_scheduled_restart_time.get(), "06:00")
+        cfg.restart_warnings_enabled = bool(self.var_restart_warnings_enabled.get())
+        cfg.restart_warning_minutes = ",".join(map(str, parse_warning_minutes(self.var_restart_warning_minutes.get()))) or "15,5,1"
 
         cfg.hide_gameanalytics_console_logs = bool(self.var_hide_gameanalytics_console_logs.get())
 
@@ -9105,6 +9466,8 @@ class ServerManagerApp:
         if not (1 <= int(cfg.max_players) <= 255):
             raise ValueError("MaxPlayers out of range (1..255).")
 
+        if cfg.scheduled_restart_enabled and parse_time_hhmm(cfg.scheduled_restart_time) is None:
+            raise ValueError("Daily restart time must be in HH:MM (24h) format.")
         if cfg.auto_update_restart and parse_time_hhmm(cfg.auto_update_time) is None:
             raise ValueError("Auto update time must be in HH:MM (24h) format.")
 
@@ -9133,6 +9496,8 @@ class ServerManagerApp:
             self.var_backup_on_stop, self.var_backup_dir, self.var_backup_retention,
             self.var_auto_save_enabled, self.var_auto_save_interval, self.var_auto_save_keep,
             self.var_auto_update_restart, self.var_auto_update_time, self.var_update_on_startup,
+            self.var_scheduled_restart_enabled, self.var_scheduled_restart_time,
+            self.var_restart_warnings_enabled, self.var_restart_warning_minutes,
             self.var_hide_gameanalytics_console_logs,
             self.var_cluster_enable, self.var_cluster_id, self.var_cluster_custom_path_enable, self.var_cluster_dir_override,
             self.var_no_transfer_from_filtering, self.var_alt_save_directory_name,
@@ -9240,12 +9605,14 @@ class ServerManagerApp:
         others = [r for r in self._running_runtimes() if r.server_id != rt.server_id]
         # The state line is written only when the state changes, so a message posted
         # meanwhile ("Auto-save failed", "Backup created ...") stays until then.
-        key = (rt.server_id, running, rt.task if busy else None, len(others))
+        key = (rt.server_id, running, rt.task if busy else None, len(others), rt.countdown)
         if key == self._status_key:
             return
         self._status_key = key
         also = f" | {len(others)} other server(s) running" if others else ""
-        if running:
+        if running and rt.countdown:
+            self._set_status(f"Server: RUNNING - {rt.countdown}{also}")
+        elif running:
             self._set_status(f"Server: RUNNING{also}")
         elif busy:
             self._set_status(f"Busy: {rt.task}{also}")
@@ -9896,6 +10263,8 @@ class ServerManagerApp:
         self.stop_server_for(self.rt)
 
     def stop_server_for(self, rt: ServerRuntime) -> bool:
+        if self._cancel_countdown(rt):
+            rt.logger.info("Stop: the restart countdown was cancelled.")
         return self._run_task("Stop Server", lambda: self._safe_stop(rt), rt)
 
     def update_and_restart_safe(self) -> None:
@@ -10806,6 +11175,7 @@ class ServerManagerApp:
         self.btn_dash_add_maps = ttk.Button(top, text="Add Maps to Cluster...", command=self._dash_add_maps)
         self.btn_dash_add_maps.grid(row=0, column=1, padx=(0, 6))
         ttk.Button(top, text="Add Server Profile...", command=self._add_server_profile).grid(row=0, column=2, padx=(0, 6))
+        ttk.Button(top, text="Import Cluster...", command=self.import_cluster).grid(row=0, column=4, padx=(12, 0))
         ttk.Label(
             top,
             text="Select a server or a cluster below. Double-click a server to open it in the other tabs.",
@@ -10818,7 +11188,7 @@ class ServerManagerApp:
         frame.rowconfigure(0, weight=1)
         self.dash_tree = ttk.Treeview(
             frame,
-            columns=("map", "status", "players", "ports", "uptime", "folder"),
+            columns=("map", "status", "players", "cpu", "ram", "ports", "uptime", "folder"),
             show="tree headings",
             selectmode="browse",
         )
@@ -10827,6 +11197,8 @@ class ServerManagerApp:
             ("map", "Map", 150, "w"),
             ("status", "Status", 200, "w"),
             ("players", "Players", 70, "e"),
+            ("cpu", "CPU", 60, "e"),
+            ("ram", "Memory", 80, "e"),
             ("ports", "Ports (game/query/RCON)", 170, "w"),
             ("uptime", "Uptime", 90, "e"),
             ("folder", "Install folder", 320, "w"),
@@ -10854,6 +11226,7 @@ class ServerManagerApp:
             ("Open", self._dash_open_selected),
             ("Cluster...", lambda: self._dash_server_action("cluster")),
             ("Copy Settings To...", lambda: self._dash_server_action("copy")),
+            ("Cancel Countdown", lambda: self._dash_server_action("cancel_countdown")),
         )):
             b = ttk.Button(srv, text=text, command=cmd)
             b.grid(row=i // 5, column=i % 5, padx=(0, 6), pady=(0, 4), sticky="ew")
@@ -10870,6 +11243,7 @@ class ServerManagerApp:
             ("Back Up All", lambda: self._dash_cluster_action("backup")),
             ("Broadcast...", lambda: self._dash_cluster_action("broadcast")),
             ("Health Check...", lambda: self._dash_cluster_action("health")),
+            ("Export...", lambda: self._dash_cluster_action("export")),
             ("Rename...", lambda: self._dash_cluster_action("rename")),
             ("Start Delay...", lambda: self._dash_cluster_action("stagger")),
         )):
@@ -10916,6 +11290,8 @@ class ServerManagerApp:
     def _dash_status(rt: ServerRuntime) -> str:
         running = rt.is_running()
         task = rt.task
+        if running and rt.countdown:
+            return f"Running - {rt.countdown}"
         if running and task:
             return f"Running - {task}"
         if running:
@@ -10932,8 +11308,11 @@ class ServerManagerApp:
         uptime = ""
         if rt.is_running() and rt.started_at is not None:
             uptime = format_duration(int((datetime.now() - rt.started_at).total_seconds()))
-        players = "" if rt.players is None or not rt.is_running() else str(rt.players)
-        return (pretty_map_name(cfg.map_name), self._dash_status(rt), players, ports, uptime, cfg.server_dir)
+        running = rt.is_running()
+        players = "" if rt.players is None or not running else str(rt.players)
+        cpu = "" if rt.cpu_percent is None or not running else f"{rt.cpu_percent:.0f}%"
+        ram = "" if not rt.memory_bytes or not running else f"{rt.memory_bytes / 1024 ** 3:.1f} GB"
+        return (pretty_map_name(cfg.map_name), self._dash_status(rt), players, cpu, ram, ports, uptime, cfg.server_dir)
 
     def _dash_refresh(self) -> None:
         if not hasattr(self, "dash_tree"):
@@ -10960,6 +11339,7 @@ class ServerManagerApp:
             members = [self._runtime(sid) for sid in view.members]
             running = sum(1 for rt in members if rt.is_running())
             counts = [rt.players for rt in members if rt.is_running() and rt.players is not None]
+            mem = sum(rt.memory_bytes or 0 for rt in members if rt.is_running())
             status = f"{running} of {len(members)} running"
             op = self._group_ops.get(view.cluster_id)
             if op:
@@ -10973,12 +11353,13 @@ class ServerManagerApp:
             put(
                 f"c:{view.cluster_id}", "", ci,
                 f"Cluster: {view.name}",
-                (f"{len(members)} map(s)", status, str(sum(counts)) if counts else "", "", "", f"ID {view.cluster_id}"),
+                (f"{len(members)} map(s)", status, str(sum(counts)) if counts else "", "",
+                 f"{mem / 1024 ** 3:.1f} GB" if mem else "", "", "", f"ID {view.cluster_id}"),
             )
             for mi, rt in enumerate(members):
                 put(f"s:{rt.server_id}", f"c:{view.cluster_id}", mi, self._display_name(rt.server_id), self._dash_server_values(rt))
         if standalone:
-            put("g:standalone", "", len(clusters), "Standalone servers", ("", "", "", "", "", ""))
+            put("g:standalone", "", len(clusters), "Standalone servers", ("",) * 8)
             for si, sid in enumerate(standalone):
                 rt = self._runtime(sid)
                 put(f"s:{sid}", "g:standalone", si, self._display_name(sid), self._dash_server_values(rt))
@@ -11005,6 +11386,33 @@ class ServerManagerApp:
         finally:
             with contextlib.suppress(Exception):
                 self.root.after(self.DASH_REFRESH_MS, self._dash_tick)
+
+    STATS_SAMPLE_SEC = 5.0
+
+    def _start_stats_sampler(self) -> None:
+        """CPU and memory of every running server, for the Dashboard."""
+        cpus = max(1, os.cpu_count() or 1)
+
+        def loop() -> None:
+            while not self._player_poll_stop.wait(self.STATS_SAMPLE_SEC):
+                with self._runtimes_lock:
+                    items = list(self._runtimes.values())
+                for rt in items:
+                    pid = rt.pid() if rt.is_running() else None
+                    usage = process_usage(pid) if pid else None
+                    if usage is None:
+                        rt.cpu_percent = rt.memory_bytes = None
+                        rt._cpu_sample = None
+                        continue
+                    cpu_s, working_set = usage
+                    now = time.monotonic()
+                    prev = rt._cpu_sample
+                    if prev is not None and prev[2] == pid and now > prev[0]:
+                        rt.cpu_percent = max(0.0, (cpu_s - prev[1]) / (now - prev[0]) / cpus * 100.0)
+                    rt._cpu_sample = (now, cpu_s, pid)
+                    rt.memory_bytes = working_set
+
+        threading.Thread(target=loop, daemon=True, name="stats").start()
 
     def _start_player_poll(self) -> None:
         def loop() -> None:
@@ -11048,6 +11456,14 @@ class ServerManagerApp:
             if self.active_server_id == sid:
                 self._refresh_server_selector(sid)
                 self.open_cluster_setup()
+            return
+        if action == "cancel_countdown":
+            rt = self._runtime(sid)
+            if self._cancel_countdown(rt):
+                rt.logger.info("Countdown cancelled from the Dashboard.")
+                self._announce_countdown_cancelled(rt)
+            else:
+                messagebox.showinfo("Cancel Countdown", f"No restart countdown is running for {self._display_name(sid)}.")
             return
         if action == "copy":
             if sid == self.active_server_id:
@@ -11180,6 +11596,9 @@ class ServerManagerApp:
         members = [self._runtime(sid) for sid in view.members]
         names = lambda rts: ", ".join(self._display_name(r.server_id) for r in rts)  # noqa: E731
 
+        if action == "export":
+            self.export_cluster(view)
+            return
         if action == "health":
             self.open_cluster_health(view)
             self._dash_refresh()
@@ -11307,9 +11726,22 @@ class ServerManagerApp:
                 messagebox.showwarning("Start All", "Another cluster-wide action is still running for this cluster.")
         elif action == "restart":
             stagger = view.stagger_sec
+            minutes = self._warning_minutes(members[0]) if members else []
+            warn = False
+            if minutes and any(rt.is_running() and rt.live_cfg().enable_rcon for rt in members):
+                choice = messagebox.askyesnocancel(
+                    "Restart All",
+                    f"Warn the players of every map first ({', '.join(map(str, minutes))} minutes before), then "
+                    "restart the maps one by one?\n\nYes: warn first.\nNo: restart now.\nCancel: do nothing.",
+                )
+                if choice is None:
+                    return
+                warn = bool(choice)
 
             def restart_all(cancel: threading.Event) -> None:
                 todo = [rt for rt in members if rt.is_running()]
+                if warn and not self._run_countdown(todo, "restarts", minutes, cancel):
+                    return
                 for i, rt in enumerate(todo):
                     # One map at a time, so players can stay on the others meanwhile.
                     self._wait_idle(rt, timeout=30 * 60, cancel=cancel)
@@ -11355,17 +11787,20 @@ class ServerManagerApp:
         *,
         install: bool,
         adding: bool,
+        stagger_sec: Optional[int] = None,
     ) -> None:
         cid = cluster["cluster_id"]
         created: List[str] = []
         meta = self.global_cfg.clusters.setdefault(cid, {})
         if not adding or "name" not in meta:
             meta["name"] = cluster["name"]
+        if stagger_sec is not None:
+            meta["start_stagger_sec"] = int(stagger_sec)
         meta.setdefault("start_stagger_sec", DEFAULT_START_STAGGER_SEC)
         try:
             ensure_dir(Path(cluster["cluster_dir"]))
             for item in plan:
-                cfg = copy.deepcopy(template)
+                cfg = copy.deepcopy(item.settings if item.settings is not None else template)
                 cfg.server_dir = str(item.server_dir)
                 cfg.map_name = item.map_name
                 cfg.server_name = item.session_name
@@ -11383,6 +11818,12 @@ class ServerManagerApp:
                     cfg.custom_start_args = ""  # they would override this map's own ports, name or cluster
                 sid = str(uuid.uuid4())
                 ServerConfigStore(server_config_path(self.app_base, sid), server_lock_path(self.app_base, sid)).save_new(cfg)
+                # Imported INI settings become the new map's staging, applied on its first start.
+                stage_gus, stage_game = staging_paths(self.app_base, sid)
+                for file_name, stage in (("GameUserSettings.ini", stage_gus), ("Game.ini", stage_game)):
+                    text = item.ini.get(file_name)
+                    if text:
+                        atomic_write_text(stage, text, encoding="utf-8")
                 self.global_cfg.servers.append(ServerRef(id=sid, display_name=item.display_name, server_dir=cfg.server_dir))
                 created.append(sid)
             self._save_global_config(self.global_cfg)
@@ -11593,6 +12034,52 @@ class ServerManagerApp:
         except Exception as e:
             messagebox.showerror("Cluster Health", f"The fix could not be applied: {e}", parent=parent)
 
+    def export_cluster(self, view: ClusterView) -> None:
+        if self.active_server_id in view.members:
+            self._save_form("Export Cluster", show_error=False)
+        path_raw = filedialog.asksaveasfilename(
+            title="Export cluster", defaultextension=".json",
+            initialfile=f"{map_folder_name(view.name)}-cluster.json",
+            filetypes=[("Cluster file", "*.json"), ("All files", "*.*")],
+        )
+        if not path_raw:
+            return
+        members: List[Tuple[str, AppConfig, Dict[str, str]]] = []
+        try:
+            for sid in view.members:
+                rt = self._runtime(sid)
+                ini: Dict[str, str] = {}
+                for target in ("gus", "game"):
+                    paths = ini_stage_paths(self.app_base, sid, Path(rt.cfg.server_dir), target)
+                    ensure_ini_staging_synced(paths, server_running=self._install_running(rt.cfg.server_dir), logger=rt.logger)
+                    if paths.stage.exists():
+                        ini[paths.stage.name] = paths.stage.read_text(encoding="utf-8", errors="replace")
+                members.append((self._display_name(sid), rt.cfg, ini))
+            doc = cluster_export_document(view.name, view.cluster_id, view.stagger_sec, members)
+            atomic_write_text(Path(path_raw), json.dumps(doc, indent=2), encoding="utf-8")
+        except Exception as e:
+            messagebox.showerror("Export Cluster", f"Exporting failed: {e}")
+            return
+        self.logger.info(f"[CLUSTER] Exported '{view.name}' ({len(members)} map(s)) to {path_raw}.")
+        messagebox.showinfo(
+            "Export Cluster",
+            f"Exported {len(members)} map(s) of {view.name} to:\n{path_raw}\n\nPasswords, the Discord webhook and "
+            "folders on this machine are not in the file. Use Import Cluster on the other machine.",
+        )
+
+    def import_cluster(self) -> None:
+        path_raw = filedialog.askopenfilename(
+            title="Import cluster", filetypes=[("Cluster file", "*.json"), ("All files", "*.*")],
+        )
+        if not path_raw:
+            return
+        try:
+            data = read_cluster_export(Path(path_raw))
+        except ValueError as e:
+            messagebox.showerror("Import Cluster", str(e))
+            return
+        ClusterImportDialog(self, Path(path_raw), data)
+
     def open_cluster_health(self, view: ClusterView) -> None:
         ClusterHealthDialog(self, view)
 
@@ -11679,6 +12166,10 @@ class ServerManagerApp:
                 except Exception as e:
                     rt.logger.info(f"Auto update scheduler: {e}")
                 try:
+                    self._tick_scheduled_restart(rt, datetime.now())
+                except Exception as e:
+                    rt.logger.info(f"Daily restart scheduler: {e}")
+                try:
                     self._tick_auto_save(rt, time.monotonic())
                 except Exception as e:
                     rt.logger.info(f"Auto-save scheduler: {e}")
@@ -11695,6 +12186,133 @@ class ServerManagerApp:
             rt.auto_save_waiting = True
             rt.logger.info("Auto-save is due; waiting for the current task to finish.")
 
+    COUNTDOWN_MINUTE_SEC = 60.0  # one countdown minute, in seconds
+
+    def _warning_minutes(self, rt: ServerRuntime) -> List[int]:
+        cfg = rt.cfg
+        return parse_warning_minutes(cfg.restart_warning_minutes) if cfg.restart_warnings_enabled else []
+
+    def _run_countdown(
+        self,
+        runtimes: List[ServerRuntime],
+        reason: str,
+        minutes: List[int],
+        cancel: threading.Event,
+        on_step: Optional[Callable[[int], None]] = None,
+    ) -> bool:
+        """Tell the players of these servers, over RCON, that they go down in N minutes, at
+        each of the given minutes before, then wait out the last one. False if cancelled."""
+        if not minutes:
+            return not cancel.is_set()
+        unit = self.COUNTDOWN_MINUTE_SEC
+        start = time.monotonic()
+        first = minutes[0]
+        for m in minutes:
+            target = start + (first - m) * unit
+            if cancel.wait(max(0.0, target - time.monotonic())):
+                return False
+            if on_step is not None:
+                on_step(m)
+            text = f"Server {reason} in {m} minute{'s' if m != 1 else ''}."
+            for rt in runtimes:
+                if rt.is_running() and rt.live_cfg().enable_rcon:
+                    try:
+                        self._rcon_try(f"ServerChat {text}", timeout=5.0, rt=rt)
+                        rt.logger.info(f"Countdown: {text}")
+                    except Exception as e:
+                        rt.logger.info(f"Countdown message failed: {e}")
+        return not cancel.wait(minutes[-1] * unit)
+
+    def _countdown_then(self, rt: ServerRuntime, reason: str, then: Callable[[], bool]) -> bool:
+        """Warn the players of a running server first, then run then() once the server is free.
+
+        Without warnings set (or RCON off) then() runs at once. False when a countdown is
+        already running for this server.
+        """
+        minutes = self._warning_minutes(rt)
+        if not minutes or not rt.is_running() or not rt.live_cfg().enable_rcon:
+            return then()
+        cancel = threading.Event()
+        with rt.task_lock:
+            if rt.countdown is not None:
+                return False
+            rt.countdown = f"{reason} in {minutes[0]} min"
+            rt.countdown_cancel = cancel
+
+        def step(m: int) -> None:
+            rt.countdown = f"{reason} in {m} min"
+            self._ui(self._refresh_buttons)
+
+        def worker() -> None:
+            try:
+                rt.logger.info(f"Countdown started: the server {reason} in {minutes[0]} minute(s).")
+                if not self._run_countdown([rt], reason, minutes, cancel, step):
+                    rt.logger.info("Countdown cancelled.")
+                    return
+                if not rt.is_running():
+                    rt.logger.info("Countdown over, but the server was stopped meanwhile; nothing to do.")
+                    return
+                self._wait_idle(rt, timeout=30 * 60, cancel=cancel)
+                if cancel.is_set() or not then():
+                    rt.logger.info("Countdown over, but another task kept the server busy; not restarted.")
+            finally:
+                with rt.task_lock:
+                    rt.countdown = None
+                    rt.countdown_cancel = None
+                self._ui(self._refresh_buttons)
+
+        threading.Thread(target=worker, daemon=True, name=f"countdown-{rt.server_id}").start()
+        self._ui(self._refresh_buttons)
+        return True
+
+    def _announce_countdown_cancelled(self, rt: ServerRuntime) -> None:
+        """Tell players the announced restart is off, on a thread (RCON can be slow)."""
+        def send() -> None:
+            with contextlib.suppress(Exception):
+                self._rcon_try("ServerChat The announced restart is cancelled.", timeout=5.0, rt=rt)
+
+        threading.Thread(target=send, daemon=True, name="countdown-cancel").start()
+
+    def _cancel_countdown(self, rt: ServerRuntime) -> bool:
+        ev = rt.countdown_cancel
+        if ev is not None:
+            ev.set()
+            return True
+        return False
+
+    def _countdown_lead(self, rt: ServerRuntime) -> timedelta:
+        """How long before a planned time its countdown starts, so the restart itself happens
+        at the time set (03:00 means down at 03:00, warned from 02:45)."""
+        minutes = self._warning_minutes(rt)
+        if not minutes or not rt.is_running() or not rt.live_cfg().enable_rcon:
+            return timedelta(0)
+        return timedelta(seconds=minutes[0] * self.COUNTDOWN_MINUTE_SEC)
+
+    def _tick_scheduled_restart(self, rt: ServerRuntime, now: datetime) -> None:
+        cfg = rt.cfg
+        if not cfg.scheduled_restart_enabled:
+            rt.restart_next = None
+            return
+        when = parse_time_hhmm(cfg.scheduled_restart_time) or dt_time(hour=6, minute=0)
+        due = rt.restart_next
+        if due is None or rt.restart_time != cfg.scheduled_restart_time:
+            rt.restart_time = cfg.scheduled_restart_time
+            rt.restart_next = next_scheduled_datetime(now + self._countdown_lead(rt), when)
+            return
+        if now < due - self._countdown_lead(rt):
+            return
+        rt.restart_next = next_scheduled_datetime(max(now, due), when)
+        if not rt.is_running():
+            return  # a planned restart keeps a running server fresh; it never starts one
+        if cfg.auto_update_restart and normalize_time_hhmm(cfg.auto_update_time) == normalize_time_hhmm(cfg.scheduled_restart_time):
+            rt.logger.info("Daily restart skipped: the nightly update restarts the server at the same time.")
+            return
+        if rt.countdown is not None:
+            rt.logger.info("Daily restart skipped: a countdown is already running for this server.")
+            return
+        rt.logger.info("Daily restart due.")
+        self._countdown_then(rt, "restarts", lambda: self.restart_server_for(rt, quiet=True))
+
     def _tick_auto_update(self, rt: ServerRuntime, now: datetime) -> None:
         cfg = rt.cfg
         if not cfg.auto_update_restart:
@@ -11705,9 +12323,10 @@ class ServerManagerApp:
         due = rt.auto_update_next  # read once: the Tk thread may change it meanwhile
         if due is None or rt.auto_update_time != cfg.auto_update_time:
             rt.auto_update_time = cfg.auto_update_time
-            rt.auto_update_next = next_scheduled_datetime(now, when)
+            rt.auto_update_next = next_scheduled_datetime(now + self._countdown_lead(rt), when)
             return
-        if now < due:
+        # With warnings on, the countdown starts early enough that the update runs at the time set.
+        if now < due - self._countdown_lead(rt):
             return
         if not rt.is_running():
             # The nightly update keeps running servers current; it never brings up a server
@@ -11717,15 +12336,18 @@ class ServerManagerApp:
             rt.auto_update_next = next_scheduled_datetime(now, when)
             return
         # Due. A busy server keeps it due and is tried again on the next tick, so a task
-        # running at 03:00 delays tonight's update instead of skipping it.
-        if not self.update_and_restart_for(rt, quiet=True):
+        # running at 03:00 delays tonight's update instead of skipping it. With warnings set,
+        # players are told first and the update follows the countdown.
+        if rt.is_busy() or not self._countdown_then(
+            rt, "restarts for an update", lambda: self.update_and_restart_for(rt, quiet=True)
+        ):
             if not rt.auto_update_waiting:
                 rt.auto_update_waiting = True
                 rt.logger.info("Auto update is due; waiting for the current task to finish.")
             return
         rt.auto_update_waiting = False
         rt.logger.info("Auto update trigger reached -> Update & Restart (Safe).")
-        rt.auto_update_next = next_scheduled_datetime(now, when)
+        rt.auto_update_next = next_scheduled_datetime(max(now, due), when)
 
     def _auto_save_job(self, rt: ServerRuntime) -> None:
         cfg = rt.live_cfg()  # zip the folder the running server writes, whatever the form says now
