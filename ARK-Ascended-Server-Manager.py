@@ -1763,6 +1763,43 @@ def steamcmd_verify_install(install_dir: Path, app_id: int) -> bool:
     exe = install_dir / "ShooterGame" / "Binaries" / "Win64" / "ArkAscendedServer.exe"
     return manifest.exists() or exe.exists()
 
+def copy_server_install(src: Path, dst: Path, logger: logging.Logger) -> int:
+    """Copy an ASA server install's program files to a new install folder, so SteamCMD only
+    has to bring it up to date instead of downloading the whole server.
+
+    ShooterGame\\Saved (worlds, configs, logs, cluster data) is left out: the new server
+    starts clean. Files already in the target are kept. Returns the number of files copied.
+    """
+    src = src.resolve()
+    saved = (src / "ShooterGame" / "Saved").resolve()
+    copied = 0
+    ensure_dir(dst)
+    for root, dirs, files in os.walk(src):
+        root_path = Path(root)
+        if root_path == saved or saved in root_path.parents:
+            dirs[:] = []
+            continue
+        dirs[:] = [d for d in dirs if (root_path / d).resolve() != saved]
+        rel = root_path.relative_to(src)
+        target_dir = dst / rel
+        ensure_dir(target_dir)
+        for name in files:
+            target = target_dir / name
+            if target.exists():
+                continue
+            part = target.with_name(name + ".part")
+            try:
+                shutil.copy2(root_path / name, part)
+                os.replace(part, target)
+            except BaseException:
+                with contextlib.suppress(OSError):
+                    part.unlink()
+                raise
+            copied += 1
+    logger.info(f"Copied {copied} server file(s) from {src} to {dst}.")
+    return copied
+
+
 def steamcmd_app_update(
     logger: logging.Logger,
     steamcmd_exe: Path,
@@ -9884,7 +9921,15 @@ class ServerManagerApp:
             return
         self.first_install_for(self.rt)
 
-    def first_install_for(self, rt: ServerRuntime) -> bool:
+    def first_install_for(
+        self,
+        rt: ServerRuntime,
+        *,
+        copy_from: Optional[Path] = None,
+        then: Optional[Callable[[], None]] = None,
+    ) -> bool:
+        """Install the server. With copy_from (an existing install), its program files are
+        copied first and SteamCMD only brings them up to date: much faster than a download."""
         def job() -> None:
             log = rt.logger
             # Installers download to fixed temp paths and SteamCMD may reinstall itself, so
@@ -9903,10 +9948,16 @@ class ServerManagerApp:
 
                 steamcmd_exe = ensure_steamcmd(self.global_cfg.steamcmd_dir, log)
 
+                target = Path(rt.cfg.server_dir)
+                if (copy_from is not None and ark_server_exe(copy_from).exists()
+                        and not ark_server_exe(target).exists() and not same_path(copy_from, target)):
+                    log.info(f"Copying the server files from {copy_from} instead of downloading them...")
+                    copy_server_install(copy_from, target, log)
+
                 steamcmd_app_update(
                     logger=log,
                     steamcmd_exe=steamcmd_exe,
-                    install_dir=Path(rt.cfg.server_dir),
+                    install_dir=target,
                     app_id=ARK_ASA_APP_ID,
                     validate=False,
                     lock_root=self.app_base,
@@ -9918,7 +9969,7 @@ class ServerManagerApp:
             exe = ark_server_exe(Path(rt.cfg.server_dir))
             log.info(f"Server executable: {exe if exe.exists() else 'NOT FOUND'}")
 
-        return self._run_task("First Install", job, rt)
+        return self._run_task("First Install", job, rt, then=then)
 
     def update_validate(self) -> None:
         if not self._save_form("Update / Validate"):
@@ -12014,11 +12065,27 @@ class ServerManagerApp:
 
         lines = [f"{'Added' if adding else 'Created'} {len(created)} profile(s) in cluster '{cluster['name']}':"]
         lines += [f"- {item.display_name}: {item.server_dir} (ports {item.port}/{item.query_port}/{item.rcon_port})" for item in plan]
-        if install:
-            for sid in created:
-                self.first_install_for(self._runtime(sid))
+        if install and created:
+            source = Path(template.server_dir) if ark_server_exe(Path(template.server_dir)).exists() else None
+            runtimes = [self._runtime(sid) for sid in created]
+            if source is not None:
+                # Every map copies the program files of an install that is already there.
+                for rt in runtimes:
+                    self.first_install_for(rt, copy_from=source)
+                how = f"by copying the server files from {source}, then letting SteamCMD bring them up to date"
+            else:
+                # Nothing to copy from yet: the first map downloads, the others copy from it.
+                first = runtimes[0]
+                rest = runtimes[1:]
+
+                def install_rest() -> None:
+                    for rt in rest:
+                        self.first_install_for(rt, copy_from=Path(first.cfg.server_dir))
+
+                self.first_install_for(first, then=install_rest if rest else None)
+                how = "the first map with a full download, the others by copying it"
             lines.append(
-                "They are being installed now, one after another (see the console). When they finish, use Start All "
+                f"They are being installed now ({how}); see the console. When they finish, use Start All "
                 "on the Dashboard."
             )
         else:

@@ -207,6 +207,32 @@ Get-FileHash -Algorithm SHA256 ".\ARK-ASA-Manager.exe"
 
 ---
 
+## Running a cluster, step by step
+
+### Turn the server you already run into a cluster
+1. Open the server's profile, go to **Advanced Start Args** and click **Set Up / Join Cluster...**
+2. Pick **Start a new cluster with this server**. The ID and a shared data folder are filled in; keep them unless you have a reason not to
+3. Leave **Back up this server first** ticked and click **Create Cluster**. The world, players and INI settings stay as they are
+4. If the server is running, accept the safe restart when asked (or restart it later). Players can download what they had uploaded once it is back
+
+### Add more maps
+1. On the **Dashboard**, select the cluster and click **Add Maps to Cluster...**
+2. Tick the maps, choose where their installs go, and check the preview of profiles, folders and ports
+3. Click **Add Maps**. With *install right away* ticked, the maps copy the server files of an existing install (or the first one downloads and the rest copy it), so this is quick
+4. Set each map's rates in its **INI Editor**, or set them on one map and use **Copy Settings To...** for the others
+
+### Start a cluster from scratch
+- On the **Dashboard**, click **New Cluster...**: name it, tick the maps, pick the install folder and the shared settings, and create it. It works like Add Maps, for a new cluster
+
+### Run it every day
+- **Start All** on the Dashboard starts the stopped maps one after another; **Stop All** saves and stops them all
+- Turn on **Auto Update & Restart** and/or a **Daily restart** per map; with **Warn players first** on, players get chat countdowns before each one
+- Run **Health Check...** after changing things: it finds mismatched mod lists, data folders, ports or server names, and fixes most of them in one click
+- Forward each map's game and query ports (UDP) on the router, as listed on the Dashboard
+
+### Move it to another PC
+- **Export...** on the Dashboard writes the cluster to a file (no passwords or local folders in it); **Import Cluster...** on the other PC recreates it with new installs and free ports
+
 ## Usage notes
 
 ### Multi-instance hosting
