@@ -6238,7 +6238,13 @@ class ClusterWizardDialog(tk.Toplevel):
 
         if add_to is not None:
             name, cid = add_to.name, add_to.cluster_id
-            folder = str(effective_cluster_dir(template) or "")
+            # A member that chose a shared folder knows the cluster's folder best.
+            chosen = next(
+                (app._runtime(sid).cfg for sid in add_to.members
+                 if app._runtime(sid).cfg.cluster_custom_path_enable and app._runtime(sid).cfg.cluster_dir_override.strip()),
+                template,
+            )
+            folder = str(effective_cluster_dir(chosen) or "")
         else:
             name = "My Cluster"
             cid = make_cluster_id(name)
@@ -6472,10 +6478,17 @@ class ClusterWizardDialog(tk.Toplevel):
 
         template = self._template_cfg()
         plan: List[PlannedServer] = []
+        used_ports = self.app._collect_used_ports()  # read once per refresh, not once per map
         planned_ports: Set[int] = set()
+        seen_dirs: Dict[str, str] = {}
         for map_name in maps:
             pretty = pretty_map_name(map_name)
             server_dir = root_dir / map_folder_name(map_name)
+            key = os.path.normcase(os.path.normpath(str(server_dir)))
+            if key in seen_dirs:
+                problems.append(f"{map_name} and {seen_dirs[key]} would share the install folder {server_dir}; tick each map once.")
+                continue
+            seen_dirs[key] = map_name
             if self.app._server_dir_in_use(str(server_dir)):
                 problems.append(f"{server_dir} is already the install folder of another profile.")
             item = PlannedServer(
@@ -6487,7 +6500,7 @@ class ClusterWizardDialog(tk.Toplevel):
             probe = copy.deepcopy(template)
             try:
                 item.port, item.query_port, item.rcon_port = self.app.auto_assign_ports(
-                    probe, stride=10, max_tries=300, extra_used=planned_ports
+                    probe, stride=10, max_tries=300, extra_used=planned_ports, used=used_ports
                 )
                 planned_ports |= {item.port, item.query_port, item.rcon_port}
             except Exception as e:
@@ -6499,7 +6512,12 @@ class ClusterWizardDialog(tk.Toplevel):
         problem = cluster_folder_problem(
             target, [p.server_dir for p in plan] + member_dirs, [resolve_backup_root(template, self.app.app_base)]
         )
-        if problem and self.add_to is None:
+        if problem and self.add_to is not None:
+            # Seen when the cluster still keeps its data inside one map's install: new maps must
+            # not be pointed in there. Moving the folder is one Cluster... click on that map.
+            problem = (f"This cluster's data folder ({target}) cannot be shared with new maps: {problem} "
+                       "Open Cluster... on one of its servers and give the cluster its own folder first.")
+        if problem:
             problems.append(problem)
         return plan, problems
 
@@ -6565,8 +6583,13 @@ class ServerManagerApp:
         self._scheduler_thread: Optional[threading.Thread] = None
         self._scheduler_stop = threading.Event()
         self._auto_update_announced: Dict[str, bool] = {}
-        # Cluster-wide sequences running now (Start All, Restart All), by cluster ID.
+        # Cluster-wide sequences running now (Start All, Restart All), by cluster ID, and the
+        # event that cancels each: Stop All and closing the window set it.
         self._group_ops: Dict[str, str] = {}
+        self._group_cancel: Dict[str, threading.Event] = {}
+        self._player_poll_stop = threading.Event()
+        # Bumped whenever the SteamCMD slot changes hands (see _take_update_slot).
+        self._update_slot_turns = 0
         # One SteamCMD run (install, update, validate) at a time across this manager's
         # servers. Reentrant: Update & Restart holds it across stop, update and start.
         self._update_slot = threading.RLock()
@@ -6846,8 +6869,10 @@ class ServerManagerApp:
         max_tries: int = 200,
         ignore_server_id: Optional[str] = None,
         extra_used: Optional[Set[int]] = None,
+        used: Optional[Set[int]] = None,
     ) -> Tuple[int, int, int]:
-        used = self._collect_used_ports(ignore_server_id=ignore_server_id)
+        # used: ports of the saved profiles, when the caller already read them.
+        used = set(used) if used is not None else self._collect_used_ports(ignore_server_id=ignore_server_id)
         used |= set(extra_used or ())  # ports planned for profiles not saved yet
         base_game = int(getattr(cfg, "port", 0) or DEFAULT_PORT)
         base_query = int(getattr(cfg, "query_port", 0) or DEFAULT_QUERY_PORT)
@@ -8839,7 +8864,7 @@ class ServerManagerApp:
             return False
         return self.start_server_for(self.rt)
 
-    def start_server_for(self, rt: ServerRuntime) -> bool:
+    def start_server_for(self, rt: ServerRuntime, *, quiet: bool = False) -> bool:
         """Start a server from its saved profile; False if that server already runs a task."""
         def job() -> None:
             if rt.is_running():
@@ -8851,7 +8876,7 @@ class ServerManagerApp:
             else:
                 self._start_server_inline(rt, check_install=True)
 
-        return self._run_task("Start Server", job, rt)
+        return self._run_task("Start Server", job, rt, quiet=quiet)
 
     def _server_log_reader(self, rt: ServerRuntime, p: subprocess.Popen) -> None:
         if not p.stdout:
@@ -9059,15 +9084,23 @@ class ServerManagerApp:
         self.update_and_restart_for(self.rt)
 
     def _take_update_slot(self, rt: ServerRuntime) -> None:
-        """Wait for this manager's SteamCMD turn; raises after UPDATE_SLOT_WAIT_SEC."""
-        if self._update_slot.acquire(blocking=False):
-            return
-        rt.logger.info("Waiting for another server's SteamCMD run to finish...")
-        if not self._update_slot.acquire(timeout=UPDATE_SLOT_WAIT_SEC):
-            raise RuntimeError(
-                f"Another server's SteamCMD run took longer than {UPDATE_SLOT_WAIT_SEC // 60} minutes; "
-                "this one was left as it is. Try again later."
-            )
+        """Wait for this manager's SteamCMD turn.
+
+        A long queue (installing a whole cluster) is fine: it only gives up when one run
+        holds the slot for UPDATE_SLOT_WAIT_SEC without the slot changing hands.
+        """
+        if not self._update_slot.acquire(blocking=False):
+            rt.logger.info("Waiting for another server's SteamCMD run to finish...")
+            while True:
+                turns = self._update_slot_turns
+                if self._update_slot.acquire(timeout=UPDATE_SLOT_WAIT_SEC):
+                    break
+                if self._update_slot_turns == turns:
+                    raise RuntimeError(
+                        f"Another server's SteamCMD run has been going for over {UPDATE_SLOT_WAIT_SEC // 60} minutes; "
+                        "this one was left as it is. Try again later."
+                    )
+        self._update_slot_turns += 1
 
     def update_and_restart_for(self, rt: ServerRuntime, *, quiet: bool = False) -> bool:
         def job() -> None:
@@ -9109,7 +9142,7 @@ class ServerManagerApp:
             return False
         return self.restart_server_for(self.rt)
 
-    def restart_server_for(self, rt: ServerRuntime) -> bool:
+    def restart_server_for(self, rt: ServerRuntime, *, quiet: bool = False) -> bool:
         def job() -> None:
             # Asked while this server still runs, so declining leaves it up.
             self._ensure_install_free(rt, Path(rt.cfg.server_dir), confirm=True)
@@ -9118,7 +9151,7 @@ class ServerManagerApp:
                 self._safe_stop(rt)
             self._start_server_inline(rt, check_install=False)
 
-        return self._run_task("Restart Server", job, rt)
+        return self._run_task("Restart Server", job, rt, quiet=quiet)
 
     def auto_update_test(self) -> None:
         if self._is_busy():
@@ -9216,15 +9249,7 @@ class ServerManagerApp:
     def backup_now(self, on_done: Optional[Callable[[Optional[Path]], None]] = None) -> None:
         if not self._save_form("Backup"):
             return
-        rt = self.rt
-
-        def job() -> None:
-            backup_path = backup_server(rt.cfg, self.app_base, rt.logger, rt.server_id)
-            self._ui(lambda: self._set_backup_status(backup_path, label="Backup created", rt=rt))
-            if on_done is not None:
-                self._ui(lambda: on_done(backup_path))
-
-        self._run_task("Backup", job, rt)
+        self._backup_for(self.rt, on_done)
 
     # ---------------------------------------------------------------------
     # Single player import
@@ -9790,6 +9815,17 @@ class ServerManagerApp:
             logger.info(f"[CLUSTER] Cluster '{cfg.cluster_id.strip()}', data folder {folder}")
 
     def _on_close(self) -> None:
+        if self._group_ops:
+            ops = ", ".join(sorted(set(self._group_ops.values())))
+            if not messagebox.askyesno(
+                "Cluster action running",
+                f"A cluster-wide action is still running ({ops}). Closing cancels it; maps it has not "
+                "reached yet are left as they are.\n\nContinue closing?",
+                icon="warning",
+                default="no",
+            ):
+                return
+            self._cancel_groups()
         running = self._running_runtimes()
         if running:
             names = "\n".join(f"- {self._display_name(rt.server_id)}" for rt in running)
@@ -9951,6 +9987,8 @@ class ServerManagerApp:
         ys.grid(row=0, column=1, sticky="ns")
         self.dash_tree.configure(yscrollcommand=ys.set)
         self.dash_tree.bind("<<TreeviewSelect>>", lambda _e: self._dash_sync_buttons())
+        self.nb.bind("<<NotebookTabChanged>>", lambda _e: self._dash_refresh() if self._dash_visible() else None, add="+")
+        self._dash_views: Dict[str, ClusterView] = {}
         self.dash_tree.bind("<Double-1>", lambda _e: self._dash_open_selected())
 
         srv = ttk.LabelFrame(tab, text="Selected Server", padding=8)
@@ -10010,7 +10048,7 @@ class ServerManagerApp:
         self.btn_dash_add_maps.configure(state="normal" if kind == "cluster" else "disabled")
         hint = ""
         if kind == "cluster":
-            view = self._cluster_view(ident)
+            view = self._dash_views.get(ident)  # as grouped by the last refresh
             if view is not None:
                 hint = (
                     f"Start All starts the stopped maps one after another, {view.stagger_sec} s apart. Restart All "
@@ -10053,6 +10091,7 @@ class ServerManagerApp:
             self.logger.info(f"Dashboard: {e}")
             return
         tree = self.dash_tree
+        self._dash_views = {c.cluster_id: c for c in clusters}
         wanted: List[str] = []
 
         def put(iid: str, parent: str, index: int, text: str, values: Tuple[str, ...]) -> None:
@@ -10094,16 +10133,24 @@ class ServerManagerApp:
                     tree.delete(iid)
         self._dash_sync_buttons()
 
+    def _dash_visible(self) -> bool:
+        try:
+            return self.nb.select() == str(self.tab_dash)
+        except Exception:
+            return False
+
     def _dash_tick(self) -> None:
         try:
-            self._dash_refresh()
+            if self._dash_visible():
+                self._dash_refresh()
         finally:
             with contextlib.suppress(Exception):
                 self.root.after(self.DASH_REFRESH_MS, self._dash_tick)
 
     def _start_player_poll(self) -> None:
         def loop() -> None:
-            while not self._scheduler_stop.wait(self.PLAYER_POLL_SEC):
+            # Its own event: closing pauses the scheduler, and must not end this for good.
+            while not self._player_poll_stop.wait(self.PLAYER_POLL_SEC):
                 for rt in self._running_runtimes():
                     if rt.removed or not rt.live_cfg().enable_rcon:
                         rt.players = None
@@ -10161,36 +10208,59 @@ class ServerManagerApp:
             messagebox.showwarning(titles[action], f"A task is running for {self._display_name(sid)}. Try again when it finishes.")
         self._dash_refresh()
 
-    def _backup_for(self, rt: ServerRuntime) -> bool:
+    def _backup_for(self, rt: ServerRuntime, on_done: Optional[Callable[[Optional[Path]], None]] = None) -> bool:
         def job() -> None:
-            path = backup_server(rt.cfg, self.app_base, rt.logger, rt.server_id)
+            # A running server's folder is the one it started with, whatever the form says now.
+            path = backup_server(rt.live_cfg(), self.app_base, rt.logger, rt.server_id)
             self._ui(lambda: self._set_backup_status(path, label="Backup created", rt=rt))
+            if on_done is not None:
+                self._ui(lambda: on_done(path))
 
         return self._run_task("Backup", job, rt)
 
     @staticmethod
-    def _wait_idle(rt: ServerRuntime, timeout: float) -> None:
+    def _wait_idle(rt: ServerRuntime, timeout: float, cancel: Optional[threading.Event] = None) -> None:
         end = time.monotonic() + timeout
         while rt.is_busy() and time.monotonic() < end:
-            time.sleep(0.5)
+            if cancel is not None and cancel.wait(0.5):
+                return
+            if cancel is None:
+                time.sleep(0.5)
 
-    def _run_group(self, cluster_id: str, label: str, fn: Callable[[], None]) -> bool:
-        """A cluster-wide sequence on its own thread; one at a time per cluster."""
+    def _cancel_groups(self, cluster_id: Optional[str] = None) -> List[str]:
+        """Cancel the cluster-wide sequences of one cluster (or all); returns their labels."""
+        with self._runtimes_lock:
+            items = [(cid, ev) for cid, ev in self._group_cancel.items() if cluster_id in (None, cid)]
+            labels = [self._group_ops.get(cid, "") for cid, _ in items]
+        for _, ev in items:
+            ev.set()
+        return labels
+
+    def _run_group(self, cluster_id: str, label: str, fn: Callable[[threading.Event], None]) -> bool:
+        """A cluster-wide sequence on its own thread; one at a time per cluster.
+
+        fn gets the sequence's cancel event: it checks it before every step and waits on
+        it instead of sleeping, so Stop All or closing the window ends it at once.
+        """
+        cancel = threading.Event()
         with self._runtimes_lock:
             if cluster_id in self._group_ops:
                 return False
             self._group_ops[cluster_id] = label
+            self._group_cancel[cluster_id] = cancel
 
         def worker() -> None:
             try:
                 self.logger.info(f"=== Cluster {cluster_id}: {label} started ===")
-                fn()
-                self.logger.info(f"=== Cluster {cluster_id}: {label} completed ===")
+                fn(cancel)
+                state = "cancelled" if cancel.is_set() else "completed"
+                self.logger.info(f"=== Cluster {cluster_id}: {label} {state} ===")
             except Exception as e:
                 self.logger.error(f"Cluster {cluster_id}: {label} failed: {e}")
             finally:
                 with self._runtimes_lock:
                     self._group_ops.pop(cluster_id, None)
+                    self._group_cancel.pop(cluster_id, None)
                 self._ui(self._dash_refresh)
 
         threading.Thread(target=worker, daemon=True, name=f"group-{cluster_id}").start()
@@ -10231,6 +10301,9 @@ class ServerManagerApp:
             self._dash_refresh()
             return
         if action == "stop":
+            # Stops a Start All / Restart All of this cluster first, or it would bring maps back.
+            if self._cancel_groups(view.cluster_id):
+                self.logger.info(f"Cluster {view.cluster_id}: Stop All cancelled the cluster-wide action in progress.")
             running = [rt for rt in members if rt.is_running()]
             refused = [rt for rt in running if not self.stop_server_for(rt)]
             if refused:
@@ -10282,33 +10355,48 @@ class ServerManagerApp:
         if action == "start":
             stagger = view.stagger_sec
 
-            def start_all() -> None:
-                todo = [rt for rt in members if not rt.is_running()]
+            def start_all(cancel: threading.Event) -> None:
+                todo = []
+                for rt in members:
+                    if rt.is_running():
+                        continue
+                    if not ark_server_exe(Path(rt.cfg.server_dir)).exists():
+                        rt.logger.info("Start All: skipped, the server is not installed (use First Install).")
+                        continue
+                    todo.append(rt)
                 for i, rt in enumerate(todo):
-                    if not self.start_server_for(rt):
+                    if cancel.is_set():
+                        return
+                    if not self.start_server_for(rt, quiet=True):
                         rt.logger.info("Start All: skipped, a task is running for this server.")
                         continue
-                    self._wait_idle(rt, timeout=30 * 60)
+                    self._wait_idle(rt, timeout=30 * 60, cancel=cancel)
                     # Maps load their world on start; spacing them out spares disk and memory.
-                    if i < len(todo) - 1 and stagger:
-                        time.sleep(stagger)
+                    if i < len(todo) - 1 and stagger and cancel.wait(stagger):
+                        return
 
             if not self._run_group(view.cluster_id, "Starting all", start_all):
                 messagebox.showwarning("Start All", "Another cluster-wide action is still running for this cluster.")
         elif action == "restart":
             stagger = view.stagger_sec
 
-            def restart_all() -> None:
+            def restart_all(cancel: threading.Event) -> None:
                 todo = [rt for rt in members if rt.is_running()]
                 for i, rt in enumerate(todo):
                     # One map at a time, so players can stay on the others meanwhile.
-                    self._wait_idle(rt, timeout=30 * 60)
-                    if not self.restart_server_for(rt):
+                    self._wait_idle(rt, timeout=30 * 60, cancel=cancel)
+                    if cancel.is_set():
+                        return
+                    if not rt.is_running():
+                        # Stopped since the sequence began: a restart would bring it back up.
+                        rt.logger.info("Restart All: skipped, the server was stopped meanwhile.")
+                        continue
+                    if not self.restart_server_for(rt, quiet=True):
                         rt.logger.info("Restart All: skipped, a task is running for this server.")
                         continue
-                    self._wait_idle(rt, timeout=30 * 60)
-                    if i < len(todo) - 1 and stagger:
-                        time.sleep(stagger)
+                    self._wait_idle(rt, timeout=30 * 60, cancel=cancel)
+                    if i < len(todo) - 1 and stagger and cancel.wait(stagger):
+                        return
 
             if not self._run_group(view.cluster_id, "Restarting one by one", restart_all):
                 messagebox.showwarning("Restart All", "Another cluster-wide action is still running for this cluster.")
