@@ -1980,14 +1980,56 @@ def write_ini(path: Path, doc: IniDocument) -> None:
     atomic_write_text(path, doc.to_text(), encoding="utf-8")
 
 
+def runtime_state_path_for_ini(path: Path) -> Path:
+    return path.with_name(f"{path.name}.runtime.json")
+
+
+def read_server_ini_runtime_state_for_stage(path: Path) -> bool:
+    state_path = runtime_state_path_for_ini(path)
+    if not state_path.exists():
+        return False
+    try:
+        with open(state_path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        value = payload.get("live_is_runtime") if isinstance(payload, dict) else None
+        return bool(value) if isinstance(value, bool) else False
+    except Exception:
+        return False
+
+
+def write_server_ini_runtime_state_for_stage(path: Path, live_is_runtime: Optional[bool]) -> None:
+    state_path = runtime_state_path_for_ini(path)
+    if live_is_runtime is None:
+        try:
+            if state_path.exists():
+                state_path.unlink()
+        except Exception:
+            pass
+        return
+
+    payload = {
+        "live_is_runtime": bool(live_is_runtime),
+        "updated": now_ts(),
+    }
+    try:
+        atomic_write_text(state_path, json.dumps(payload, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
 def three_way_merge_ini(base: IniDocument, staged: IniDocument, upstream: IniDocument) -> IniDocument:
     base_map = base.get_last_value_map()
     staged_map = staged.get_last_value_map()
     up_doc = upstream
 
+    base_lower: Dict[str, Dict[str, str]] = {}
+    for sec, kvs in base_map.items():
+        base_lower[sec] = {key.lower(): val for key, val in kvs.items()}
+
     for sec, kvs in staged_map.items():
+        sec_base = base_lower.get(sec, {})
         for key, staged_val in kvs.items():
-            base_val = base_map.get(sec, {}).get(key, None)
+            base_val = sec_base.get(key.lower())
             if base_val is None or staged_val != base_val:
                 up_doc.set(sec, key, staged_val)
 
@@ -2050,7 +2092,13 @@ def ensure_ini_staging_synced(paths: IniStagePaths, server_running: bool, logger
         if logger:
             logger.info(msg)
 
-    if server_running:
+    runtime_live_state = (
+        read_server_ini_runtime_state_for_stage(paths.live)
+        or read_server_ini_runtime_state_for_stage(paths.stage)
+    )
+
+    # Runtime-generated live INIs after shutdown should never be treated as authoritative user input.
+    if server_running or runtime_live_state:
         upstream = paths.baseline if paths.baseline.exists() else paths.live
     else:
         upstream = paths.live if paths.live.exists() else paths.baseline
@@ -2995,11 +3043,13 @@ def apply_staging_to_server(app_base: Path, server_id: str, server_dir: Path, lo
         ensure_dir(dest_gus.parent)
         shutil.copy2(stage_gus, dest_gus)
         logger.info("Applied staging: GameUserSettings.ini")
+        write_server_ini_runtime_state_for_stage(stage_gus, live_is_runtime=False)
 
     if stage_game.exists():
         ensure_dir(dest_game.parent)
         shutil.copy2(stage_game, dest_game)
         logger.info("Applied staging: Game.ini")
+        write_server_ini_runtime_state_for_stage(stage_game, live_is_runtime=False)
 
 
 def restore_baseline_to_server(app_base: Path, server_id: str, server_dir: Path, logger: logging.Logger) -> None:
@@ -3010,15 +3060,24 @@ def restore_baseline_to_server(app_base: Path, server_id: str, server_dir: Path,
     dest_gus = server_dir / GAMEUSERSETTINGS_REL
     dest_game = server_dir / GAME_INI_REL
 
+    # Clear runtime-state marker before restoring config files
+    for ini_path in (src_gus, src_game):
+        try:
+            write_server_ini_runtime_state_for_stage(ini_path, live_is_runtime=None)
+        except Exception:
+            pass
+
     if src_gus.exists():
         ensure_dir(dest_gus.parent)
         shutil.copy2(src_gus, dest_gus)
         logger.info("Restored baseline: GameUserSettings.ini")
+        write_server_ini_runtime_state_for_stage(src_gus, live_is_runtime=False)
 
     if src_game.exists():
         ensure_dir(dest_game.parent)
         shutil.copy2(src_game, dest_game)
         logger.info("Restored baseline: Game.ini")
+        write_server_ini_runtime_state_for_stage(src_game, live_is_runtime=False)
 
 
 def ensure_required_server_settings(
@@ -4102,6 +4161,9 @@ def restore_server_backup(
                 atomic_write_bytes(target, data)
             if paths.baseline.exists():
                 atomic_write_bytes(paths.baseline, data)
+            write_server_ini_runtime_state_for_stage(paths.live, live_is_runtime=False)
+            write_server_ini_runtime_state_for_stage(paths.stage, live_is_runtime=False)
+            write_server_ini_runtime_state_for_stage(paths.stage_base, live_is_runtime=False)
             res.config_restored.append(paths.live.name)
             logger.info(f"Restored {paths.live.name} from {backup.path.name}")
 
@@ -7433,6 +7495,14 @@ class ServerManagerApp:
 
         # RCON FIX: server stopped -> snapshot invalid
         self._clear_runtime_rcon()
+
+        # ARK writes config files during shutdown. Treat the live INIs as runtime-generated until
+        # the manager explicitly restores or applies a user-authored baseline/staging copy.
+        for ini_name in (GAMEUSERSETTINGS_REL, GAME_INI_REL):
+            try:
+                write_server_ini_runtime_state_for_stage(Path(self.cfg.server_dir) / ini_name, live_is_runtime=True)
+            except Exception:
+                pass
 
         self.logger.info("Server stopped.")
 
