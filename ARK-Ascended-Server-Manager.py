@@ -2700,6 +2700,21 @@ class DiscordStateStore:
             self.logger.info(f"[Discord] Failed to save state: {e}")
 
 
+DISCORD_SHARED_FIELDS = (
+    "discord_enable",
+    "discord_webhook_url",
+    "discord_poll_interval_sec",
+    "discord_notify_start",
+    "discord_notify_stop",
+    "discord_notify_join",
+    "discord_notify_leave",
+    "discord_notify_crash",
+    "discord_include_player_id",
+    "discord_mention_mode",
+    "discord_mention_map_json",
+)
+
+
 class DiscordNotificationCoordinator:
     ERROR_THROTTLE_SEC = 3600
 
@@ -2715,6 +2730,18 @@ class DiscordNotificationCoordinator:
         self._stop_event = threading.Event()
         self._server_instance_id: Optional[str] = None
         self._stop_requested = False
+        # Which server a message is from ("PvE Land · The Island"), shown at the top of each
+        # one: several maps of a cluster often post to the same channel.
+        self.source_label = ""
+
+    def _post(self, payload: Dict[str, Any]) -> None:
+        if not self._webhook:
+            return
+        label = self.source_label.strip()
+        if label:
+            for embed in payload.get("embeds") or []:
+                embed.setdefault("author", {"name": label[:256]})
+        self._webhook.post(payload)
 
     def update_config(self, cfg: AppConfig) -> None:
         self._cfg = cfg
@@ -2792,7 +2819,7 @@ class DiscordNotificationCoordinator:
                 }
             ]
         }
-        self._webhook.post(payload)
+        self._post(payload)
 
     def _poll_loop(self) -> None:
         while not self._stop_event.is_set():
@@ -2925,7 +2952,7 @@ class DiscordNotificationCoordinator:
                 }
             ]
         }
-        self._webhook.post(payload)
+        self._post(payload)
 
     def _notify_stop(self, cfg: AppConfig) -> None:
         if not cfg.discord_notify_stop or not self._webhook:
@@ -2952,7 +2979,7 @@ class DiscordNotificationCoordinator:
                 }
             ]
         }
-        self._webhook.post(payload)
+        self._post(payload)
 
     def _notify_crash(self, cfg: AppConfig, exit_code: Optional[int]) -> None:
         if not cfg.discord_notify_crash or not self._webhook:
@@ -2983,7 +3010,7 @@ class DiscordNotificationCoordinator:
                 }
             ]
         }
-        self._webhook.post(payload)
+        self._post(payload)
 
     def _stop_fields(self, state: Dict[str, Any]) -> List[Dict[str, Any]]:
         fields: List[Dict[str, Any]] = []
@@ -3019,7 +3046,7 @@ class DiscordNotificationCoordinator:
                 "timestamp": utc_now_iso(),
                 "footer": {"text": "ARK ASA Server Manager"},
             }
-            self._webhook.post({"embeds": [embed]})
+            self._post({"embeds": [embed]})
             return
 
         for player_id in player_ids:
@@ -3036,7 +3063,7 @@ class DiscordNotificationCoordinator:
                 "timestamp": utc_now_iso(),
                 "footer": {"text": "ARK ASA Server Manager"},
             }
-            self._webhook.post({"embeds": [embed]})
+            self._post({"embeds": [embed]})
 
     def _maybe_notify_error(self, cfg: AppConfig, error: Exception) -> None:
         if not self._webhook:
@@ -3112,7 +3139,7 @@ class DiscordNotificationCoordinator:
                 }
             ]
         }
-        self._webhook.post(payload)
+        self._post(payload)
 
 # =============================================================================
 # SERVER OPS
@@ -8554,13 +8581,80 @@ class ServerManagerApp:
                 rt.logger,
                 lambda cmd, timeout, _rt=rt: self._rcon_try(cmd, timeout=timeout, rt=_rt),
             )
+        rt.discord.source_label = self._discord_source_label(rt.server_id)
         rt.discord.update_config(rt.cfg)
         return rt.discord
 
     def _discord_update_config(self) -> None:
         rt = self.rt
         if rt.discord is not None:
+            rt.discord.source_label = self._discord_source_label(rt.server_id)
             rt.discord.update_config(rt.cfg)
+
+    def _cluster_of(self, server_id: str) -> Optional[ClusterView]:
+        return next((c for c in self._cluster_views()[0] if server_id in c.members), None)
+
+    def _discord_source_label(self, server_id: str) -> str:
+        """'PvE Land · The Island' for a map of a cluster, else the profile's name."""
+        try:
+            view = self._cluster_of(server_id)
+            if view is not None:
+                return f"{view.name} · {pretty_map_name(self._runtime(server_id).cfg.map_name or DEFAULT_MAP)}"
+            return self._display_name(server_id)
+        except Exception:
+            return ""
+
+    def _discord_use_for_cluster(self) -> None:
+        """Give every map of this profile's cluster the same Discord setup (webhook,
+        notifications, mentions), so the whole cluster posts to one channel."""
+        if not self._save_form("Discord"):
+            return
+        sid = self.active_server_id
+        view = self._cluster_of(sid)
+        if view is None:
+            messagebox.showinfo(
+                "Discord", "This profile is not part of a cluster. Turn on Enable Cluster first (Server tab or Cluster...)."
+            )
+            return
+        others = [m for m in view.members if m != sid]
+        if not others:
+            messagebox.showinfo("Discord", f"{self._display_name(sid)} is the only map of {view.name} so far.")
+            return
+        src = self.rt.cfg
+        if src.discord_enable and not src.discord_webhook_url.strip():
+            messagebox.showwarning("Discord", "Enter the webhook URL first (or turn Discord notifications off).")
+            return
+        names = "\n".join(f"- {self._display_name(m)}" for m in others)
+        if not messagebox.askyesno(
+            "Use for Every Map",
+            f"Give these maps of {view.name} the Discord settings of {self._display_name(sid)} "
+            f"(webhook, notifications, mentions)?\n\n{names}\n\n"
+            "Each message names its map, so one channel serves the whole cluster.",
+        ):
+            return
+        values = {k: getattr(src, k) for k in DISCORD_SHARED_FIELDS}
+        done: List[str] = []
+        failed: List[str] = []
+        for other in others:
+            try:
+                self._save_profile_fields(other, **values)
+            except Exception as e:
+                failed.append(f"- {self._display_name(other)}: {e}")
+                continue
+            done.append(other)
+            rt = self._runtime(other)
+            if rt.discord is not None:  # running with Discord: it follows now
+                rt.discord.source_label = self._discord_source_label(other)
+                rt.discord.update_config(rt.cfg)
+                if rt.is_running():
+                    rt.discord.start_polling(rt.cfg)
+        msg = f"Discord settings copied to {len(done)} map(s)."
+        if any(self._runtime(o).is_running() and self._runtime(o).discord is None for o in done):
+            msg += " Maps that are running without Discord start posting from their next start."
+        if failed:
+            messagebox.showwarning("Discord", msg + "\n\nNot copied:\n" + "\n".join(failed))
+        else:
+            messagebox.showinfo("Discord", msg)
 
     def _discord_start_notifications(self, rt: ServerRuntime, pid: int) -> None:
         if not rt.cfg.discord_enable:
@@ -9259,6 +9353,14 @@ class ServerManagerApp:
         discord_btns.grid(row=3, column=0, sticky="w", pady=(10, 0))
         ttk.Button(discord_btns, text="Send Test", command=self._discord_send_test).grid(row=0, column=0, padx=(0, 6))
         ttk.Button(discord_btns, text="Open State Folder", command=self._discord_open_state_folder).grid(row=0, column=1)
+        ttk.Button(discord_btns, text="Use for Every Map in the Cluster", command=self._discord_use_for_cluster).grid(
+            row=0, column=2, padx=(6, 0)
+        )
+        ttk.Label(
+            self.tab_discord,
+            text="Every message names its server (cluster and map), so the maps of a cluster can share one channel.",
+            foreground=THEME_COLORS["muted"],
+        ).grid(row=4, column=0, sticky="w", pady=(6, 0))
 
         # ---------------- INI Editor tab ----------------
         self.tab_ini.columnconfigure(0, weight=1)
