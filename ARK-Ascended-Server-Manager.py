@@ -9,6 +9,7 @@ import hashlib
 import json
 import logging
 import os
+import queue
 import re
 import shlex
 import shutil
@@ -50,7 +51,7 @@ from data.ini_settings import (
     INI_SETTINGS_MISC,
     INI_SETTINGS_ENVIRONMENT, INI_SETTINGS_DINOS_FULL,
     INI_SETTINGS_STRUCTURES, INI_SETTINGS_STACK_SIZE,
-    INI_SETTINGS_SERVER_OPTIONS, _SPAWN_ENTRY_KEYS,
+    INI_SETTINGS_SERVER_OPTIONS, INI_SETTINGS_CLUSTER_TRANSFERS, _SPAWN_ENTRY_KEYS,
     _DINO_STAT_DEFAULTS,
 )
 
@@ -140,6 +141,16 @@ BACKUP_ZIP_PREFIXES = (
     ("ASA_AutoSave_", BACKUP_KIND_AUTO_SAVE),
 )
 SERVERS_DIR_NAME = "servers"
+# Cluster transfer data (uploaded survivors, dinos and items). Without -ClusterDirOverride
+# each install keeps it in its own Saved\clusters, so two installs with the same cluster ID
+# still never see each other's uploads. The manager gives every cluster one shared folder.
+CLUSTERS_DIR_NAME = "clusters"
+SERVER_CLUSTERS_REL = Path(r"ShooterGame\Saved\clusters")
+# Cluster data rides along in backups under this prefix. Restores never extract it: the
+# folder is shared by every map in the cluster, so rolling it back would hit them all.
+CLUSTER_ZIP_PREFIX = "ClusterData/"
+# The ID goes on the command line unquoted, so keep it to characters that cannot split it.
+CLUSTER_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 LOCKS_DIR_NAME = "locks"
 GLOBAL_CONFIG_NAME = "global.json"
 LEGACY_CONFIG_NAME = "config.json"
@@ -2962,7 +2973,9 @@ def build_server_command(cfg: AppConfig) -> List[str]:
             raise ValueError("Enable Cluster requires Cluster ID.")
         flags.append(f"-clusterid={cid}")
 
-    if cfg.cluster_custom_path_enable:
+    # The folder belongs to the cluster: without -clusterid there is nothing to share, and the
+    # status line, backups and cluster setup all treat it as unused then.
+    if cfg.cluster_enable and cfg.cluster_custom_path_enable:
         p = cfg.cluster_dir_override.strip()
         if not p:
             raise ValueError("Enable Cluster Custom Path requires a valid path.")
@@ -3121,6 +3134,203 @@ def ensure_required_server_settings(
     doc_game.set("/Script/Engine.GameSession", "MaxPlayers", str(int(cfg.max_players)))
     write_ini(paths_game.stage, doc_game)
     logger.info("Staged Game.ini (/Script/Engine.GameSession MaxPlayers).")
+
+# =============================================================================
+# CLUSTER
+# =============================================================================
+
+def make_cluster_id(name: str) -> str:
+    """A readable, unique cluster ID: a slug of the name plus a short random tail."""
+    slug = re.sub(r"[^a-z0-9]+", "-", (name or "").lower()).strip("-")[:24].strip("-")
+    return f"{slug or 'cluster'}-{uuid.uuid4().hex[:6]}"
+
+
+def server_cluster_data_dir(server_dir: Path) -> Path:
+    """Where ARK keeps cluster data when no ClusterDirOverride is given."""
+    return server_dir / SERVER_CLUSTERS_REL
+
+
+def default_cluster_dir(app_base: Path, cluster_id: str, server_dir: Optional[Path] = None) -> Path:
+    """Shared cluster folder under the manager's storage.
+
+    The path goes on the command line unquoted, so a storage root with spaces in it
+    (an APPDATA fallback under "C:\\Users\\First Last") falls back to a folder beside
+    the server install.
+    """
+    preferred = app_base / CLUSTERS_DIR_NAME / cluster_id
+    if " " not in str(preferred) or server_dir is None:
+        return preferred
+    beside = server_dir.parent / "ARK-Clusters" / cluster_id
+    return beside if " " not in str(beside) else preferred
+
+
+def effective_cluster_dir(cfg: AppConfig) -> Optional[Path]:
+    """The folder this profile's server reads and writes cluster data in, or None if standalone."""
+    if not cfg.cluster_enable or not cfg.cluster_id.strip():
+        return None
+    override = cfg.cluster_dir_override.strip()
+    if cfg.cluster_custom_path_enable and override:
+        return Path(override)
+    return server_cluster_data_dir(Path(cfg.server_dir))
+
+
+def path_contains(outer: Path, inner: Path) -> bool:
+    """True when inner is outer or lies anywhere below it."""
+    try:
+        return same_path(outer, inner) or outer.resolve() in inner.resolve().parents
+    except OSError:
+        return False
+
+
+def cluster_id_data_dir(cluster_dir: Path, cluster_id: str) -> Path:
+    """ARK keeps one cluster's uploads in a subfolder named after its ID."""
+    return cluster_dir / cluster_id
+
+
+def dir_has_files(path: Optional[Path]) -> bool:
+    try:
+        return path is not None and path.is_dir() and any(p.is_file() for p in path.rglob("*"))
+    except OSError:
+        return False
+
+
+def same_path(a: Path, b: Path) -> bool:
+    return os.path.normcase(os.path.normpath(str(a))) == os.path.normcase(os.path.normpath(str(b)))
+
+
+def copy_cluster_data(src: Path, dst: Path, logger: logging.Logger) -> Tuple[int, int]:
+    """Copy transfer data into a cluster folder. Files already there win; nothing is moved."""
+    copied = skipped = 0
+    if not src.is_dir():
+        return copied, skipped
+    # Listed up front, and minus dst itself when it sits inside src, so the walk never
+    # picks up files this copy just wrote.
+    nested = path_contains(src, dst) and not same_path(src, dst)
+    files = [
+        p for p in src.rglob("*")
+        if p.is_file() and not (nested and path_contains(dst, p))
+    ]
+    ensure_dir(dst)
+    for path in files:
+        target = dst / path.relative_to(src)
+        if target.exists():
+            skipped += 1
+            continue
+        ensure_dir(target.parent)
+        # Through a temp name: a copy cut short must not leave a truncated upload that
+        # "existing files win" would then keep for good. os.rename refuses to overwrite on
+        # Windows, so an upload another map wrote meanwhile still wins.
+        part = target.with_name(target.name + ".part")
+        try:
+            shutil.copy2(path, part)
+            os.rename(part, target)
+        except FileExistsError:
+            with contextlib.suppress(OSError):
+                part.unlink()
+            skipped += 1
+            continue
+        except BaseException:
+            with contextlib.suppress(OSError):
+                part.unlink()
+            raise
+        copied += 1
+    logger.info(f"Cluster data: copied {copied} file(s) from {src} to {dst} ({skipped} already there, kept).")
+    return copied, skipped
+
+
+@dataclass
+class ClusterInfo:
+    """A cluster as seen through the profiles that use it."""
+    cluster_id: str
+    cluster_dir: Optional[Path] = None
+    member_ids: List[str] = field(default_factory=list)
+    member_names: List[str] = field(default_factory=list)
+    member_dirs: List[str] = field(default_factory=list)
+    member_folders: List[Path] = field(default_factory=list)  # each member's own cluster folder
+    mods: List[str] = field(default_factory=list)  # normalized mod list of each member, in order
+
+    def label(self) -> str:
+        names = ", ".join(self.member_names) or "no servers"
+        return f"{self.cluster_id}  ({names})"
+
+
+def discover_clusters(
+    app_base: Path,
+    servers: List[ServerRef],
+    exclude_id: str = "",
+) -> List[ClusterInfo]:
+    """Group the other profiles by the cluster ID they run with."""
+    found: Dict[str, ClusterInfo] = {}
+    custom_dir: Set[str] = set()  # clusters whose folder came from a member's own override
+    for ref in servers:
+        if ref.id == exclude_id:
+            continue
+        path = server_config_path(app_base, ref.id)
+        if not path.exists():
+            continue
+        try:
+            cfg = ServerConfigStore(path, server_lock_path(app_base, ref.id)).load().cfg
+        except Exception:
+            continue
+        if ref.server_dir:
+            cfg.server_dir = ref.server_dir
+        folder = effective_cluster_dir(cfg)
+        if folder is None:
+            continue
+        cid = cfg.cluster_id.strip()
+        info = found.setdefault(cid, ClusterInfo(cluster_id=cid))
+        # A shared folder a member chose beats the per-install default of another member.
+        is_custom = bool(cfg.cluster_custom_path_enable and cfg.cluster_dir_override.strip())
+        if info.cluster_dir is None or (is_custom and cid not in custom_dir):
+            info.cluster_dir = folder
+            if is_custom:
+                custom_dir.add(cid)
+        info.member_ids.append(ref.id)
+        info.member_names.append(f"{ref.display_name or ref.id} - {cfg.map_name}")
+        info.member_dirs.append(cfg.server_dir)
+        info.member_folders.append(folder)
+        info.mods.append(cfg.normalized_mods())
+    return sorted(found.values(), key=lambda c: c.cluster_id.lower())
+
+
+def cluster_config_warnings(cfg: AppConfig, backup_root: Optional[Path] = None) -> List[str]:
+    """Things about this profile's cluster settings that silently break transfers."""
+    warnings: List[str] = []
+    cid = cfg.cluster_id.strip()
+    override = cfg.cluster_dir_override.strip()
+
+    if cfg.cluster_enable and cfg.cluster_custom_path_enable and override:
+        folder = Path(override)
+        if not folder.is_absolute():
+            warnings.append(
+                "The cluster folder is a relative path; ARK resolves it from its own Binaries folder, the "
+                "manager from elsewhere. Use a full path such as D:\\ARK-Clusters\\<id>."
+            )
+        elif path_contains(folder, Path(cfg.server_dir)) or (backup_root is not None and path_contains(folder, backup_root)):
+            warnings.append(
+                "The cluster folder contains the server install or the backup folder. Give the cluster a "
+                "folder of its own; backups leave it out until then."
+            )
+
+    if cfg.cluster_enable and cid and not CLUSTER_ID_RE.match(cid):
+        warnings.append(
+            f"Cluster ID '{cid}' has characters other than letters, numbers, '-' and '_'; "
+            "ARK may not read it from the command line."
+        )
+    if cfg.cluster_enable and not cfg.cluster_custom_path_enable:
+        warnings.append(
+            "Cluster data is kept inside this install (Saved\\clusters), so only servers running from "
+            "this same install folder can see transfers. Use 'Set Up / Join Cluster...' to give the "
+            "cluster a shared folder."
+        )
+    if cfg.cluster_enable and cfg.cluster_custom_path_enable and " " in override:
+        warnings.append(
+            "The cluster folder path contains spaces; ARK cuts the path at the first space. "
+            "Pick a folder without spaces."
+        )
+    if not cfg.cluster_enable and cfg.cluster_custom_path_enable and override:
+        warnings.append("A cluster folder is set but 'Enable Cluster' is off, so it is not passed to the server.")
+    return warnings
 
 # =============================================================================
 # SINGLE PLAYER IMPORT
@@ -3675,8 +3885,14 @@ def resolve_backup_root(cfg: AppConfig, app_base: Path) -> Path:
     return Path(raw) if raw else (app_base / BACKUP_DIR_NAME)
 
 
-def backup_manifest(kind: str, server_id: str = "", server_name: str = "", map_name: str = "") -> Dict[str, Any]:
-    return {
+def backup_manifest(
+    kind: str,
+    server_id: str = "",
+    server_name: str = "",
+    map_name: str = "",
+    cluster_id: str = "",
+) -> Dict[str, Any]:
+    manifest: Dict[str, Any] = {
         "format": 1,
         "kind": kind,
         "server_id": server_id,
@@ -3684,6 +3900,9 @@ def backup_manifest(kind: str, server_id: str = "", server_name: str = "", map_n
         "map": map_name,
         "created": datetime.now().isoformat(timespec="seconds"),
     }
+    if cluster_id:
+        manifest["cluster_id"] = cluster_id
+    return manifest
 
 
 def read_backup_manifest(path: Path) -> Dict[str, Any]:
@@ -3702,23 +3921,48 @@ def _zip_server_tree(
     server_dir: Path,
     roots: List[Path],
     manifest: Optional[Dict[str, Any]],
+    extra_roots: Optional[List[Tuple[Path, str]]] = None,
+    skipped_out: Optional[List[str]] = None,
 ) -> int:
-    """Zip every file under roots, stored relative to the server folder, each file once."""
+    """Zip every file under roots, stored relative to the server folder, each file once.
+
+    extra_roots are folders outside the server folder, stored under their own arc prefix.
+    They may be shared with servers that are running, so a file that cannot be read there
+    is skipped (and listed in skipped_out) rather than failing the whole zip.
+    """
     base = server_dir.resolve()
+    own_zip = out_zip.resolve()
     seen: Set[str] = set()
+    sources = [(root.resolve(), None) for root in roots]
+    sources += [(root.resolve(), prefix) for root, prefix in (extra_roots or [])]
     with zipfile.ZipFile(out_zip, "w", compression=zipfile.ZIP_DEFLATED) as z:
-        for root in roots:
-            root = root.resolve()
+        for root, prefix in sources:
             if not root.exists():
                 continue
             for path in root.rglob("*"):
-                if not path.is_file():
+                if not path.is_file() or path.resolve() == own_zip:
                     continue
-                arc = path.relative_to(base).as_posix()
+                if prefix is None:
+                    arc = path.relative_to(base).as_posix()
+                else:
+                    arc = prefix + path.relative_to(root).as_posix()
                 if arc in seen:
                     continue
+                if prefix is None:
+                    z.write(path, arcname=arc)
+                else:
+                    # Read whole first: a read failing part way through z.write would still
+                    # leave a truncated entry in the zip.
+                    try:
+                        info = zipfile.ZipInfo.from_file(path, arcname=arc)
+                        data = path.read_bytes()
+                    except OSError as e:
+                        if skipped_out is not None:
+                            skipped_out.append(f"{path}: {e}")
+                        continue
+                    info.compress_type = zipfile.ZIP_DEFLATED
+                    z.writestr(info, data)
                 seen.add(arc)
-                z.write(path, arcname=arc)
         if manifest is not None:
             z.writestr(BACKUP_MANIFEST_NAME, json.dumps(manifest, indent=2))
     return len(seen)
@@ -3787,19 +4031,38 @@ def _write_server_zip(
     out_zip = target_dir / f"{prefix}{now_ts()}.zip"
 
     logger.info(f"Creating {label.lower()}: {out_zip}")
-    # The config folder lives inside Saved, so zipping Saved already covers it.
+    # The config folder lives inside Saved, so zipping Saved already covers it. So does
+    # cluster data on the per-install default; a shared cluster folder has to be added.
+    # Only full backups carry it: every map of the cluster zips the same folder, and
+    # auto-saves running on each map would multiply that many times over.
+    extra: List[Tuple[Path, str]] = []
+    cluster_dir = effective_cluster_dir(cfg)
+    if kind == BACKUP_KIND_FULL and cluster_dir is not None and cluster_dir.is_dir():
+        if path_contains(saved, cluster_dir):
+            pass  # already inside the Saved zip
+        elif path_contains(cluster_dir, server_dir) or path_contains(cluster_dir, target_dir):
+            # Zipping it would take in whole installs, other maps and the backups themselves.
+            logger.info(f"{label}: cluster folder {cluster_dir} contains the install or the backup folder; left out.")
+        else:
+            extra.append((cluster_dir, f"{CLUSTER_ZIP_PREFIX}{cfg.cluster_id.strip()}/"))
+            logger.info(f"Including cluster data: {cluster_dir}")
+    skipped: List[str] = []
     try:
         _zip_server_tree(
             out_zip,
             server_dir,
             [saved],
-            backup_manifest(kind, server_id, cfg.server_name, cfg.map_name),
+            backup_manifest(kind, server_id, cfg.server_name, cfg.map_name, cfg.cluster_id.strip() if cfg.cluster_enable else ""),
+            extra_roots=extra,
+            skipped_out=skipped,
         )
     except Exception:
         # A half-written zip would be listed as a backup and count towards retention.
         with contextlib.suppress(OSError):
             out_zip.unlink()
         raise
+    if skipped:
+        logger.info(f"{label}: skipped {len(skipped)} cluster file(s) in use by another server, e.g. {skipped[0]}")
     logger.info(f"{label} completed.")
 
     prune_server_backups(target_dir, server_id, retention, logger, prefix=prefix)
@@ -4202,9 +4465,20 @@ def find_server_processes(server_dir: Path) -> List[int]:
 # =============================================================================
 
 class TkTextHandler(logging.Handler):
+    """Log into the console widget without touching Tk from the logging thread.
+
+    emit() runs under the handler lock. Calling Tk there from a worker thread makes the
+    worker wait for the main thread while holding that lock, and the main thread then
+    deadlocks the moment it logs anything itself. So emit() only queues, and the main
+    thread drains the queue on a timer.
+    """
+
+    DRAIN_MS = 100
+
     def __init__(self, text: tk.Text):
         super().__init__()
         self._text = text
+        self._queue: "queue.SimpleQueue[str]" = queue.SimpleQueue()
         self._drop_predicate: Callable[[str], bool] = lambda _msg: False
 
     def set_drop_predicate(self, pred: Callable[[str], bool]) -> None:
@@ -4218,18 +4492,48 @@ class TkTextHandler(logging.Handler):
         except Exception:
             pass
 
-        msg = self.format(record)
-
-        def append() -> None:
-            self._text.configure(state="normal")
-            self._text.insert("end", msg + "\n")
-            self._text.see("end")
-            self._text.configure(state="disabled")
-
         try:
-            self._text.after(0, append)
+            self._queue.put(self.format(record))
         except Exception:
             pass
+
+    def start_pump(self) -> None:
+        """Call once from the main thread."""
+        try:
+            self._text.after(self.DRAIN_MS, self._drain)
+        except Exception:
+            pass
+
+    def _drain(self) -> None:
+        lines: List[str] = []
+        try:
+            while len(lines) < 2000:
+                lines.append(self._queue.get_nowait())
+        except queue.Empty:
+            pass
+        if lines:
+            try:
+                self._text.configure(state="normal")
+                try:
+                    self._text.insert("end", "\n".join(lines) + "\n")
+                except tk.TclError:
+                    # One line Tk refuses (say a lone surrogate from server output) must not
+                    # cost the rest of the batch.
+                    for line in lines:
+                        with contextlib.suppress(tk.TclError):
+                            self._text.insert("end", line + "\n")
+                self._text.see("end")
+            except Exception:
+                pass
+            finally:
+                # Whatever happened, never leave the console editable.
+                with contextlib.suppress(Exception):
+                    self._text.configure(state="disabled")
+        # Re-armed on its own: a failed insert must never stop the pump for good.
+        try:
+            self._text.after(self.DRAIN_MS, self._drain)
+        except Exception:
+            pass  # widget destroyed: the app is closing
 
 
 def build_logger(log_dir: Path, text_widget: tk.Text) -> Tuple[logging.Logger, TkTextHandler]:
@@ -4243,6 +4547,7 @@ def build_logger(log_dir: Path, text_widget: tk.Text) -> Tuple[logging.Logger, T
     h_gui = TkTextHandler(text_widget)
     h_gui.setLevel(LOG_LEVEL)
     h_gui.setFormatter(fmt)
+    h_gui.start_pump()
     logger.addHandler(h_gui)
 
     h_file = logging.FileHandler(log_dir / LOG_FILE_NAME, encoding="utf-8")
@@ -5188,6 +5493,440 @@ class BackupManagerDialog(tk.Toplevel):
         self.app.start_backup_restore(req)
 
 
+@dataclass
+class ClusterSetupRequest:
+    cluster_id: str
+    cluster_dir: Path
+    joining: bool = False
+    copy_from: Optional[Path] = None  # the old cluster ID's folder
+    copy_to: Optional[Path] = None  # the new cluster ID's folder
+    backup_first: bool = True
+
+
+@dataclass
+class ClusterSetupResult:
+    backup_zip: Optional[Path] = None
+    copied: int = 0
+    skipped: int = 0
+
+
+class TaskCancelled(Exception):
+    """The user declined a confirmation inside a task; logged, not shown as an error."""
+
+
+class ClusterSetupDialog(tk.Toplevel):
+    """Bring the active server into a cluster: start a new one with it, or join one another profile runs.
+
+    Only the profile's start options change. The world save stays where it is, and a running
+    server keeps running untouched until it is restarted.
+    """
+
+    def __init__(self, app: "ServerManagerApp") -> None:
+        super().__init__(app.root)
+        self.app = app
+        self.cfg = app.cfg
+        self.server_dir = Path(self.cfg.server_dir)
+        self.running = app._is_server_running()
+        self.clusters = discover_clusters(app.app_base, app.global_cfg.servers, exclude_id=app.active_server_id)
+        self.current_dir = effective_cluster_dir(self.cfg)
+        self.current_id = self.cfg.cluster_id.strip() if self.current_dir is not None else ""
+        self._used_ports = app._collect_used_ports(ignore_server_id=app.active_server_id)
+        # Other maps still reading the folder this server's data sits in (its override, or the
+        # install's Saved\clusters a sibling profile may run from): copying it would duplicate
+        # their players' uploads.
+        source_base = self.current_dir if self.current_dir is not None else server_cluster_data_dir(self.server_dir)
+        self._current_shared_with: List[str] = [
+            name
+            for c in self.clusters
+            for name, folder in zip(c.member_names, c.member_folders)
+            if same_path(folder, source_base)
+        ]
+
+        joined = next((c for c in self.clusters if c.cluster_id == self.current_id), None)
+        start_id = self.current_id or make_cluster_id(self.cfg.server_name)
+        if self.current_dir is not None and self.cfg.cluster_custom_path_enable:
+            start_dir = self.current_dir
+        else:
+            start_dir = default_cluster_dir(app.app_base, start_id, self.server_dir)
+
+        self.var_mode = tk.StringVar(master=self, value="join" if joined else "new")
+        self.var_cluster_id = tk.StringVar(master=self, value=start_id)
+        self.var_cluster_dir = tk.StringVar(master=self, value=str(start_dir))
+        self.var_join_pick = tk.StringVar(master=self, value=joined.label() if joined else "")
+        self.var_copy = tk.BooleanVar(master=self, value=True)
+        self.var_copy_label = tk.StringVar(master=self, value="")
+        self.var_backup = tk.BooleanVar(master=self, value=True)
+        self.var_warning = tk.StringVar(master=self, value="")
+        self.var_join_detail = tk.StringVar(master=self, value="")
+        # The folder follows the typed ID until the user picks one themselves.
+        self._dir_auto = not (self.current_dir is not None and self.cfg.cluster_custom_path_enable)
+
+        title = f"Cluster - {self.cfg.server_name}"
+        self.title(title)
+        self.transient(app.root)
+        self.configure(background=THEME_COLORS["bg"])
+        apply_initial_window_geometry(self, 820, 640)
+        apply_min_window_size(self, 720, 560)
+
+        self._build()
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
+        self.bind("<Escape>", lambda _e: self.destroy())
+
+        self.var_cluster_id.trace_add("write", lambda *_: self._on_id_changed())
+        self.var_cluster_dir.trace_add("write", lambda *_: self._refresh())
+        if joined:
+            self._on_join_picked()
+        self._sync_mode()
+
+        self.grab_set()
+        self.focus_set()
+
+    # -- layout ------------------------------------------------------------
+    def _build(self) -> None:
+        theme = THEME_COLORS
+        wrap = 740
+        root = ttk.Frame(self, padding=12)
+        root.grid(row=0, column=0, sticky="nsew")
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(0, weight=1)
+        root.columnconfigure(0, weight=1)
+
+        state = "running" if self.running else "stopped"
+        where = f"in cluster '{self.current_id}'" if self.current_id else "standalone (not in a cluster)"
+        ttk.Label(
+            root,
+            text=f"{self.cfg.server_name}  -  {self.cfg.map_name}  -  {state}, {where}",
+            font=("Segoe UI", 10, "bold"),
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Label(root, text=f"Install: {self.server_dir}", foreground=theme["muted"]).grid(row=1, column=0, sticky="w")
+
+        lf = ttk.LabelFrame(root, text="Cluster", padding=10)
+        lf.grid(row=2, column=0, sticky="ew", pady=(10, 0))
+        lf.columnconfigure(1, weight=1)
+
+        ttk.Radiobutton(
+            lf, text="Start a new cluster with this server", variable=self.var_mode, value="new",
+            command=self._sync_mode,
+        ).grid(row=0, column=0, columnspan=3, sticky="w")
+        self.rb_join = ttk.Radiobutton(
+            lf, text="Join a cluster another profile already runs", variable=self.var_mode, value="join",
+            command=self._sync_mode,
+        )
+        self.rb_join.grid(row=1, column=0, columnspan=3, sticky="w", pady=(4, 0))
+        if not self.clusters:
+            self.rb_join.configure(state="disabled", text="Join a cluster another profile already runs (none found)")
+
+        self.cmb_join = ttk.Combobox(
+            lf, textvariable=self.var_join_pick, state="readonly",
+            values=[c.label() for c in self.clusters],
+        )
+        self.cmb_join.grid(row=2, column=1, columnspan=2, sticky="ew", padx=6, pady=(4, 0))
+        self.cmb_join.bind("<<ComboboxSelected>>", lambda _e: self._on_join_picked())
+        ttk.Label(lf, textvariable=self.var_join_detail, foreground=theme["muted"], wraplength=wrap - 120, justify="left") \
+            .grid(row=3, column=1, columnspan=2, sticky="w", padx=6)
+
+        ttk.Label(lf, text="Cluster ID").grid(row=4, column=0, sticky="w", pady=(10, 0))
+        self.ent_id = ttk.Entry(lf, textvariable=self.var_cluster_id)
+        self.ent_id.grid(row=4, column=1, columnspan=2, sticky="ew", padx=6, pady=(10, 0))
+
+        ttk.Label(lf, text="Cluster data folder").grid(row=5, column=0, sticky="w", pady=(6, 0))
+        self.ent_dir = ttk.Entry(lf, textvariable=self.var_cluster_dir)
+        self.ent_dir.grid(row=5, column=1, sticky="ew", padx=6, pady=(6, 0))
+        self.ent_dir.bind("<KeyRelease>", lambda _e: self._mark_dir_manual())
+        self.btn_browse = ttk.Button(lf, text="Browse", command=self._browse_dir)
+        self.btn_browse.grid(row=5, column=2, pady=(6, 0))
+
+        ttk.Label(
+            lf,
+            text="Every server in a cluster must use the same ID and the same data folder; the folder holds "
+                 "uploaded survivors, dinos and items. Letters, numbers, '-' and '_' only. To join a cluster "
+                 "that is not listed (for example one run by another tool), choose 'Start a new cluster' and "
+                 "enter its ID and folder.",
+            foreground=theme["muted"], wraplength=wrap, justify="left",
+        ).grid(row=6, column=0, columnspan=3, sticky="w", pady=(6, 0))
+
+        lf_data = ttk.LabelFrame(root, text="Existing Data", padding=10)
+        lf_data.grid(row=3, column=0, sticky="ew", pady=(10, 0))
+        lf_data.columnconfigure(0, weight=1)
+        self.chk_copy = ttk.Checkbutton(lf_data, textvariable=self.var_copy_label, variable=self.var_copy)
+        self.chk_copy.grid(row=0, column=0, sticky="w")
+        ttk.Checkbutton(
+            lf_data,
+            text="Back up this server first (world, settings and any current cluster data)",
+            variable=self.var_backup,
+        ).grid(row=1, column=0, sticky="w", pady=(4, 0))
+
+        lf_info = ttk.LabelFrame(root, text="What Happens", padding=10)
+        lf_info.grid(row=4, column=0, sticky="ew", pady=(10, 0))
+        lf_info.columnconfigure(0, weight=1)
+        when = (
+            "The server is running now and keeps running unchanged; it joins the cluster when it restarts, "
+            "and you will be offered a safe restart right after."
+            if self.running else
+            "The change takes effect the next time the server starts."
+        )
+        ttk.Label(
+            lf_info,
+            text="Your world save, survivors, tribes and INI settings stay exactly where they are; only this "
+                 f"profile's cluster start options change. {when}\n\n"
+                 "To be safe, ask players to download anything they keep in an obelisk, transmitter or "
+                 "terminal before that restart, and upload it again afterwards.",
+            wraplength=wrap, justify="left",
+        ).grid(row=0, column=0, sticky="w")
+
+        ttk.Label(root, textvariable=self.var_warning, foreground=theme["warning"], wraplength=wrap, justify="left") \
+            .grid(row=5, column=0, sticky="w", pady=(10, 0))
+
+        buttons = ttk.Frame(root)
+        buttons.grid(row=6, column=0, sticky="ew", pady=(12, 0))
+        buttons.columnconfigure(0, weight=1)
+        if self.current_id:
+            ttk.Button(buttons, text="Leave Cluster", command=self._on_leave).grid(row=0, column=0, sticky="w")
+        self.btn_apply = ttk.Button(buttons, text="Create Cluster", command=self._on_apply)
+        self.btn_apply.grid(row=0, column=1, padx=(0, 8))
+        ttk.Button(buttons, text="Cancel", command=self.destroy).grid(row=0, column=2)
+
+    # -- state -------------------------------------------------------------
+    def _picked_cluster(self) -> Optional[ClusterInfo]:
+        idx = self.cmb_join.current()
+        if 0 <= idx < len(self.clusters):
+            return self.clusters[idx]
+        return None
+
+    def _sync_mode(self) -> None:
+        joining = self.var_mode.get() == "join"
+        self.cmb_join.configure(state="readonly" if joining else "disabled")
+        entry_state = "readonly" if joining else "normal"
+        self.ent_id.configure(state=entry_state)
+        self.ent_dir.configure(state=entry_state)
+        self.btn_browse.configure(state="disabled" if joining else "normal")
+        if joining:
+            if self._picked_cluster() is None and self.clusters:
+                self.cmb_join.current(0)
+            self._on_join_picked()
+        else:
+            self.var_join_detail.set("")
+        self._refresh()
+
+    def _on_join_picked(self) -> None:
+        info = self._picked_cluster()
+        if info is None:
+            return
+        self.var_cluster_id.set(info.cluster_id)
+        if info.cluster_dir is not None:
+            self.var_cluster_dir.set(str(info.cluster_dir))
+        self.var_join_detail.set("Servers: " + "; ".join(info.member_names))
+        self._refresh()
+
+    def _on_id_changed(self) -> None:
+        if self.var_mode.get() == "new" and self._dir_auto:
+            cid = self.var_cluster_id.get().strip()
+            if cid:
+                self.var_cluster_dir.set(str(default_cluster_dir(self.app.app_base, cid, self.server_dir)))
+        self._refresh()
+
+    def _mark_dir_manual(self) -> None:
+        self._dir_auto = False
+
+    def _browse_dir(self) -> None:
+        p = filedialog.askdirectory(title="Select the cluster data folder", parent=self, mustexist=False)
+        if p:
+            self._dir_auto = False
+            self.var_cluster_dir.set(str(Path(p)))
+
+    def _old_cluster_id(self, base: Path) -> str:
+        """The ID this server's existing transfer data is filed under, or "" if unknown."""
+        if self.current_id:
+            return self.current_id
+        # A standalone server can still hold data from an earlier cluster; only a single
+        # ID folder says unambiguously which one.
+        try:
+            subdirs = [p.name for p in base.iterdir() if p.is_dir()]
+        except OSError:
+            return ""
+        return subdirs[0] if len(subdirs) == 1 else ""
+
+    def _copy_plan(self, target: Optional[Path], new_id: str) -> Optional[Tuple[Path, Path]]:
+        """(source, destination) for transfer data that would otherwise be left behind.
+
+        ARK files uploads under <cluster folder>\\<cluster id>, so the data moves from the
+        old ID's folder to the new ID's folder; other IDs in the old folder stay put.
+        """
+        if target is None or not new_id:
+            return None
+        base = self.current_dir if self.current_dir is not None else server_cluster_data_dir(self.server_dir)
+        old_id = self._old_cluster_id(base)
+        if not old_id:
+            return None
+        src = cluster_id_data_dir(base, old_id)
+        dst = cluster_id_data_dir(target, new_id)
+        if not dir_has_files(src) or same_path(src, dst):
+            return None
+        return src, dst
+
+    def _target_dir(self) -> Optional[Path]:
+        raw = self.var_cluster_dir.get().strip()
+        return Path(raw) if raw else None
+
+    def _refresh(self) -> None:
+        joining = self.var_mode.get() == "join"
+        cid = self.var_cluster_id.get().strip()
+        target = self._target_dir()
+
+        plan = self._copy_plan(target, cid)
+        if plan is not None and self._current_shared_with:
+            self.var_copy.set(False)
+            self.var_copy_label.set(
+                f"Not copying {plan[0]}: it is still in use by " + "; ".join(self._current_shared_with)
+                + ", and copying it would duplicate their players' uploads."
+            )
+            self.chk_copy.configure(state="disabled")
+        elif plan is not None:
+            text = f"Bring this server's transfer data along: copy {plan[0]} to {plan[1]}"
+            if self.running:
+                # Copied while the server is stopped: anything players download meanwhile
+                # would otherwise exist in both folders.
+                text += " (the server is saved and stopped first, then started again)"
+            self.var_copy_label.set(text)
+            self.chk_copy.configure(state="normal")
+        else:
+            self.var_copy_label.set("No existing transfer data to bring along.")
+            self.chk_copy.configure(state="disabled")
+
+        self.btn_apply.configure(
+            text="Save" if self._unchanged(cid, target) else ("Join Cluster" if joining else "Create Cluster")
+        )
+
+        warnings: List[str] = []
+        if cid and not CLUSTER_ID_RE.match(cid):
+            warnings.append("The cluster ID may only use letters, numbers, '-' and '_'.")
+        if target is not None and " " in str(target):
+            warnings.append("The folder path contains spaces; ARK cuts the path at the first space. Pick another folder.")
+        if not joining:
+            clash = next((c for c in self.clusters if c.cluster_id == cid), None)
+            if clash is not None:
+                warnings.append(
+                    f"Another profile already uses the ID '{cid}' ({'; '.join(clash.member_names)}). "
+                    "Pick 'Join' to share its folder, or use a different ID."
+                )
+        info = self._picked_cluster() if joining else None
+        if info is not None:
+            def mod_set(csv: str) -> Set[str]:
+                return {m for m in csv.split(",") if m}
+            # Transfers only care which mods are present, not their order.
+            mine = mod_set(self.cfg.normalized_mods())
+            odd = [name for name, mods in zip(info.member_names, info.mods) if mod_set(mods) != mine]
+            if odd:
+                warnings.append(
+                    "Mods differ from: " + "; ".join(odd) + ". Modded dinos and items are lost on transfer "
+                    "to a map that lacks the mod, so keep the mod lists the same."
+                )
+            shared = [n for n, d in zip(info.member_names, info.member_dirs) if same_path(Path(d), self.server_dir)]
+            if shared:
+                warnings.append(
+                    "Runs from the same install folder as: " + "; ".join(shared) + ". Servers that run at "
+                    "the same time each need their own install folder."
+                )
+            if info.cluster_dir is not None and any(
+                same_path(info.cluster_dir, server_cluster_data_dir(Path(d))) for d in info.member_dirs
+            ):
+                warnings.append(
+                    "That cluster keeps its data inside one server's install. It works, but open that "
+                    "server's cluster setup and give the cluster its own folder when convenient."
+                )
+        clashes = sorted(self._used_ports & {int(self.cfg.port), int(self.cfg.query_port), int(self.cfg.rcon_port)})
+        if clashes:
+            warnings.append(
+                f"Port(s) {', '.join(map(str, clashes))} are also set on another profile; servers that run "
+                "at the same time need their own ports."
+            )
+        self.var_warning.set("\n".join(warnings))
+
+    def _unchanged(self, cid: str, target: Optional[Path]) -> bool:
+        """The profile already runs with exactly this ID and shared folder."""
+        return (
+            bool(self.current_id) and cid == self.current_id and target is not None
+            and self.current_dir is not None and same_path(target, self.current_dir)
+            and self.cfg.cluster_custom_path_enable
+        )
+
+    # -- actions -----------------------------------------------------------
+    def _on_apply(self) -> None:
+        cid = self.var_cluster_id.get().strip()
+        target = self._target_dir()
+        joining = self.var_mode.get() == "join"
+        # A listed cluster, or the one this profile already runs, keeps its ID whatever it
+        # contains; only IDs typed in new are held to the pattern.
+        if not cid or (not joining and cid != self.current_id and not CLUSTER_ID_RE.match(cid)):
+            messagebox.showerror("Cluster", "Enter a cluster ID using letters, numbers, '-' and '_' only.", parent=self)
+            return
+        if target is None:
+            messagebox.showerror("Cluster", "Choose a cluster data folder.", parent=self)
+            return
+        if self._unchanged(cid, target):
+            self.destroy()  # nothing to back up, copy or restart for
+            return
+        if not target.is_absolute():
+            messagebox.showerror("Cluster", "Use a full path for the cluster data folder, such as D:\\ARK-Clusters\\<id>.", parent=self)
+            return
+        if " " in str(target):
+            if joining:
+                info = self._picked_cluster()
+                who = "; ".join(info.member_names) if info is not None else "the other servers"
+                messagebox.showerror(
+                    "Cluster",
+                    f"That cluster's folder has a space in its path, which ARK cannot read. Move it to a folder "
+                    f"without spaces in the cluster setup of: {who}; then join it.",
+                    parent=self,
+                )
+            else:
+                messagebox.showerror("Cluster", "Pick a cluster data folder whose path has no spaces.", parent=self)
+            return
+        # The install's own Saved\clusters is allowed only to join a cluster that already lives there.
+        if path_contains(self.server_dir, target) and not same_path(target, server_cluster_data_dir(self.server_dir)):
+            messagebox.showerror(
+                "Cluster",
+                "Keep the cluster data folder outside the server install, so updates and restores never touch it.",
+                parent=self,
+            )
+            return
+        backup_root = resolve_backup_root(self.cfg, self.app.app_base)
+        if path_contains(target, self.server_dir) or path_contains(target, backup_root):
+            messagebox.showerror(
+                "Cluster",
+                "That folder contains the server install or the backup folder. Give the cluster a folder of its "
+                "own, for example D:\\ARK-Clusters\\<id>.",
+                parent=self,
+            )
+            return
+
+        plan = self._copy_plan(target, cid)
+        copy_ok = plan is not None and self.var_copy.get() and not self._current_shared_with
+        req = ClusterSetupRequest(
+            cluster_id=cid,
+            cluster_dir=target,
+            joining=joining,
+            copy_from=plan[0] if (copy_ok and plan) else None,
+            copy_to=plan[1] if (copy_ok and plan) else None,
+            backup_first=bool(self.var_backup.get()),
+        )
+        self.destroy()
+        self.app.start_cluster_setup(req)
+
+    def _on_leave(self) -> None:
+        if not messagebox.askyesno(
+            "Leave Cluster",
+            f"Take {self.cfg.server_name} out of cluster '{self.current_id}'?\n\n"
+            "Its world and the cluster folder are kept as they are; the server just stops sharing "
+            "transfers with the other maps. "
+            + ("It keeps running unchanged until it restarts." if self.running else "Applies on the next start."),
+            parent=self,
+        ):
+            return
+        self.destroy()
+        self.app.leave_cluster()
+
+
 class ServerManagerApp:
     def __init__(self, root: tk.Tk, app_base: Path):
         self.root = root
@@ -5298,6 +6037,8 @@ class ServerManagerApp:
         self._sync_map_mode()
         self._sync_backup_label_texts()
         self._hook_autosave()
+        self._sync_cluster_summary()
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self._refresh_buttons()
         self._sync_auto_update_scheduler()
         self._start_auto_save_scheduler()
@@ -5610,6 +6351,11 @@ class ServerManagerApp:
             messagebox.showwarning("Server running", "Stop the server before switching profiles.")
             self._refresh_server_selector(self.active_server_id)
             return
+        if self._is_busy():
+            # Tasks finish against the active profile; switching under them lands their result on another.
+            messagebox.showwarning("Task running", "Wait for the current task to finish before switching profiles.")
+            self._refresh_server_selector(self.active_server_id)
+            return
 
         try:
             self.cfg = self._collect_vars_to_cfg()
@@ -5633,6 +6379,13 @@ class ServerManagerApp:
         self._reset_ini_state()
 
     def _add_server_profile(self) -> None:
+        # Adding makes the new profile active; a running server or task would carry on under it.
+        if self._is_server_running():
+            messagebox.showwarning("New Server Profile", "Stop the server before adding a profile.")
+            return
+        if self._is_busy():
+            messagebox.showwarning("New Server Profile", "Wait for the current task to finish before adding a profile.")
+            return
         display_name = simpledialog.askstring("New Server Profile", "Display name:", initialvalue="New Server")
         if not display_name:
             return
@@ -5706,6 +6459,9 @@ class ServerManagerApp:
     def _remove_server_profile(self) -> None:
         if self._is_server_running():
             messagebox.showwarning("Remove Profile", "Stop the server before removing a profile.")
+            return
+        if self._is_busy():
+            messagebox.showwarning("Remove Profile", "Wait for the current task to finish before removing a profile.")
             return
         if len(self.global_cfg.servers) <= 1:
             messagebox.showwarning("Remove Profile", "At least one server profile must exist.")
@@ -5920,6 +6676,7 @@ class ServerManagerApp:
         self.var_cluster_dir_override = tk.StringVar(master=m)
         self.var_no_transfer_from_filtering = tk.BooleanVar(master=m)
         self.var_alt_save_directory_name = tk.StringVar(master=m)
+        self.var_cluster_summary = tk.StringVar(master=m, value="")
 
         self.var_dino_mode = tk.StringVar(master=m)
 
@@ -6285,22 +7042,48 @@ class ServerManagerApp:
         lf_cluster.grid(row=0, column=0, sticky="nsew", padx=5, pady=5)
         lf_cluster.columnconfigure(1, weight=1)
 
-        ttk.Checkbutton(lf_cluster, text="Enable Cluster", variable=self.var_cluster_enable).grid(row=0, column=0, sticky="w")
-        ttk.Label(lf_cluster, text="Cluster ID").grid(row=1, column=0, sticky="w", pady=(6, 0))
-        ttk.Entry(lf_cluster, textvariable=self.var_cluster_id).grid(row=1, column=1, sticky="ew", padx=6, pady=(6, 0))
+        self.lbl_cluster_summary = ttk.Label(
+            lf_cluster,
+            textvariable=self.var_cluster_summary,
+            foreground=theme["muted"],
+            wraplength=520,
+            justify="left",
+        )
+        self.lbl_cluster_summary.grid(row=0, column=0, columnspan=2, sticky="w")
+        self.btn_cluster_setup = ttk.Button(
+            lf_cluster,
+            text="Set Up / Join Cluster...",
+            command=self.open_cluster_setup,
+        )
+        self.btn_cluster_setup.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        HoverTooltip(
+            self.btn_cluster_setup,
+            "Turn this server into the first map of a new cluster, or join a cluster another\n"
+            "profile runs. Sets the cluster ID and a shared data folder, can bring existing\n"
+            "transfer data along, and leaves the world save untouched.",
+        )
+        ttk.Separator(lf_cluster).grid(row=2, column=0, columnspan=2, sticky="ew", pady=(10, 4))
+        ttk.Label(lf_cluster, text="Manual settings", foreground=theme["muted"]).grid(row=3, column=0, sticky="w")
 
-        ttk.Checkbutton(lf_cluster, text="NoTransferFromFiltering", variable=self.var_no_transfer_from_filtering).grid(row=2, column=0, sticky="w", pady=(8, 0))
+        ttk.Checkbutton(
+            lf_cluster, text="Enable Cluster", variable=self.var_cluster_enable,
+            command=self._on_cluster_enable_toggled,
+        ).grid(row=4, column=0, sticky="w", pady=(4, 0))
+        ttk.Label(lf_cluster, text="Cluster ID").grid(row=5, column=0, sticky="w", pady=(6, 0))
+        ttk.Entry(lf_cluster, textvariable=self.var_cluster_id).grid(row=5, column=1, sticky="ew", padx=6, pady=(6, 0))
 
-        ttk.Checkbutton(lf_cluster, text="Enable Cluster Custom Path", variable=self.var_cluster_custom_path_enable).grid(row=3, column=0, sticky="w", pady=(8, 0))
-        ttk.Label(lf_cluster, text="ClusterDirOverride Path").grid(row=4, column=0, sticky="w", pady=(6, 0))
+        ttk.Checkbutton(lf_cluster, text="NoTransferFromFiltering", variable=self.var_no_transfer_from_filtering).grid(row=6, column=0, sticky="w", pady=(8, 0))
+
+        ttk.Checkbutton(lf_cluster, text="Enable Cluster Custom Path", variable=self.var_cluster_custom_path_enable).grid(row=7, column=0, sticky="w", pady=(8, 0))
+        ttk.Label(lf_cluster, text="ClusterDirOverride Path").grid(row=8, column=0, sticky="w", pady=(6, 0))
         path_row = ttk.Frame(lf_cluster)
-        path_row.grid(row=4, column=1, sticky="ew", padx=6, pady=(6, 0))
+        path_row.grid(row=8, column=1, sticky="ew", padx=6, pady=(6, 0))
         path_row.columnconfigure(0, weight=1)
         ttk.Entry(path_row, textvariable=self.var_cluster_dir_override).grid(row=0, column=0, sticky="ew")
         ttk.Button(path_row, text="Browse", command=self._browse_cluster_dir).grid(row=0, column=1, padx=(6, 0))
 
-        ttk.Label(lf_cluster, text="AltSaveDirectoryName (optional, per instance)").grid(row=5, column=0, sticky="w", pady=(8, 0))
-        ttk.Entry(lf_cluster, textvariable=self.var_alt_save_directory_name).grid(row=5, column=1, sticky="ew", padx=6, pady=(8, 0))
+        ttk.Label(lf_cluster, text="AltSaveDirectoryName (optional, per instance)").grid(row=9, column=0, sticky="w", pady=(8, 0))
+        ttk.Entry(lf_cluster, textvariable=self.var_alt_save_directory_name).grid(row=9, column=1, sticky="ew", padx=6, pady=(8, 0))
 
         # moved: ServerPlatform
         lf_platform = ttk.LabelFrame(self.tab_adv, text="Platform / Crossplay", padding=10)
@@ -6570,6 +7353,7 @@ class ServerManagerApp:
             ("Structures", INI_SETTINGS_STRUCTURES, None, None),
             ("Stack Size Overrides", INI_SETTINGS_STACK_SIZE, None, None),
             ("Server Options", INI_SETTINGS_SERVER_OPTIONS, None, None),
+            ("Cluster & Transfers", INI_SETTINGS_CLUSTER_TRANSFERS, None, None),
         ]
 
         for tab_label, settings_list, stats_list, spawn_keys in visual_sections:
@@ -6984,6 +7768,14 @@ class ServerManagerApp:
                 v.trace_add("write", lambda *_: self._sync_auto_save_hint())
             except Exception:
                 pass
+        for v in (
+            self.var_server_dir, self.var_cluster_enable, self.var_cluster_id,
+            self.var_cluster_custom_path_enable, self.var_cluster_dir_override,
+        ):
+            try:
+                v.trace_add("write", lambda *_: self._sync_cluster_summary())
+            except Exception:
+                pass
 
     def _schedule_autosave(self) -> None:
         if self._autosave_after_id:
@@ -7040,6 +7832,7 @@ class ServerManagerApp:
         self.btn_backup_now.configure(state=("disabled" if busy else "normal"))
         self.btn_sp_import.configure(state=("disabled" if busy or running else "normal"))
         self.btn_manage_backups.configure(state=("disabled" if busy else "normal"))
+        self.btn_cluster_setup.configure(state=("disabled" if busy else "normal"))
 
         self.btn_rcon_send.configure(state=("disabled" if busy else "normal"))
         self.btn_auto_update_test.configure(state=("disabled" if busy else "normal"))
@@ -7073,6 +7866,8 @@ class ServerManagerApp:
                 self.logger.info(f"=== {name} started ===")
                 fn()
                 self.logger.info(f"=== {name} completed ===")
+            except TaskCancelled as e:
+                self.logger.info(f"=== {name} cancelled: {e} ===")
             except Exception as e:
                 err = str(e)
                 self.logger.error(f"{name} failed: {err}")
@@ -7239,7 +8034,9 @@ class ServerManagerApp:
 
         self._run_task("Update / Validate", job)
 
-    def _update_server_install(self, *, validate: Optional[bool] = None) -> None:
+    def _update_server_install(self, *, validate: Optional[bool] = None, check_install: bool = True) -> None:
+        if check_install:
+            self._ensure_install_free(Path(self.cfg.server_dir), confirm=False)
         steamcmd_exe = ensure_steamcmd(self.global_cfg.steamcmd_dir, self.logger)
         if validate is None:
             validate = bool(self.cfg.validate_on_update)
@@ -7288,13 +8085,15 @@ class ServerManagerApp:
             time.sleep(AUTO_RESTART_DELAY_SEC)
             try:
                 self.logger.info("Auto-restarting server...")
-                self._start_server_inline()
+                # Unattended, so no shared-install prompt: a sibling on this install was
+                # already accepted when this server first started.
+                self._start_server_inline(check_install=False)
             except Exception as e:
-                self.logger.info(f"Auto-restart failed: {type(e).__name__}: {e}")
+                self.logger.error(f"Auto-restart failed, the server stays down: {type(e).__name__}: {e}")
 
         threading.Thread(target=job, daemon=True).start()
 
-    def start_server(self) -> None:
+    def start_server(self) -> bool:
         def job() -> None:
             self.cfg = self._collect_vars_to_cfg()
             self._save_active_server_config(self.cfg)
@@ -7302,7 +8101,9 @@ class ServerManagerApp:
             server_dir = Path(self.cfg.server_dir)
             if self.cfg.update_on_startup:
                 self.logger.info("Update on startup enabled -> updating server install.")
-                self._update_server_install(validate=None)
+                self._update_server_install(validate=None)  # refuses an install a server runs from
+            else:
+                self._ensure_install_free(server_dir, confirm=True)
 
             exe = ark_server_exe(server_dir)
             if not exe.exists():
@@ -7311,6 +8112,7 @@ class ServerManagerApp:
             if self.cfg.enable_rcon and not (self.cfg.admin_password or "").strip():
                 raise RuntimeError("Admin/RCON password is empty. Set 'Admin Password (RCON/Admin)' before starting.")
 
+            self._prepare_cluster_for_start(self.cfg)
             self._stage_required_configs_for_start()
             apply_staging_to_server(self.app_base, self.active_server_id, server_dir, self.logger)
 
@@ -7344,7 +8146,7 @@ class ServerManagerApp:
                 self._discord_start_notifications(pid)
             self._ui(self._refresh_buttons)
 
-        self._run_task("Start Server", job)
+        return self._run_task("Start Server", job)
 
     def _server_log_reader(self) -> None:
         with self._server_proc_lock:
@@ -7533,6 +8335,10 @@ class ServerManagerApp:
             self.cfg = self._collect_vars_to_cfg()
             self._save_active_server_config(self.cfg)
 
+            # Before stopping our own server: if another server holds the install, the update
+            # cannot run, and stopping first would only leave this map down until someone looks.
+            self._ensure_install_free(Path(self.cfg.server_dir), confirm=False)
+
             if self._is_server_running():
                 self.logger.info("Server running -> performing safe stop before update.")
                 self._mark_stop_requested()
@@ -7540,12 +8346,29 @@ class ServerManagerApp:
                 self._stop_server_impl(inline=True)
                 self._discord_stop_notifications(requested=True)
 
-            self._update_server_install(validate=None)
+            self._update_server_install(validate=None, check_install=False)
 
             self.logger.info("Restarting server after update...")
-            self._start_server_inline()
+            self._start_server_inline(check_install=False)
 
         self._run_task("Update & Restart", job)
+
+    def restart_server_safe(self) -> bool:
+        """Save, stop and start again with the current profile settings. False if another task runs."""
+        def job() -> None:
+            self.cfg = self._collect_vars_to_cfg()
+            self._save_active_server_config(self.cfg)
+            # Asked while this server still runs, so declining leaves it up.
+            self._ensure_install_free(Path(self.cfg.server_dir), confirm=True)
+            if self._is_server_running():
+                self.logger.info("Restart: safe stop first.")
+                self._mark_stop_requested()
+                self._discord_request_stop()
+                self._stop_server_impl(inline=True)
+                self._discord_stop_notifications(requested=True)
+            self._start_server_inline(check_install=False)
+
+        return self._run_task("Restart Server", job)
 
     def auto_update_test(self) -> None:
         if self._is_busy():
@@ -7554,7 +8377,7 @@ class ServerManagerApp:
         self.logger.info("Auto update test triggered -> Update / Restart (Safe).")
         self.update_and_restart_safe()
 
-    def _start_server_inline(self) -> None:
+    def _start_server_inline(self, *, check_install: bool = True) -> None:
         server_dir = Path(self.cfg.server_dir)
         exe = ark_server_exe(server_dir)
         if not exe.exists():
@@ -7563,6 +8386,9 @@ class ServerManagerApp:
         if self.cfg.enable_rcon and not (self.cfg.admin_password or "").strip():
             raise RuntimeError("Admin/RCON password is empty. Set 'Admin Password (RCON/Admin)' before starting.")
 
+        if check_install:
+            self._ensure_install_free(server_dir, confirm=True)
+        self._prepare_cluster_for_start(self.cfg)
         self._stage_required_configs_for_start()
         apply_staging_to_server(self.app_base, self.active_server_id, server_dir, self.logger)
 
@@ -7848,6 +8674,296 @@ class ServerManagerApp:
 
         self._set_status(f"Backup restored ({self._status_timestamp()})")
         messagebox.showinfo("Restore Backup", "\n\n".join(lines))
+
+    # ---------------------------------------------------------------------
+    # Cluster
+    # ---------------------------------------------------------------------
+    def open_cluster_setup(self) -> None:
+        if self._is_busy():
+            messagebox.showwarning("Cluster", "Another task is running. Try again when it finishes.")
+            return
+        try:
+            self.cfg = self._collect_vars_to_cfg()
+            self._save_active_server_config(self.cfg)
+        except Exception as e:
+            messagebox.showerror("Cluster", f"Current configuration is invalid: {e}")
+            return
+        ClusterSetupDialog(self)
+
+    def start_cluster_setup(self, req: ClusterSetupRequest) -> None:
+        cfg = self.cfg
+        server_id = self.active_server_id
+        app_base = self.app_base
+
+        def job() -> None:
+            result = ClusterSetupResult()
+            stopped = False
+            if req.copy_from is not None and self._is_server_running():
+                # Copy only while nothing serves the old folder: a download made after the copy
+                # would leave the same dino or item in both folders.
+                self.logger.info("Cluster setup: stopping the server so its transfer data is copied while unused.")
+                self._mark_stop_requested()
+                self._discord_request_stop()
+                self._stop_server_impl(inline=True)
+                self._discord_stop_notifications(requested=True)
+                stopped = True
+
+            # A stop with backup on stop has just zipped everything; one backup is enough.
+            if req.backup_first and not (stopped and cfg.backup_on_stop):
+                if self._is_server_running() and cfg.enable_rcon:
+                    try:
+                        self.logger.info("Cluster setup: RCON SaveWorld before the backup")
+                        self._rcon_try("SaveWorld", timeout=30.0)
+                        time.sleep(AUTO_SAVE_SETTLE_SEC)
+                    except Exception as e:
+                        self.logger.info(f"Cluster setup: SaveWorld failed ({e}); backing up the last save on disk.")
+                result.backup_zip = backup_server(cfg, app_base, self.logger, server_id)
+
+            ensure_dir(req.cluster_dir)
+            if req.copy_from is not None and req.copy_to is not None:
+                result.copied, result.skipped = copy_cluster_data(req.copy_from, req.copy_to, self.logger)
+            self._ui(lambda: self._finish_cluster_setup(req, result, server_id, stopped))
+
+        if not self._run_task("Cluster Setup", job):
+            messagebox.showwarning("Cluster", "Another task is running. Try again when it finishes.")
+
+    def _cluster_vars(self) -> Tuple[bool, str, bool, str]:
+        return (
+            bool(self.var_cluster_enable.get()),
+            self.var_cluster_id.get(),
+            bool(self.var_cluster_custom_path_enable.get()),
+            self.var_cluster_dir_override.get(),
+        )
+
+    def _set_cluster_vars(self, values: Tuple[bool, str, bool, str]) -> None:
+        enable, cid, custom, folder = values
+        self.var_cluster_enable.set(enable)
+        self.var_cluster_id.set(cid)
+        self.var_cluster_custom_path_enable.set(custom)
+        self.var_cluster_dir_override.set(folder)
+
+    def _save_cluster_vars(self, values: Tuple[bool, str, bool, str], title: str) -> bool:
+        """Apply cluster fields and save; on failure put the old ones back, so autosave cannot persist them later."""
+        before = self._cluster_vars()
+        self._set_cluster_vars(values)
+        try:
+            self.cfg = self._collect_vars_to_cfg()
+            self._save_active_server_config(self.cfg)
+        except Exception as e:
+            self._set_cluster_vars(before)
+            messagebox.showerror(title, f"Saving the cluster settings failed, nothing was changed: {e}")
+            return False
+        return True
+
+    def _finish_cluster_setup(
+        self,
+        req: ClusterSetupRequest,
+        result: ClusterSetupResult,
+        server_id: str,
+        stopped: bool = False,
+    ) -> None:
+        if server_id != self.active_server_id:
+            messagebox.showerror(
+                "Cluster",
+                "The active profile changed while the cluster setup ran, so nothing was saved. "
+                "Switch back and run Set Up / Join Cluster again.",
+            )
+            return
+        if not self._save_cluster_vars((True, req.cluster_id, True, str(req.cluster_dir)), "Cluster"):
+            if stopped:
+                messagebox.showwarning("Cluster", "The server was stopped for the copy; start it again from the Server tab.")
+            return
+
+        verb = "joined" if req.joining else "now runs in"
+        self.logger.info(f"[CLUSTER] {self.cfg.server_name} {verb} cluster '{req.cluster_id}' (data folder {req.cluster_dir}).")
+        self._sync_cluster_summary()
+        self._set_status(f"Cluster '{req.cluster_id}' set ({self._status_timestamp()})")
+
+        lines = [f"{self.cfg.server_name} {verb} cluster '{req.cluster_id}'.", f"Cluster data folder:\n{req.cluster_dir}"]
+        if result.backup_zip is not None:
+            lines.append(f"Backup made first:\n{result.backup_zip}")
+        if req.copy_from is not None:
+            line = f"Copied {result.copied} existing transfer file(s) from {req.copy_from} to {req.copy_to}."
+            if result.skipped:
+                line += f" {result.skipped} file(s) were already there and were kept."
+            lines.append(line)
+        if not req.joining:
+            lines.append(
+                "To add another map, create a profile for it with its own install folder, then use "
+                "'Set Up / Join Cluster...' on it and pick 'Join'."
+            )
+
+        if stopped:
+            lines.append("The server was stopped for the copy and is starting again now, inside the cluster.")
+            messagebox.showinfo("Cluster", "\n\n".join(lines))
+            if not self.start_server():
+                messagebox.showwarning("Cluster", "Another task is running. Start the server when it finishes.")
+        elif self._is_server_running():
+            lines.append(
+                "The server is still running with its old start options. Restart it now (safe: save, stop, "
+                "start) to bring it into the cluster? Players are disconnected for the restart."
+            )
+            if messagebox.askyesno("Cluster", "\n\n".join(lines)):
+                if not self.restart_server_safe():
+                    messagebox.showwarning("Cluster", "Another task is running. Restart the server when it finishes.")
+        else:
+            lines.append("Takes effect the next time you start the server.")
+            messagebox.showinfo("Cluster", "\n\n".join(lines))
+
+    def leave_cluster(self) -> None:
+        _enable, old_id, _custom, folder = self._cluster_vars()
+        # The ID and folder stay filled in, so joining again is one tick away.
+        if not self._save_cluster_vars((False, old_id, False, folder), "Leave Cluster"):
+            return
+        old_id = old_id.strip()
+        self.logger.info(f"[CLUSTER] {self.cfg.server_name} left cluster '{old_id}'.")
+        self._sync_cluster_summary()
+
+        msg = f"{self.cfg.server_name} is no longer in cluster '{old_id}'."
+        if self._is_server_running():
+            if messagebox.askyesno("Leave Cluster", msg + "\n\nRestart the server now (safe) to apply it?"):
+                if not self.restart_server_safe():
+                    messagebox.showwarning("Leave Cluster", "Another task is running. Restart the server when it finishes.")
+        else:
+            messagebox.showinfo("Leave Cluster", msg + " Applies on the next start.")
+
+    def _on_cluster_enable_toggled(self) -> None:
+        """Ticking 'Enable Cluster' by hand fills in an ID and a shared folder, so transfers work."""
+        if not self.var_cluster_enable.get():
+            return
+        if not self.var_cluster_id.get().strip():
+            self.var_cluster_id.set(make_cluster_id(self.var_server_name.get()))
+        if not self.var_cluster_custom_path_enable.get() and not self.var_cluster_dir_override.get().strip():
+            server_dir = Path(self.var_server_dir.get().strip() or DEFAULT_SERVER_DIR)
+            # Uploads already kept inside the install would vanish from the players' view if the
+            # folder silently moved; leave it there and let the summary point at the setup.
+            if dir_has_files(server_cluster_data_dir(server_dir)):
+                return
+            cid = self.var_cluster_id.get().strip()
+            self.var_cluster_custom_path_enable.set(True)
+            self.var_cluster_dir_override.set(str(default_cluster_dir(self.app_base, cid, server_dir)))
+
+    def _sync_cluster_summary(self) -> None:
+        try:
+            cfg = AppConfig(
+                server_dir=self.var_server_dir.get().strip(),
+                backup_dir=self.var_backup_dir.get().strip(),
+                cluster_enable=bool(self.var_cluster_enable.get()),
+                cluster_id=self.var_cluster_id.get().strip(),
+                cluster_custom_path_enable=bool(self.var_cluster_custom_path_enable.get()),
+                cluster_dir_override=self.var_cluster_dir_override.get().strip(),
+            )
+            folder = effective_cluster_dir(cfg)
+            if folder is None:
+                text = ("Standalone server, not in a cluster. Use 'Set Up / Join Cluster...' to start a "
+                        "cluster with this server or to join one.")
+            else:
+                text = f"In cluster '{cfg.cluster_id}'. Cluster data folder: {folder}"
+            warnings = cluster_config_warnings(cfg, resolve_backup_root(cfg, self.app_base))
+            if warnings:
+                text += "\n" + "\n".join(f"Warning: {w}" for w in warnings)
+            self.var_cluster_summary.set(text)
+            self.lbl_cluster_summary.configure(
+                foreground=THEME_COLORS["warning"] if warnings else THEME_COLORS["muted"]
+            )
+        except Exception:
+            pass
+
+    def _ask_on_ui(self, title: str, message: str) -> bool:
+        """Yes/No asked on the Tk thread; callable from a worker, which waits for the answer."""
+        if threading.current_thread() is threading.main_thread():
+            return bool(messagebox.askyesno(title, message, icon="warning"))
+        done = threading.Event()
+        answer = [False]
+
+        def ask() -> None:
+            try:
+                answer[0] = bool(messagebox.askyesno(title, message, icon="warning"))
+            finally:
+                done.set()
+
+        self._ui(ask)
+        done.wait()
+        return answer[0]
+
+    def _ensure_install_free(self, server_dir: Path, *, confirm: bool) -> None:
+        """Check no other server runs from this install (this profile's own server is ignored).
+
+        Starting a second one is allowed after a warning: profiles may share an install on
+        purpose, at the cost of sharing its INIs. Updating never is: SteamCMD cannot replace
+        files a running server holds open. confirm=False refuses outright.
+        """
+        own: Optional[int] = None
+        with self._server_proc_lock:
+            if self._server_proc is not None and self._server_proc.poll() is None:
+                own = self._server_proc.pid
+        pids = [p for p in find_server_processes(server_dir) if p != own]
+        if not pids:
+            return
+        where = (
+            f"An ARK server is already running from {server_dir} (PID {', '.join(map(str, pids))}). "
+            "Another profile or another manager window started it."
+        )
+        if not confirm:
+            raise RuntimeError(
+                where + " SteamCMD cannot update an install while a server runs from it; stop that server first."
+            )
+        if not self._ask_on_ui(
+            "Shared install folder",
+            where + "\n\nBoth servers would share this install's GameUserSettings.ini and Game.ini: starting "
+            "this one writes this profile's settings over them, and each server writes its own back when it "
+            "stops. Giving each map its own install folder avoids that.\n\nStart anyway?",
+        ):
+            raise TaskCancelled("Start cancelled: another server is running from this install folder.")
+
+    def _prepare_cluster_for_start(self, cfg: AppConfig) -> None:
+        for w in cluster_config_warnings(cfg, resolve_backup_root(cfg, self.app_base)):
+            self.logger.info(f"[CLUSTER] Warning: {w}")
+        folder = effective_cluster_dir(cfg)
+        if folder is not None:
+            if cfg.cluster_custom_path_enable:
+                ensure_dir(folder)
+            self.logger.info(f"[CLUSTER] Cluster '{cfg.cluster_id.strip()}', data folder {folder}")
+
+    def _on_close(self) -> None:
+        if self._is_server_running():
+            choice = messagebox.askyesnocancel(
+                "Server running",
+                f"{self.cfg.server_name} is still running.\n\n"
+                "Yes: stop it safely (save, then shut down) and close.\n\n"
+                "No: close the manager and leave the server running. Reopening the manager does not "
+                "reconnect to it yet; stop it later with DoExit from the RCON tab.\n\n"
+                "Cancel: keep the manager open.",
+                icon="warning",
+            )
+            if choice is None:
+                return
+            if choice is True:
+                self._stop_and_close()
+                return
+        # Workers are daemon threads: closing kills them mid-write (INIs, zips, SteamCMD, a
+        # restart), whether or not the server is left running.
+        if self._is_busy() and not messagebox.askyesno(
+            "Task running",
+            "A task is still running (see the console). Closing now can leave it half done, for example "
+            "a partly written backup or settings file, or a server started but no longer tracked.\n\n"
+            "Close anyway?",
+            icon="warning",
+            default="no",
+        ):
+            return
+        self.root.destroy()
+
+    def _stop_and_close(self) -> None:
+        def job() -> None:
+            self._mark_stop_requested()
+            self._discord_request_stop()
+            self._stop_server_impl(inline=True)
+            self._discord_stop_notifications(requested=True)
+            self._ui(self.root.destroy)
+
+        if not self._run_task("Stop Server", job):
+            messagebox.showwarning("Server running", "Another task is running. Close again when it finishes.")
 
     # ---------------------------------------------------------------------
     # Auto-save

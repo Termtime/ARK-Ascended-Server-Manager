@@ -76,6 +76,21 @@ This manager separates *edit time* and *runtime*:
 
 ![INI Editor](docs/img/ASA_Server_Manager_Preview_5.png)
 
+### Clusters
+- **Set Up / Join Cluster...** (Advanced Start Args tab) turns an existing standalone server into the first map of a new cluster, or joins it to a cluster another profile already runs
+- Sets the cluster ID and gives the cluster one shared data folder (by default `<manager storage>\clusters\<id>`), so transfers work across separate installs; without a shared folder each install keeps uploads in its own `Saved\clusters` and other maps never see them
+- The world save, survivors, tribes and INI settings are not moved or changed; a running server keeps running and is offered a safe restart to join
+- Optionally copies transfer data the server already has into the cluster folder (existing files there are kept) and backs the server up first
+- Joining warns when mod lists differ, when two maps share one install folder, or when ports clash with another profile
+- **Leave Cluster** takes a server back out; its world and the cluster folder are kept
+- Ticking *Enable Cluster* by hand fills in an ID and a shared folder; the tab shows the cluster status and warns about settings that silently break transfers (no shared folder, spaces in the path)
+- Full backups (on stop and manual) include the shared cluster folder (`ClusterData/<id>/` in the zip); auto-saves leave it out, and restores never write it back, since every map in the cluster shares it
+- INI Editor **Cluster & Transfers** tab: upload/download restrictions, upload slots and expiry
+- Copied transfer data moves from the old cluster ID's folder to the new one's, so it shows up under the new ID; if the server is running it is saved and stopped for the copy, then started again, so nothing can be downloaded twice. A folder other maps still use is never copied
+- Starting asks first when another server already runs from the same install folder (they would share its INIs); updating refuses, since SteamCMD cannot replace files a running server holds, and Update & Restart checks this before stopping anything
+- Cluster folders must be full paths outside the install, and may not contain the install or the backup folder
+- *Custom Path* only applies while *Enable Cluster* is on: a profile that had a custom path with the cluster off no longer passes `-ClusterDirOverride`
+
 ### Advanced start arguments (grouped)
 - Cluster configuration
 - Dino modes (mutually exclusive)
@@ -165,8 +180,9 @@ Get-FileHash -Algorithm SHA256 ".\ARK-ASA-Manager.exe"
 
 ### Multi-instance hosting
 - Use **unique ports per instance** (game/query/RCON)
+- Give each map that runs at the same time **its own install folder**: the INI files live inside the install, so two servers on one install overwrite each other's settings
 - Use `AltSaveDirectoryName` per instance to keep saves separated
-- For clusters: keep **cluster IDs consistent** across instances that should transfer
+- For clusters: use **Set Up / Join Cluster...** on each map so they share one cluster ID and one cluster data folder
 
 > Rule of thumb: treat each instance as a separate “service unit” (ports + save path + config), even if they share the same host.
 

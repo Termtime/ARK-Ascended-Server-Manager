@@ -286,6 +286,24 @@ INI_SETTINGS_SERVER_OPTIONS: list = [
     ("game", _GM, "MaxFallSpeedMultiplier", "Max Fall Speed", "Scales falling speed threshold for fall damage.", "float", "1.0", 0.01, 100.0, 0.5),
 ]
 
+# Uploads and downloads through obelisks, transmitters and terminals. These matter most on
+# a cluster, but also control what a standalone server lets players bring in from elsewhere.
+INI_SETTINGS_CLUSTER_TRANSFERS: list = [
+    ("gus", _SS, "PreventDownloadSurvivors", "Prevent Survivor Downloads", "Block downloading survivors from other servers in the cluster.", "bool", "False", 0, 1),
+    ("gus", _SS, "PreventDownloadItems", "Prevent Item Downloads", "Block downloading items and resources.", "bool", "False", 0, 1),
+    ("gus", _SS, "PreventDownloadDinos", "Prevent Dino Downloads", "Block downloading tamed creatures.", "bool", "False", 0, 1),
+    ("gus", _SS, "PreventUploadSurvivors", "Prevent Survivor Uploads", "Block uploading survivors, so they cannot leave this map.", "bool", "False", 0, 1),
+    ("gus", _SS, "PreventUploadItems", "Prevent Item Uploads", "Block uploading items and resources.", "bool", "False", 0, 1),
+    ("gus", _SS, "PreventUploadDinos", "Prevent Dino Uploads", "Block uploading tamed creatures.", "bool", "False", 0, 1),
+    ("gus", _SS, "noTributeDownloads", "No Downloads At All", "Block every download, including from servers in the same cluster.", "bool", "False", 0, 1),
+    ("gus", _SS, "MaxTributeDinos", "Max Uploaded Dinos", "Upload slots for tamed creatures per survivor.", "int", "20", 0, 500, 5),
+    ("gus", _SS, "MaxTributeItems", "Max Uploaded Items", "Upload slots for items and resources per survivor.", "int", "50", 0, 500, 5),
+    ("gus", _SS, "TributeItemExpirationSeconds", "Uploaded Item Lifetime (s)", "Seconds an uploaded item is kept before it expires.", "int", "86400", 0, 2592000, 3600),
+    ("gus", _SS, "TributeDinoExpirationSeconds", "Uploaded Dino Lifetime (s)", "Seconds an uploaded creature is kept before it expires.", "int", "86400", 0, 2592000, 3600),
+    ("gus", _SS, "MinimumDinoReuploadInterval", "Dino Re-upload Cooldown (s)", "Seconds a downloaded creature must wait before it can be uploaded again.", "float", "0.0", 0.0, 86400.0, 60.0),
+    ("gus", _SS, "CrossARKAllowForeignDinoDownloads", "Allow Foreign Dino Downloads", "Allow downloading creatures that are not native to this map (ASE setting; ASA support unconfirmed).", "bool", "False", 0, 1),
+]
+
 # Spawn customization keys – complex multi-value entries edited via text areas.
 # Each tuple: (ini_file, section, key, title, description)
 _SPAWN_ENTRY_KEYS: list = [
