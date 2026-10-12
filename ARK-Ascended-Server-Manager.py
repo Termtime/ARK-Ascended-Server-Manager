@@ -119,6 +119,8 @@ LOG_ROTATE_KEEP = 3
 # How long an Update & Restart waits, with its server still up, for another server's
 # SteamCMD run to finish before it gives up for this time.
 UPDATE_SLOT_WAIT_SEC = 3 * 60 * 60
+# How long a cluster-wide start waits for one map to load (RCON answers) before the next.
+READY_WAIT_SEC = 15 * 60
 STAGING_DIR_NAME = "staging"
 BASELINE_DIR_NAME = "baseline"
 BACKUP_DIR_NAME = "backups"
@@ -1336,19 +1338,25 @@ class ServerConfigStore:
 
         return ConfigLoadResult(cfg=cfg, migrated=migrated, warnings=warnings)
 
+    @staticmethod
+    def _serialize(cfg: AppConfig) -> Dict[str, Any]:
+        """The profile as written to disk: the Discord webhook only ever encrypted."""
+        base = asdict(cfg)
+        webhook_raw = (cfg.discord_webhook_url or "").strip()
+        if webhook_raw:
+            try:
+                base["discord_webhook_url_enc"] = dpapi_encrypt(webhook_raw)
+            except Exception as exc:
+                raise RuntimeError(f"Failed to encrypt Discord webhook URL: {exc}") from exc
+        else:
+            base["discord_webhook_url_enc"] = ""
+        base["discord_webhook_url"] = ""
+        return base
+
     def save(self, cfg: AppConfig) -> None:
         with exclusive_file_lock(self.lock_path):
             ensure_dir(self.path.parent)
-            base = asdict(cfg)
-            webhook_raw = (cfg.discord_webhook_url or "").strip()
-            if webhook_raw:
-                try:
-                    base["discord_webhook_url_enc"] = dpapi_encrypt(webhook_raw)
-                except Exception as exc:
-                    raise RuntimeError(f"Failed to encrypt Discord webhook URL: {exc}") from exc
-            else:
-                base["discord_webhook_url_enc"] = ""
-            base["discord_webhook_url"] = ""
+            base = self._serialize(cfg)
             for k, v in self._extra.items():
                 if k not in base:
                     base[k] = v
@@ -1365,7 +1373,8 @@ class ServerConfigStore:
             if self.path.exists():
                 raise FileExistsError(str(self.path))
             ensure_dir(self.path.parent)
-            base = asdict(cfg)
+            # New profiles are often copies of one with a webhook; it must not land in clear text.
+            base = self._serialize(cfg)
             atomic_write_text(self.path, json.dumps(base, indent=2), encoding="utf-8")
 
 
@@ -3413,8 +3422,18 @@ def map_folder_name(map_name: str) -> str:
     return re.sub(r"[^A-Za-z0-9_-]+", "", base) or "Map"
 
 
-def cluster_folder_problem(target: Optional[Path], server_dirs: List[Path], backup_roots: List[Path]) -> Optional[str]:
-    """Why a cluster data folder cannot be used, or None when it can."""
+def cluster_folder_problem(
+    target: Optional[Path],
+    server_dirs: List[Path],
+    backup_roots: List[Path],
+    *,
+    allow_own_saved: bool = True,
+) -> Optional[str]:
+    """Why a cluster data folder cannot be used, or None when it can.
+
+    allow_own_saved lets a server join a cluster that lives in its own install's
+    Saved\\clusters (the setup dialog); the wizard never points new maps in there.
+    """
     if target is None or not str(target).strip():
         return "Choose a cluster data folder."
     if not target.is_absolute():
@@ -3423,7 +3442,7 @@ def cluster_folder_problem(target: Optional[Path], server_dirs: List[Path], back
         return "Pick a cluster data folder whose path has no spaces; ARK cuts the path at the first space."
     for d in server_dirs:
         # The install's own Saved\clusters is allowed only to join a cluster that already lives there.
-        if path_contains(d, target) and not same_path(target, server_cluster_data_dir(d)):
+        if path_contains(d, target) and not (allow_own_saved and same_path(target, server_cluster_data_dir(d))):
             return "Keep the cluster data folder outside the server installs, so updates and restores never touch it."
         if path_contains(target, d):
             return ("That folder contains a server install. Give the cluster a folder of its own, "
@@ -6227,6 +6246,7 @@ class ClusterWizardDialog(tk.Toplevel):
             template_id = add_to.members[0]
         else:
             template_id = app.active_server_id
+        self._template_start_id = template_id
         template = app._runtime(template_id).cfg
         self._existing_maps: Set[str] = set()
         member_dirs: List[str] = []
@@ -6275,7 +6295,10 @@ class ClusterWizardDialog(tk.Toplevel):
         self.configure(background=THEME_COLORS["bg"])
         apply_initial_window_geometry(self, 1120, 760)
         apply_min_window_size(self, 980, 640)
+        self._problems: List[str] = []
         self._build()
+        if template_id in self._template_ids:
+            self.cmb_template.current(self._template_ids.index(template_id))
         self.protocol("WM_DELETE_WINDOW", self.destroy)
         self.bind("<Escape>", lambda _e: self.destroy())
 
@@ -6366,7 +6389,8 @@ class ClusterWizardDialog(tk.Toplevel):
         ttk.Checkbutton(lf_shared, text=f"Crossplay ({CROSSPLAY_PLATFORM})", variable=self.var_crossplay) \
             .grid(row=len(rows), column=0, columnspan=2, sticky="w", pady=(8, 0))
         ttk.Label(lf_shared, text="Other settings from").grid(row=len(rows) + 1, column=0, sticky="w", pady=(8, 0))
-        ttk.Combobox(lf_shared, textvariable=self.var_template, values=self._template_labels, state="readonly") \
+        self.cmb_template = ttk.Combobox(lf_shared, textvariable=self.var_template, values=self._template_labels, state="readonly")
+        self.cmb_template \
             .grid(row=len(rows) + 1, column=1, sticky="ew", padx=6, pady=(8, 0))
         ttk.Label(
             lf_shared,
@@ -6437,9 +6461,11 @@ class ClusterWizardDialog(tk.Toplevel):
         self._refresh_after = self.after(300, self._refresh)
 
     def _template_cfg(self) -> AppConfig:
-        label = self.var_template.get()
-        sid = self._template_ids[self._template_labels.index(label)] if label in self._template_labels else self.app.active_server_id
-        return self.app._runtime(sid).cfg
+        # By position, not by label: two profiles may carry the same name.
+        idx = self.cmb_template.current() if hasattr(self, "cmb_template") else -1
+        if 0 <= idx < len(self._template_ids):
+            return self.app._runtime(self._template_ids[idx]).cfg
+        return self.app._runtime(self._template_start_id).cfg
 
     def _selected_maps(self) -> List[str]:
         maps = [m for m, var in self.var_maps.items() if var.get()]
@@ -6448,8 +6474,10 @@ class ClusterWizardDialog(tk.Toplevel):
             maps.append(custom)
         return maps
 
-    def _make_plan(self) -> Tuple[List[PlannedServer], List[str]]:
+    def _make_plan(self) -> Tuple[List[PlannedServer], List[str], List[str]]:
+        """(plan, problems that block creating, notes that do not)."""
         problems: List[str] = []
+        notes: List[str] = []
         maps = self._selected_maps()
         name = self.var_name.get().strip()
         cid = self.var_cid.get().strip()
@@ -6467,6 +6495,8 @@ class ClusterWizardDialog(tk.Toplevel):
         custom = self.var_custom_map.get().strip()
         if custom and not re.match(r"^[A-Za-z0-9_]+$", custom):
             problems.append("The other map's name may only use letters, numbers and '_' (for example Astraeos_WP).")
+        if custom and custom.lower() in {m.lower() for m in self._existing_maps}:
+            problems.append(f"{custom} is already in this cluster.")
         if not (self.var_admin.get() or "").strip():
             problems.append("Set an admin password: the manager saves and stops the servers through RCON.")
         if not (1 <= safe_int(self.var_max_players.get(), 0) <= 255):
@@ -6474,9 +6504,16 @@ class ClusterWizardDialog(tk.Toplevel):
         root_dir = Path(root_raw) if root_raw else None
         if root_dir is None or not root_dir.is_absolute():
             problems.append("Choose a full path for the install folder, such as D:\\ARK\\MyCluster.")
-            return [], problems
+            return [], problems, notes
 
         template = self._template_cfg()
+        if re.search(r"(?i)(-clusterid|clusterdiroverride|[?-]port=|queryport|sessionname|altsavedirectoryname)", template.custom_start_args or ""):
+            notes.append(
+                "The template's custom server arguments set ports, the session name or cluster options; they "
+                f"would override the per-map values: '{template.custom_start_args}'. They are left out of the new maps."
+            )
+        existing_dirs = [Path(r.server_dir) for r in self.app.global_cfg.servers if r.server_dir]
+        taken_names = {(r.display_name or "").strip().lower() for r in self.app.global_cfg.servers}
         plan: List[PlannedServer] = []
         used_ports = self.app._collect_used_ports()  # read once per refresh, not once per map
         planned_ports: Set[int] = set()
@@ -6489,11 +6526,18 @@ class ClusterWizardDialog(tk.Toplevel):
                 problems.append(f"{map_name} and {seen_dirs[key]} would share the install folder {server_dir}; tick each map once.")
                 continue
             seen_dirs[key] = map_name
-            if self.app._server_dir_in_use(str(server_dir)):
-                problems.append(f"{server_dir} is already the install folder of another profile.")
+            clash = next((d for d in existing_dirs if path_contains(d, server_dir) or path_contains(server_dir, d)), None)
+            if clash is not None:
+                problems.append(f"{server_dir} overlaps the install folder of another profile ({clash}).")
+            display = f"{pretty} ({name})" if name else pretty
+            n = 2
+            while display.lower() in taken_names:
+                display = f"{pretty} ({name}) {n}"
+                n += 1
+            taken_names.add(display.lower())
             item = PlannedServer(
                 map_name=map_name,
-                display_name=f"{pretty} ({name})" if name else pretty,
+                display_name=display,
                 session_name=f"{prefix} - {pretty}" if prefix else pretty,
                 server_dir=server_dir,
             )
@@ -6508,33 +6552,44 @@ class ClusterWizardDialog(tk.Toplevel):
             plan.append(item)
 
         target = Path(self.var_dir.get().strip()) if self.var_dir.get().strip() else None
-        member_dirs = [Path(self.app._runtime(sid).cfg.server_dir) for sid in (self.add_to.members if self.add_to else [])]
+        all_cfgs = [self.app._runtime(r.id).cfg for r in self.app.global_cfg.servers]
+        backup_roots = {str(resolve_backup_root(c, self.app.app_base)) for c in all_cfgs + [template]}
         problem = cluster_folder_problem(
-            target, [p.server_dir for p in plan] + member_dirs, [resolve_backup_root(template, self.app.app_base)]
+            target,
+            [p.server_dir for p in plan] + existing_dirs,
+            [Path(b) for b in backup_roots],
+            allow_own_saved=False,
         )
-        if problem and self.add_to is not None:
-            # Seen when the cluster still keeps its data inside one map's install: new maps must
-            # not be pointed in there. Moving the folder is one Cluster... click on that map.
-            problem = (f"This cluster's data folder ({target}) cannot be shared with new maps: {problem} "
-                       "Open Cluster... on one of its servers and give the cluster its own folder first.")
+        if self.add_to is not None:
+            folders = {os.path.normcase(os.path.normpath(str(effective_cluster_dir(self.app._runtime(sid).cfg) or "")))
+                       for sid in self.add_to.members}
+            if len(folders) > 1:
+                problem = ("The maps of this cluster do not share one data folder, so transfers between them do not "
+                           "work yet. Open Cluster... on each of them and pick the same folder, then add maps.")
+            elif problem:
+                # Seen when the cluster still keeps its data inside one map's install: new maps must
+                # not be pointed in there. Moving the folder is one Cluster... click on that map.
+                problem = (f"This cluster's data folder ({target}) cannot be shared with new maps: {problem} "
+                           "Open Cluster... on one of its servers and give the cluster its own folder first.")
         if problem:
             problems.append(problem)
-        return plan, problems
+        return plan, problems, notes
 
     def _refresh(self) -> None:
         self._refresh_after = None
-        self._plan, problems = self._make_plan()
+        self._plan, problems, notes = self._make_plan()
+        self._problems = problems
         self.tree.delete(*self.tree.get_children())
         for item in self._plan:
             ports = f"{item.port} / {item.query_port} / {item.rcon_port}" if item.port else "-"
             self.tree.insert("", "end", text=item.display_name, values=(item.map_name, str(item.server_dir), ports))
-        self.var_warning.set("\n".join(problems))
+        self.var_warning.set("\n".join(problems + [f"Note: {n}" for n in notes]))
         self.btn_create.configure(state="disabled" if problems or not self._plan else "normal")
 
     # -- actions -----------------------------------------------------------
     def _on_create(self) -> None:
         self._refresh()
-        plan, problems = self._plan, self.var_warning.get().strip()
+        plan, problems = self._plan, self._problems
         if problems or not plan:
             return
         template = self._template_cfg()
@@ -7111,6 +7166,7 @@ class ServerManagerApp:
 
         self.global_cfg.servers = [r for r in self.global_cfg.servers if r.id != ref.id]
         self._drop_runtime(ref.id)
+        self._prune_cluster_meta()
         self.active_server_id = self.global_cfg.servers[0].id
         self.global_cfg.last_selected_server_id = self.active_server_id
         self._save_global_config(self.global_cfg)
@@ -9708,6 +9764,7 @@ class ServerManagerApp:
         old_id = old_id.strip()
         self.logger.info(f"[CLUSTER] {self.cfg.server_name} left cluster '{old_id}'.")
         self._sync_cluster_summary()
+        self._prune_cluster_meta()
 
         msg = f"{self.cfg.server_name} is no longer in cluster '{old_id}'."
         if self._is_server_running():
@@ -9815,17 +9872,18 @@ class ServerManagerApp:
             logger.info(f"[CLUSTER] Cluster '{cfg.cluster_id.strip()}', data folder {folder}")
 
     def _on_close(self) -> None:
-        if self._group_ops:
-            ops = ", ".join(sorted(set(self._group_ops.values())))
-            if not messagebox.askyesno(
-                "Cluster action running",
-                f"A cluster-wide action is still running ({ops}). Closing cancels it; maps it has not "
-                "reached yet are left as they are.\n\nContinue closing?",
-                icon="warning",
-                default="no",
-            ):
-                return
-            self._cancel_groups()
+        with self._runtimes_lock:
+            ops = sorted(set(self._group_ops.values()))
+        if ops and not messagebox.askyesno(
+            "Cluster action running",
+            f"A cluster-wide action is still running ({', '.join(ops)}). Closing cancels it; maps it has not "
+            "reached yet are left as they are.\n\nContinue closing?",
+            icon="warning",
+            default="no",
+        ):
+            return
+        # Cancelled only once the window really goes (below): backing out of a later
+        # question must leave the action running.
         running = self._running_runtimes()
         if running:
             names = "\n".join(f"- {self._display_name(rt.server_id)}" for rt in running)
@@ -9855,6 +9913,7 @@ class ServerManagerApp:
                     default="no",
                 ):
                     return
+                self._cancel_groups()
                 self._stop_and_close(running)
                 return
         # Workers are daemon threads: closing kills them mid-write (INIs, zips, SteamCMD, a
@@ -9868,6 +9927,7 @@ class ServerManagerApp:
             default="no",
         ):
             return
+        self._cancel_groups()
         self.root.destroy()
 
     def _stop_and_close(self, running: List[ServerRuntime]) -> None:
@@ -9938,6 +9998,16 @@ class ServerManagerApp:
     def _cluster_views(self) -> Tuple[List[ClusterView], List[str]]:
         profiles = [(rt.server_id, rt.cfg) for rt in self._all_runtimes()]
         return group_clusters(profiles, self.global_cfg.clusters)
+
+    def _prune_cluster_meta(self) -> None:
+        """Forget names and delays of clusters no profile belongs to any more."""
+        live = {c.cluster_id for c in self._cluster_views()[0]}
+        stale = [cid for cid in self.global_cfg.clusters if cid not in live]
+        if stale:
+            for cid in stale:
+                self.global_cfg.clusters.pop(cid, None)
+            with contextlib.suppress(Exception):
+                self._save_global_config(self.global_cfg)
 
     def _cluster_view(self, cluster_id: str) -> Optional[ClusterView]:
         return next((c for c in self._cluster_views()[0] if c.cluster_id == cluster_id), None)
@@ -10210,8 +10280,16 @@ class ServerManagerApp:
 
     def _backup_for(self, rt: ServerRuntime, on_done: Optional[Callable[[Optional[Path]], None]] = None) -> bool:
         def job() -> None:
-            # A running server's folder is the one it started with, whatever the form says now.
-            path = backup_server(rt.live_cfg(), self.app_base, rt.logger, rt.server_id)
+            cfg = rt.live_cfg()  # a running server's folder is the one it started with
+            if rt.is_running() and cfg.enable_rcon:
+                # Zip what the world is now, not the last autosave minutes ago.
+                try:
+                    rt.logger.info("Backup: RCON SaveWorld")
+                    self._rcon_try("SaveWorld", timeout=30.0, rt=rt)
+                    time.sleep(AUTO_SAVE_SETTLE_SEC)
+                except Exception as e:
+                    rt.logger.info(f"Backup: SaveWorld failed ({e}); zipping the last save on disk.")
+            path = backup_server(cfg, self.app_base, rt.logger, rt.server_id)
             self._ui(lambda: self._set_backup_status(path, label="Backup created", rt=rt))
             if on_done is not None:
                 self._ui(lambda: on_done(path))
@@ -10226,6 +10304,31 @@ class ServerManagerApp:
                 return
             if cancel is None:
                 time.sleep(0.5)
+
+    def _wait_ready(self, rt: ServerRuntime, cancel: threading.Event, timeout: float = READY_WAIT_SEC) -> bool:
+        """After a start: wait until the map has loaded (RCON answers) or failed.
+
+        True when it is up, or still starting when the time is up; False when its task
+        ended without a running server. A cancel returns at once.
+        """
+        self._wait_idle(rt, timeout=30 * 60, cancel=cancel)
+        if cancel.is_set():
+            return True
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            if not rt.is_running():
+                return False
+            if not rt.live_cfg().enable_rcon:
+                return True  # nothing to ask; the process is up
+            try:
+                self._rcon_try("ListPlayers", timeout=3.0, rt=rt)
+                return True
+            except Exception:
+                pass
+            if cancel.wait(5.0):
+                return True
+        rt.logger.info("Still loading after the wait; moving on to the next map.")
+        return rt.is_running()
 
     def _cancel_groups(self, cluster_id: Optional[str] = None) -> List[str]:
         """Cancel the cluster-wide sequences of one cluster (or all); returns their labels."""
@@ -10304,10 +10407,22 @@ class ServerManagerApp:
             # Stops a Start All / Restart All of this cluster first, or it would bring maps back.
             if self._cancel_groups(view.cluster_id):
                 self.logger.info(f"Cluster {view.cluster_id}: Stop All cancelled the cluster-wide action in progress.")
-            running = [rt for rt in members if rt.is_running()]
-            refused = [rt for rt in running if not self.stop_server_for(rt)]
-            if refused:
-                messagebox.showwarning("Stop All", f"A task is running for {names(refused)}; stop it when it finishes.")
+            running = [rt for rt in members if rt.is_running() and not rt.is_busy()]
+            for rt in running:
+                self.stop_server_for(rt)
+            # Maps in the middle of a task (a start, a restart, an update) would come up after
+            # this; they are stopped as soon as their task is done.
+            pending = [rt for rt in members if rt.is_busy()]
+            if pending:
+                def sweep(_pending: List[ServerRuntime] = pending) -> None:
+                    for rt in _pending:
+                        self._wait_idle(rt, timeout=60 * 60)
+                        if rt.is_running() and not self.stop_server_for(rt):
+                            rt.logger.info("Stop All: could not stop, another task took the server meanwhile.")
+
+                threading.Thread(target=sweep, daemon=True, name="stop-all-sweep").start()
+                rt0 = pending[0]
+                self._set_status_for(rt0, f"Stop All: {names(pending)} will be stopped when their current task ends.")
             self._dash_refresh()
             return
         if action == "backup":
@@ -10364,16 +10479,22 @@ class ServerManagerApp:
                         rt.logger.info("Start All: skipped, the server is not installed (use First Install).")
                         continue
                     todo.append(rt)
+                failed: List[str] = []
                 for i, rt in enumerate(todo):
                     if cancel.is_set():
-                        return
+                        break
                     if not self.start_server_for(rt, quiet=True):
                         rt.logger.info("Start All: skipped, a task is running for this server.")
                         continue
-                    self._wait_idle(rt, timeout=30 * 60, cancel=cancel)
-                    # Maps load their world on start; spacing them out spares disk and memory.
+                    # Maps load their world on start; the next one waits until this one answers.
+                    if not self._wait_ready(rt, cancel):
+                        failed.append(self._display_name(rt.server_id))
+                        continue
                     if i < len(todo) - 1 and stagger and cancel.wait(stagger):
-                        return
+                        break
+                if failed:
+                    self._ui(lambda: messagebox.showwarning(
+                        "Start All", "These maps did not start (see the console):\n- " + "\n- ".join(failed)))
 
             if not self._run_group(view.cluster_id, "Starting all", start_all):
                 messagebox.showwarning("Start All", "Another cluster-wide action is still running for this cluster.")
@@ -10394,7 +10515,15 @@ class ServerManagerApp:
                     if not self.restart_server_for(rt, quiet=True):
                         rt.logger.info("Restart All: skipped, a task is running for this server.")
                         continue
-                    self._wait_idle(rt, timeout=30 * 60, cancel=cancel)
+                    if not self._wait_ready(rt, cancel):
+                        # Whatever failed here (the shared cluster drive, a port) would likely fail
+                        # for the next map too: stop rather than take the cluster down map by map.
+                        name = self._display_name(rt.server_id)
+                        self._ui(lambda: messagebox.showwarning(
+                            "Restart All",
+                            f"{name} did not come back up (see the console), so Restart All stopped there; "
+                            "the other maps were left running."))
+                        return
                     if i < len(todo) - 1 and stagger and cancel.wait(stagger):
                         return
 
@@ -10422,6 +10551,10 @@ class ServerManagerApp:
     ) -> None:
         cid = cluster["cluster_id"]
         created: List[str] = []
+        meta = self.global_cfg.clusters.setdefault(cid, {})
+        if not adding or "name" not in meta:
+            meta["name"] = cluster["name"]
+        meta.setdefault("start_stagger_sec", DEFAULT_START_STAGGER_SEC)
         try:
             ensure_dir(Path(cluster["cluster_dir"]))
             for item in plan:
@@ -10438,18 +10571,25 @@ class ServerManagerApp:
                 cfg.cluster_custom_path_enable = True
                 cfg.cluster_dir_override = cluster["cluster_dir"]
                 cfg.alt_save_directory_name = ""  # each map has its own install, so its own saves
+                if re.search(r"(?i)(-clusterid|clusterdiroverride|[?-]port=|queryport|sessionname|altsavedirectoryname)",
+                             cfg.custom_start_args or ""):
+                    cfg.custom_start_args = ""  # they would override this map's own ports, name or cluster
                 sid = str(uuid.uuid4())
                 ServerConfigStore(server_config_path(self.app_base, sid), server_lock_path(self.app_base, sid)).save_new(cfg)
                 self.global_cfg.servers.append(ServerRef(id=sid, display_name=item.display_name, server_dir=cfg.server_dir))
                 created.append(sid)
-            meta = self.global_cfg.clusters.setdefault(cid, {})
-            if not adding or "name" not in meta:
-                meta["name"] = cluster["name"]
-            meta.setdefault("start_stagger_sec", DEFAULT_START_STAGGER_SEC)
             self._save_global_config(self.global_cfg)
         except Exception as e:
-            self._save_global_config(self.global_cfg)
-            messagebox.showerror("Cluster", f"Creating the profiles stopped part way: {e}\n\nCreated: {len(created)} of {len(plan)}.")
+            note = ""
+            try:
+                self._save_global_config(self.global_cfg)  # keep the profiles that were made
+            except Exception as e2:
+                note = f"\n\nSaving the profile list failed too: {e2}"
+            messagebox.showerror(
+                "Cluster",
+                f"Creating the profiles stopped part way: {e}\n\nCreated: {len(created)} of {len(plan)}; they are "
+                f"listed on the Dashboard and can be removed like any profile.{note}",
+            )
             self._refresh_server_selector(self.active_server_id)
             self._dash_refresh()
             return
