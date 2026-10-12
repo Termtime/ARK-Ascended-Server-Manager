@@ -3558,8 +3558,22 @@ CLUSTER_EXPORT_FORMAT = "ark-asa-manager-cluster"
 # Never in an export file: secrets, and what only makes sense on this machine.
 EXPORT_LEFT_OUT_FIELDS = {
     "server_dir", "backup_dir", "cluster_dir_override", "admin_password", "join_password",
-    "discord_webhook_url", "discord_webhook_url_enc", "schema_version",
+    "discord_webhook_url", "discord_webhook_url_enc", "schema_version", "rcon_host",
 }
+
+
+def strip_arg_secrets(args: str) -> str:
+    """Custom server arguments without any part that carries a password."""
+    kept: List[str] = []
+    for token in split_custom_start_args(args):
+        if "password" not in token.lower():
+            kept.append(token)
+            continue
+        if "?" in token:  # a ?Key=Value chain: drop only the password parts
+            parts = [p for p in token.split("?") if "password" not in p.lower()]
+            if any(parts):
+                kept.append("?".join(parts))
+    return " ".join(kept)
 
 
 def cluster_export_document(
@@ -3573,6 +3587,7 @@ def cluster_export_document(
     servers = []
     for display_name, cfg, ini in members:
         settings = {k: v for k, v in asdict(cfg).items() if k not in EXPORT_LEFT_OUT_FIELDS}
+        settings["custom_start_args"] = strip_arg_secrets(cfg.custom_start_args)
         servers.append({
             "display_name": display_name,
             "settings": settings,
@@ -3611,11 +3626,16 @@ def read_cluster_export(path: Path) -> Dict[str, Any]:
     servers = data.get("servers")
     if not isinstance(servers, list) or not servers:
         raise ValueError("The cluster file lists no servers.")
+    if not isinstance(data.get("cluster", {}), dict):
+        raise ValueError("The cluster file's cluster section is not readable.")
     for item in servers:
         if not isinstance(item, dict) or not isinstance(item.get("settings"), dict):
             raise ValueError("A server in the cluster file has no settings.")
         if not str(item["settings"].get("map_name") or "").strip():
             raise ValueError("A server in the cluster file has no map.")
+        ini = item.get("ini", {})
+        if not isinstance(ini, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in ini.items()):
+            raise ValueError("A server in the cluster file has unreadable INI settings.")
     return data
 
 
@@ -5051,7 +5071,9 @@ def process_usage(pid: int) -> Optional[Tuple[float, int]]:
         k.CloseHandle.argtypes = [wintypes.HANDLE]
         psapi = ctypes.windll.psapi
         psapi.GetProcessMemoryInfo.argtypes = [wintypes.HANDLE, ctypes.POINTER(_PROCESS_MEMORY_COUNTERS), wintypes.DWORD]
-        handle = k.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        # PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, as GetProcessMemoryInfo documents;
+        # without VM_READ (a server running with more rights) the CPU time can still be read.
+        handle = k.OpenProcess(0x1000 | 0x0010, False, pid) or k.OpenProcess(0x1000, False, pid)
         if not handle:
             return None
         try:
@@ -7412,14 +7434,17 @@ class ClusterImportDialog(tk.Toplevel):
         self.var_warning = tk.StringVar(master=self, value="")
         self._plan: List[PlannedServer] = []
         self._problems: List[str] = []
+        self._plan_problems: List[str] = []
         self.title(f"Import Cluster - {path.name}")
         self.transient(app.root)
         self.configure(background=THEME_COLORS["bg"])
         apply_initial_window_geometry(self, 900, 600)
         apply_min_window_size(self, 760, 520)
         self._build()
+        self._refresh_after: Optional[str] = None
+        self._planned_for: Optional[str] = None  # install folder the current plan was made for
         for var in (self.var_name, self.var_cid, self.var_root, self.var_dir, self.var_admin):
-            var.trace_add("write", lambda *_: self._refresh())
+            var.trace_add("write", lambda *_: self._schedule_refresh())
         self.protocol("WM_DELETE_WINDOW", self.destroy)
         self.bind("<Escape>", lambda _e: self.destroy())
         self._refresh()
@@ -7469,7 +7494,14 @@ class ClusterImportDialog(tk.Toplevel):
         self.btn_import.grid(row=0, column=0, padx=(0, 8))
         ttk.Button(buttons, text="Cancel", command=self.destroy).grid(row=0, column=1)
 
+    def _schedule_refresh(self) -> None:
+        if self._refresh_after is not None:
+            with contextlib.suppress(Exception):
+                self.after_cancel(self._refresh_after)
+        self._refresh_after = self.after(300, self._refresh)
+
     def _refresh(self) -> None:
+        self._refresh_after = None
         problems: List[str] = []
         name = self.var_name.get().strip()
         cid = self.var_cid.get().strip()
@@ -7486,7 +7518,21 @@ class ClusterImportDialog(tk.Toplevel):
         plan: List[PlannedServer] = []
         if root_dir is None or not root_dir.is_absolute():
             problems.append("Choose a full path for the install folder.")
+        elif self._planned_for == root_raw and self._plan:
+            # Same install folder: keep the plan (and its ports); only re-check the rest.
+            plan = self._plan
+            problems.extend(self._plan_problems)
+            existing_dirs = [Path(r.server_dir) for r in self.app.global_cfg.servers if r.server_dir]
+            problem = cluster_folder_problem(
+                Path(self.var_dir.get().strip()) if self.var_dir.get().strip() else None,
+                [p.server_dir for p in plan] + existing_dirs,
+                [resolve_backup_root(self.app.cfg, self.app.app_base)],
+                allow_own_saved=False,
+            )
+            if problem:
+                problems.append(problem)
         else:
+            plan_problems: List[str] = []
             existing_dirs = [Path(r.server_dir) for r in self.app.global_cfg.servers if r.server_dir]
             taken = {(r.display_name or "").strip().lower() for r in self.app.global_cfg.servers}
             used = self.app._collect_used_ports()
@@ -7504,7 +7550,7 @@ class ClusterImportDialog(tk.Toplevel):
                 seen.add(key)
                 clash = next((d for d in existing_dirs if path_contains(d, server_dir) or path_contains(server_dir, d)), None)
                 if clash is not None:
-                    problems.append(f"{server_dir} overlaps the install folder of another profile ({clash}).")
+                    plan_problems.append(f"{server_dir} overlaps the install folder of another profile ({clash}).")
                 display = str(item.get("display_name") or pretty_map_name(cfg.map_name))
                 base_name, n = display, 2
                 while display.lower() in taken:
@@ -7519,8 +7565,10 @@ class ClusterImportDialog(tk.Toplevel):
                     )
                     planned |= {planned_item.port, planned_item.query_port, planned_item.rcon_port}
                 except Exception as e:
-                    problems.append(f"No free ports for {display}: {e}")
+                    plan_problems.append(f"No free ports for {display}: {e}")
                 plan.append(planned_item)
+            self._planned_for, self._plan_problems = root_raw, plan_problems
+            problems.extend(plan_problems)
             problem = cluster_folder_problem(
                 Path(self.var_dir.get().strip()) if self.var_dir.get().strip() else None,
                 [p.server_dir for p in plan] + existing_dirs,
@@ -9400,9 +9448,13 @@ class ServerManagerApp:
         cfg.backup_include_configs = True
 
         cfg.auto_update_restart = bool(self.var_auto_update_restart.get())
+        if bool(self.var_auto_update_restart.get()) and parse_time_hhmm(self.var_auto_update_time.get()) is None:
+            raise ValueError("Auto update time must be in HH:MM (24h) format, for example 03:00.")
         cfg.auto_update_time = normalize_time_hhmm(self.var_auto_update_time.get(), DEFAULT_SCHEDULE_TIME)
         cfg.update_on_startup = bool(self.var_update_on_startup.get())
         cfg.scheduled_restart_enabled = bool(self.var_scheduled_restart_enabled.get())
+        if bool(self.var_scheduled_restart_enabled.get()) and parse_time_hhmm(self.var_scheduled_restart_time.get()) is None:
+            raise ValueError("Daily restart time must be in HH:MM (24h) format, for example 06:00.")
         cfg.scheduled_restart_time = normalize_time_hhmm(self.var_scheduled_restart_time.get(), "06:00")
         cfg.restart_warnings_enabled = bool(self.var_restart_warnings_enabled.get())
         cfg.restart_warning_minutes = ",".join(map(str, parse_warning_minutes(self.var_restart_warning_minutes.get()))) or "15,5,1"
@@ -10291,7 +10343,10 @@ class ServerManagerApp:
                     )
         self._update_slot_turns += 1
 
-    def update_and_restart_for(self, rt: ServerRuntime, *, quiet: bool = False) -> bool:
+    def update_and_restart_for(self, rt: ServerRuntime, *, quiet: bool = False, from_countdown: bool = False) -> bool:
+        if not from_countdown and rt.countdown is not None and self._cancel_countdown(rt):
+            rt.logger.info("Update & Restart: the planned restart countdown was cancelled; this replaces it.")
+
         def job() -> None:
             # Maps updating at the same time take turns here, while still running: stopping
             # first and then queueing for SteamCMD would keep every waiting map down.
@@ -10331,7 +10386,12 @@ class ServerManagerApp:
             return False
         return self.restart_server_for(self.rt)
 
-    def restart_server_for(self, rt: ServerRuntime, *, quiet: bool = False) -> bool:
+    def restart_server_for(self, rt: ServerRuntime, *, quiet: bool = False, from_countdown: bool = False) -> bool:
+        # A restart made by hand replaces a planned one that is counting down, which would
+        # otherwise restart the server a second time once its countdown ends.
+        if not from_countdown and rt.countdown is not None and self._cancel_countdown(rt):
+            rt.logger.info("Restart: the planned restart countdown was cancelled; this restart replaces it.")
+
         def job() -> None:
             # Asked while this server still runs, so declining leaves it up.
             self._ensure_install_free(rt, Path(rt.cfg.server_dir), confirm=True)
@@ -11066,6 +11126,19 @@ class ServerManagerApp:
                 self._cancel_groups()
                 self._stop_and_close(running)
                 return
+        # A countdown has told players a restart is coming; leaving it to die with the window
+        # would leave them waiting for nothing.
+        counting = [rt for rt in self._running_runtimes() if rt.countdown is not None]
+        if counting:
+            if not messagebox.askyesno(
+                "Countdown running",
+                "A restart countdown is running for " + ", ".join(self._display_name(rt.server_id) for rt in counting)
+                + ". Closing cancels it and tells the players the restart is off.\n\nClose anyway?",
+                icon="warning",
+                default="no",
+            ):
+                return
+            self._cancel_countdowns_and_announce(counting)
         # Workers are daemon threads: closing kills them mid-write (INIs, zips, SteamCMD, a
         # restart), whether or not servers are left running.
         if self._any_busy() and not messagebox.askyesno(
@@ -11084,6 +11157,8 @@ class ServerManagerApp:
         # No new timer tasks while closing: one could claim a server between the check
         # below and its stop, or start something the closing window would then cut off.
         self._scheduler_stop.set()
+        for rt in running:
+            self._cancel_countdown(rt)  # they are being stopped now; nothing left to count down to
         running = self._running_runtimes()  # what runs now, not when the question was asked
         busy = [rt for rt in running if rt.is_busy()]
         if busy:
@@ -11740,8 +11815,32 @@ class ServerManagerApp:
 
             def restart_all(cancel: threading.Event) -> None:
                 todo = [rt for rt in members if rt.is_running()]
-                if warn and not self._run_countdown(todo, "restarts", minutes, cancel):
-                    return
+                if warn:
+                    # Shown on each map, and it blocks a second countdown (a nightly update) on them;
+                    # stopping one map or Cancel Countdown cancels the whole Restart All.
+                    owned: List[ServerRuntime] = []
+                    for rt in todo:
+                        with rt.task_lock:
+                            if rt.countdown is None:
+                                rt.countdown = f"restarts in {minutes[0]} min (Restart All)"
+                                rt.countdown_cancel = cancel
+                                owned.append(rt)
+
+                    def step(m: int) -> None:
+                        for rt in owned:
+                            rt.countdown = f"restarts in {m} min (Restart All)"
+                        self._ui(self._refresh_buttons)
+
+                    try:
+                        if not self._run_countdown(todo, "restarts", minutes, cancel, step):
+                            return
+                    finally:
+                        for rt in owned:
+                            with rt.task_lock:
+                                if rt.countdown_cancel is cancel:
+                                    rt.countdown = None
+                                    rt.countdown_cancel = None
+                        self._ui(self._refresh_buttons)
                 for i, rt in enumerate(todo):
                     # One map at a time, so players can stay on the others meanwhile.
                     self._wait_idle(rt, timeout=30 * 60, cancel=cancel)
@@ -11751,7 +11850,7 @@ class ServerManagerApp:
                         # Stopped since the sequence began: a restart would bring it back up.
                         rt.logger.info("Restart All: skipped, the server was stopped meanwhile.")
                         continue
-                    if not self.restart_server_for(rt, quiet=True):
+                    if not self.restart_server_for(rt, quiet=True, from_countdown=True):
                         rt.logger.info("Restart All: skipped, a task is running for this server.")
                         continue
                     if not self._wait_ready(rt, cancel):
@@ -12223,20 +12322,24 @@ class ServerManagerApp:
                         rt.logger.info(f"Countdown message failed: {e}")
         return not cancel.wait(minutes[-1] * unit)
 
+    COUNTDOWN_RETRY_SEC = 2 * 60 * 60  # how long a planned action waits for a busy server
+
     def _countdown_then(self, rt: ServerRuntime, reason: str, then: Callable[[], bool]) -> bool:
         """Warn the players of a running server first, then run then() once the server is free.
 
-        Without warnings set (or RCON off) then() runs at once. False when a countdown is
-        already running for this server.
+        Without warnings set (or RCON off) there is no countdown, but then() still waits for
+        the server to be free, for up to COUNTDOWN_RETRY_SEC, so a planned restart or update
+        is not lost to a task that happens to be running. False when a countdown (or a
+        planned action waiting) is already there for this server.
         """
         minutes = self._warning_minutes(rt)
-        if not minutes or not rt.is_running() or not rt.live_cfg().enable_rcon:
-            return then()
+        if not rt.is_running() or not rt.live_cfg().enable_rcon:
+            minutes = []
         cancel = threading.Event()
         with rt.task_lock:
             if rt.countdown is not None:
                 return False
-            rt.countdown = f"{reason} in {minutes[0]} min"
+            rt.countdown = f"{reason} in {minutes[0]} min" if minutes else f"{reason} (waiting)"
             rt.countdown_cancel = cancel
 
         def step(m: int) -> None:
@@ -12245,16 +12348,26 @@ class ServerManagerApp:
 
         def worker() -> None:
             try:
-                rt.logger.info(f"Countdown started: the server {reason} in {minutes[0]} minute(s).")
+                if minutes:
+                    rt.logger.info(f"Countdown started: the server {reason} in {minutes[0]} minute(s).")
                 if not self._run_countdown([rt], reason, minutes, cancel, step):
                     rt.logger.info("Countdown cancelled.")
                     return
-                if not rt.is_running():
+                if minutes and not rt.is_running():
                     rt.logger.info("Countdown over, but the server was stopped meanwhile; nothing to do.")
                     return
-                self._wait_idle(rt, timeout=30 * 60, cancel=cancel)
-                if cancel.is_set() or not then():
-                    rt.logger.info("Countdown over, but another task kept the server busy; not restarted.")
+                rt.countdown = f"{reason} now"
+                end = time.monotonic() + self.COUNTDOWN_RETRY_SEC
+                while not cancel.is_set():
+                    self._wait_idle(rt, timeout=max(1.0, end - time.monotonic()), cancel=cancel)
+                    if cancel.is_set():
+                        return
+                    if then():
+                        return
+                    if time.monotonic() >= end:
+                        rt.logger.error(f"The planned action ({reason}) gave up: the server stayed busy for too long.")
+                        return
+                    cancel.wait(5.0)  # another task took the server first; try again shortly
             finally:
                 with rt.task_lock:
                     rt.countdown = None
@@ -12264,6 +12377,22 @@ class ServerManagerApp:
         threading.Thread(target=worker, daemon=True, name=f"countdown-{rt.server_id}").start()
         self._ui(self._refresh_buttons)
         return True
+
+    def _cancel_countdowns_and_announce(self, runtimes: List[ServerRuntime], wait: float = 4.0) -> None:
+        """Cancel countdowns and tell their players, waiting a moment so the message is sent
+        before the window (and its threads) go."""
+        threads = []
+        for rt in runtimes:
+            if self._cancel_countdown(rt) and rt.live_cfg().enable_rcon:
+                t = threading.Thread(
+                    target=lambda _rt=rt: self._rcon_try("ServerChat The announced restart is cancelled.", timeout=3.0, rt=_rt),
+                    daemon=True,
+                )
+                t.start()
+                threads.append(t)
+        end = time.monotonic() + wait
+        for t in threads:
+            t.join(max(0.0, end - time.monotonic()))
 
     def _announce_countdown_cancelled(self, rt: ServerRuntime) -> None:
         """Tell players the announced restart is off, on a thread (RCON can be slow)."""
@@ -12308,10 +12437,10 @@ class ServerManagerApp:
             rt.logger.info("Daily restart skipped: the nightly update restarts the server at the same time.")
             return
         if rt.countdown is not None:
-            rt.logger.info("Daily restart skipped: a countdown is already running for this server.")
+            rt.logger.info("Daily restart skipped: a countdown or planned restart is already running for this server.")
             return
         rt.logger.info("Daily restart due.")
-        self._countdown_then(rt, "restarts", lambda: self.restart_server_for(rt, quiet=True))
+        self._countdown_then(rt, "restarts", lambda: self.restart_server_for(rt, quiet=True, from_countdown=True))
 
     def _tick_auto_update(self, rt: ServerRuntime, now: datetime) -> None:
         cfg = rt.cfg
@@ -12338,8 +12467,8 @@ class ServerManagerApp:
         # Due. A busy server keeps it due and is tried again on the next tick, so a task
         # running at 03:00 delays tonight's update instead of skipping it. With warnings set,
         # players are told first and the update follows the countdown.
-        if rt.is_busy() or not self._countdown_then(
-            rt, "restarts for an update", lambda: self.update_and_restart_for(rt, quiet=True)
+        if rt.countdown is not None or not self._countdown_then(
+            rt, "restarts for an update", lambda: self.update_and_restart_for(rt, quiet=True, from_countdown=True)
         ):
             if not rt.auto_update_waiting:
                 rt.auto_update_waiting = True
