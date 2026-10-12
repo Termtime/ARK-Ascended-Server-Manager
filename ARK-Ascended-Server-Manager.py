@@ -3491,11 +3491,12 @@ def cluster_health(
         for port in ports:
             owner = seen_ports.get(port)
             if owner is not None and owner[0] != sid and sid in names:
-                issues.append(HealthIssue(
-                    "error", f"{name} uses port {port}, which {owner[1]} uses too; they cannot run at the same time.",
-                    fix="new_ports", servers=[sid],
-                ))
-                break
+                if not any(i.fix == "new_ports" and i.servers == [sid] for i in issues):
+                    issues.append(HealthIssue(
+                        "error", f"{name} uses port {port}, which {owner[1]} uses too; they cannot run at the same time.",
+                        fix="new_ports", servers=[sid],
+                    ))
+                continue
             seen_ports.setdefault(port, (sid, name))
 
     sessions: Dict[str, List[str]] = {}
@@ -4128,7 +4129,10 @@ MAP_SPECIFIC_INI_KEYS = {
     "configaddnpcspawnentriescontainer",
     "configsubtractnpcspawnentriescontainer",
     "configoverridenpcspawnentriescontainer",
+    "configoverridesupplycrateitems",  # crate classes differ per map
 }
+# Bound to the machine or the server, never copied between servers.
+NEVER_COPY_INI_KEYS = {"multihome"}
 
 
 @dataclass
@@ -4159,7 +4163,7 @@ def copy_ini_settings(
     INI Editor change.
     """
     res = IniCopyResult()
-    protected_anywhere = set(SP_MOD_KEYS_LOWER)
+    protected_anywhere = set(SP_MOD_KEYS_LOWER) | NEVER_COPY_INI_KEYS
     if not include_map_specific:
         protected_anywhere |= MAP_SPECIFIC_INI_KEYS
     for target, enabled in (("gus", include_gus), ("game", include_game)):
@@ -4758,12 +4762,19 @@ def _exe_key(path: str) -> str:
 
 def find_all_server_processes() -> Dict[str, List[FoundProcess]]:
     """Every ArkAscendedServer.exe on the machine, by normalized executable path: one
-    query, however many installs are looked at."""
+    query, however many installs are looked at. Empty when the query fails."""
+    return query_server_processes() or {}
+
+
+def query_server_processes() -> Optional[Dict[str, List[FoundProcess]]]:
+    """Like find_all_server_processes, but None when the query itself failed, so a
+    caller can tell "none running" from "could not look"."""
     if os.name != "nt":
         return {}
     script = (
         "Get-CimInstance Win32_Process -Filter \"Name='ArkAscendedServer.exe'\" | "
-        "ForEach-Object { \"$($_.ProcessId)|$($_.CreationDate.ToString('yyyy-MM-dd HH:mm:ss'))|"
+        "ForEach-Object { \"$($_.ProcessId)|$($_.CreationDate.ToString('yyyy-MM-dd HH:mm:ss', "
+        "[Globalization.CultureInfo]::InvariantCulture))|"
         "$($_.ExecutablePath)|$($_.CommandLine)\" }"
     )
     try:
@@ -4775,7 +4786,9 @@ def find_all_server_processes() -> Dict[str, List[FoundProcess]]:
             creationflags=CREATE_NO_WINDOW,
         ).stdout
     except Exception:
-        return {}
+        return None
+    if out is None:
+        return None
     found: Dict[str, List[FoundProcess]] = {}
     for line in (out or "").splitlines():
         parts = line.strip().split("|", 3)
@@ -4801,9 +4814,21 @@ def find_server_processes(server_dir: Path) -> List[int]:
 
 
 def command_line_port(command_line: str) -> Optional[int]:
-    """The game port in an ARK server command line ('...?Port=7777?...')."""
-    m = re.search(r"[?\s]Port=(\d+)", command_line or "", re.IGNORECASE)
-    return int(m.group(1)) if m else None
+    """The game port in an ARK server command line ('<exe> TheIsland_WP?listen?...?Port=7777?...').
+
+    Only the map URL is read, split at '?', so a server name that contains 'Port=' does
+    not count.
+    """
+    try:
+        args = shlex.split(command_line or "", posix=False)
+    except ValueError:
+        args = (command_line or "").split()
+    url = next((a.strip('"') for a in args[1:] if "?" in a), "")
+    for part in url.split("?"):
+        key, _, value = part.partition("=")
+        if key.strip().lower() == "port" and value.strip().isdigit():
+            return int(value.strip())
+    return None
 
 
 class AttachedProcess:
@@ -4818,7 +4843,7 @@ class AttachedProcess:
     _WAIT_TIMEOUT = 0x102
     _INFINITE = 0xFFFFFFFF
 
-    def __init__(self, pid: int) -> None:
+    def __init__(self, pid: int, expected_exe: Optional[Path] = None) -> None:
         if os.name != "nt":
             raise OSError("Attaching to a process is only supported on Windows.")
         k = ctypes.windll.kernel32
@@ -4829,14 +4854,36 @@ class AttachedProcess:
         k.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
         k.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
         k.CloseHandle.argtypes = [wintypes.HANDLE]
+        k.QueryFullProcessImageNameW.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)]
         self._k = k
+        self.can_terminate = True
         handle = k.OpenProcess(self._SYNCHRONIZE | self._PROCESS_TERMINATE | self._PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
         if not handle:
-            raise OSError(f"Cannot open process {pid} (error {ctypes.GetLastError()}).")
+            # A server running elevated above the manager can still be watched, just not killed.
+            handle = k.OpenProcess(self._SYNCHRONIZE | self._PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+            self.can_terminate = False
+        if not handle:
+            raise OSError(f"Cannot open process {pid}.")
         self._handle = handle
         self.pid = pid
         self.stdout = None
         self.returncode: Optional[int] = None
+        self.expected_exe = expected_exe
+        # The PID may have been reused since it was listed: hold on only to an ARK server.
+        if expected_exe is not None:
+            image = self.image_path()
+            if not image or _exe_key(image) != _exe_key(str(expected_exe)):
+                with contextlib.suppress(Exception):
+                    k.CloseHandle(handle)
+                self._handle = None
+                raise OSError(f"Process {pid} is no longer the ARK server ({image or 'unknown image'}).")
+
+    def image_path(self) -> str:
+        size = wintypes.DWORD(1024)
+        buf = ctypes.create_unicode_buffer(size.value)
+        if self._k.QueryFullProcessImageNameW(self._handle, 0, buf, ctypes.byref(size)):
+            return buf.value
+        return ""
 
     def _exit_code(self) -> Optional[int]:
         code = wintypes.DWORD()
@@ -4862,13 +4909,16 @@ class AttachedProcess:
         return self.poll()
 
     def terminate(self) -> None:
+        if not self.can_terminate:
+            raise OSError(f"No right to end process {self.pid}; it runs with more rights than the manager.")
         self._k.TerminateProcess(self._handle, 1)
 
     kill = terminate
 
     def __del__(self) -> None:
         with contextlib.suppress(Exception):
-            self._k.CloseHandle(self._handle)
+            if self._handle:
+                self._k.CloseHandle(self._handle)
 
 # =============================================================================
 # GUI LOGGING
@@ -5010,6 +5060,78 @@ PROCESS_BOUND_FIELDS = (
 )
 
 
+RUN_STATE_FILE_NAME = "run_state.json"
+
+
+def run_state_path(app_base: Path, server_id: str) -> Path:
+    return server_root(app_base, server_id) / RUN_STATE_FILE_NAME
+
+
+def write_run_state(app_base: Path, server_id: str, pid: int, cfg: AppConfig) -> None:
+    """Remember, on disk, the process this manager launched and what it is bound to, so a
+    later manager session can reattach with the right ports and RCON login even after the
+    form was edited, and knows the server is its own."""
+    state: Dict[str, Any] = {"pid": int(pid), "launched": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+    for name in PROCESS_BOUND_FIELDS:
+        if name != "admin_password":
+            state[name] = getattr(cfg, name)
+    password = str(cfg.admin_password or "")
+    try:
+        state["admin_password_enc"] = dpapi_encrypt(password) if password else ""
+    except Exception:
+        state["admin_password_enc"] = ""
+    path = run_state_path(app_base, server_id)
+    ensure_dir(path.parent)
+    atomic_write_text(path, json.dumps(state, indent=2), encoding="utf-8")
+
+
+def read_run_state(app_base: Path, server_id: str) -> Optional[Dict[str, Any]]:
+    path = run_state_path(app_base, server_id)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) and isinstance(data.get("pid"), int) else None
+    except Exception:
+        return None
+
+
+def clear_run_state(app_base: Path, server_id: str) -> None:
+    with contextlib.suppress(OSError):
+        run_state_path(app_base, server_id).unlink()
+
+
+def cfg_from_run_state(cfg: AppConfig, state: Dict[str, Any]) -> AppConfig:
+    """The saved profile with what the recorded process was started with laid over it."""
+    run = copy.deepcopy(cfg)
+    for name in PROCESS_BOUND_FIELDS:
+        if name == "admin_password":
+            enc = str(state.get("admin_password_enc") or "")
+            if enc:
+                with contextlib.suppress(Exception):
+                    run.admin_password = dpapi_decrypt(enc)
+        elif name in state:
+            with contextlib.suppress(Exception):
+                setattr(run, name, type(getattr(run, name))(state[name]))
+    return run
+
+
+def live_rcon_settings(server_dir: Path) -> Tuple[Optional[int], Optional[str], Optional[bool]]:
+    """RCON port, admin password and RCON on/off as the install's live GameUserSettings.ini
+    has them: what a running server read when it started."""
+    try:
+        values = read_ini(server_dir / GAMEUSERSETTINGS_REL).get_last_value_map()
+    except Exception:
+        return None, None, None
+    sec = next((v for k, v in values.items() if k.strip().lower() == "serversettings"), {})
+    low = {k.lower(): v for k, v in sec.items()}
+    port = low.get("rconport", "")
+    enabled = low.get("rconenabled")
+    return (
+        int(port) if str(port).strip().isdigit() else None,
+        low.get("serveradminpassword"),
+        None if enabled is None else str(enabled).strip().lower() == "true",
+    )
+
+
 class ServerRuntime:
     """What one server profile has while the app runs: its process and background state.
 
@@ -5041,6 +5163,9 @@ class ServerRuntime:
         self.auto_update_next: Optional[datetime] = None
         self.auto_update_waiting = False
         self.removed = False  # its profile was removed; nothing may start for it any more
+        # True when this manager launched the running process (now, or in a session whose
+        # run state it found). Only then are the install's INIs its to restore on stop.
+        self.launched_by_us = False
         self.players: Optional[int] = None  # last ListPlayers count while running, None if unknown
         self.auto_update_time = ""  # the HH:MM auto_update_next was computed from
 
@@ -6983,13 +7108,33 @@ class ClusterHealthDialog(tk.Toplevel):
             self.app._fix_health_issue(self.view, issue, parent=self)
             self._recheck()
 
+    # Fixes that change nothing a player owns. Mod lists and data folders change what maps
+    # load and where uploads live; those are fixed one at a time, each with its own question.
+    FIX_ALL_SAFE = ("new_ports", "session_names", "same_platform")
+
     def _fix_all(self) -> None:
-        done: Set[Tuple[str, Tuple[str, ...]]] = set()
-        for issue in list(self._issues):
+        todo: List[HealthIssue] = []
+        seen: Set[Tuple[str, Tuple[str, ...]]] = set()
+        for issue in self._issues:
             key = (issue.fix, tuple(issue.servers))
-            if issue.fix and key not in done:
-                done.add(key)
-                self.app._fix_health_issue(self.view, issue, parent=self, ask=False)
+            if issue.fix in self.FIX_ALL_SAFE and key not in seen:
+                seen.add(key)
+                todo.append(issue)
+        left = [i for i in self._issues if i.fix and i.fix not in self.FIX_ALL_SAFE]
+        if not todo:
+            messagebox.showinfo(
+                "Cluster Health",
+                "The remaining fixes change mod lists or data folders; select each and use Fix Selected.",
+                parent=self,
+            )
+            return
+        lines = [f"- {ServerManagerApp.HEALTH_FIX_LABELS.get(i.fix, i.fix)}: "
+                 + ", ".join(self.app._display_name(sid) for sid in i.servers) for i in todo]
+        extra = ("\n\nMod list and data folder fixes are not included; do them one at a time." if left else "")
+        if not messagebox.askyesno("Cluster Health", "Apply these fixes?\n\n" + "\n".join(lines) + extra, parent=self):
+            return
+        for issue in todo:
+            self.app._fix_health_issue(self.view, issue, parent=self, ask=False)
         self._recheck()
 
 
@@ -7121,6 +7266,7 @@ class ServerManagerApp:
         # Bumped on every profile save, so cached per-profile results know they are stale.
         self._cfg_generation = 0
         self._health_cache: Dict[Tuple[str, Tuple[str, ...]], Tuple[int, float, List[HealthIssue]]] = {}
+        self._health_running: Set[Tuple[str, Tuple[str, ...]]] = set()
         self._initialize_profiles()
 
         self._autosave_after_id: Optional[str] = None
@@ -9448,11 +9594,14 @@ class ServerManagerApp:
             # The handle cannot be waited on: look for the process by its install instead,
             # rather than taking a live server for a stopped one.
             rt.logger.info(f"Watching the reattached server by its handle failed ({e}); checking its process instead.")
-            server_dir = Path(rt.live_cfg().server_dir)
-            while p.pid in find_server_processes(server_dir):
+            exe = _exe_key(str(ark_server_exe(Path(rt.live_cfg().server_dir))))
+            while True:
                 with rt.proc_lock:
                     if rt.proc is not p:
                         return  # stopped (and cleaned up) by the manager meanwhile
+                found = query_server_processes()
+                if found is not None and p.pid not in [x.pid for x in found.get(exe, [])]:
+                    break  # looked, and it is gone; a failed look proves nothing
                 time.sleep(10)
         self._on_process_exit(rt, p)
 
@@ -9475,6 +9624,7 @@ class ServerManagerApp:
             rt.rcon_snapshot = None
             rt.started_at = None
             rt.run_cfg = None
+            clear_run_state(self.app_base, rt.server_id)
             self._auto_restart_server(rt, code)
             self._discord_stop_notifications(rt, requested=False, exit_code=code)
         self._ui(self._refresh_buttons)
@@ -9482,50 +9632,91 @@ class ServerManagerApp:
     def _reattach_running_servers(self) -> None:
         """Pick up servers left running when the manager last closed (or started elsewhere).
 
-        Each install is scanned once; a process is matched to a profile by the game port
-        in its command line, which also tells apart profiles sharing one install.
+        A server this manager launched left a run state behind: it is matched by its PID
+        and gets back exactly the ports and RCON login it runs with. Others are matched by
+        the game port in their command line (or, one profile with one process on an
+        install, by being the only candidates), with the RCON login the install's live INI
+        holds, and are treated as not started by the manager.
         """
+        everything = query_server_processes()
+        if everything is None:
+            self.logger.info("Looking for running servers failed; none were reattached.")
+            return
+        claimed: Set[int] = set()
+        attached: List[str] = []
+
+        def attach(rt: ServerRuntime, proc: FoundProcess, run: AppConfig, ours: bool) -> bool:
+            try:
+                handle = AttachedProcess(proc.pid, expected_exe=ark_server_exe(Path(run.server_dir)))
+            except Exception as e:
+                rt.logger.info(f"Found its server running (PID {proc.pid}) but cannot attach: {e}")
+                return False
+            with rt.proc_lock:
+                if rt.proc is not None:
+                    return False
+                rt.proc = handle
+                rt.run_cfg = run
+                rt.started_at = proc.started or datetime.now()
+                rt.launched_by_us = ours
+            self._capture_runtime_rcon(rt, run)
+            rt.stop_requested.clear()
+            claimed.add(proc.pid)
+            threading.Thread(target=self._watch_attached, args=(rt, handle), daemon=True,
+                             name=f"attached-{rt.server_id}").start()
+            if rt.cfg.discord_enable:
+                with contextlib.suppress(Exception):
+                    self._discord_get_coordinator(rt).start_polling(rt.cfg)
+            how = "as started by this manager" if ours else "started outside this manager or before it kept a record"
+            rt.logger.info(f"Reattached to the running server (PID {proc.pid}, {how}); its console output is not available.")
+            attached.append(self._display_name(rt.server_id))
+            return True
+
+        runtimes = [rt for rt in self._all_runtimes() if not rt.is_running()]
+        all_found = {proc.pid: (key, proc) for key, procs in everything.items() for proc in procs}
+        # 1) Our own launches, by the PID they recorded.
+        for rt in runtimes:
+            state = read_run_state(self.app_base, rt.server_id)
+            if state is None:
+                continue
+            hit = all_found.get(int(state["pid"]))
+            run = cfg_from_run_state(rt.cfg, state)
+            if hit is None or hit[0] != _exe_key(str(ark_server_exe(Path(run.server_dir)))):
+                clear_run_state(self.app_base, rt.server_id)  # that process is gone
+                continue
+            attach(rt, hit[1], run, ours=True)
+        # 2) Everything else, by install folder and game port.
         by_dir: Dict[str, List[ServerRuntime]] = {}
-        for rt in self._all_runtimes():
+        for rt in runtimes:
             if rt.is_running() or not ark_server_exe(Path(rt.cfg.server_dir)).exists():
                 continue
-            key = os.path.normcase(os.path.normpath(rt.cfg.server_dir))
-            by_dir.setdefault(key, []).append(rt)
-        attached: List[str] = []
-        everything = find_all_server_processes() if by_dir else {}
-        for runtimes in by_dir.values():
-            found = everything.get(_exe_key(str(ark_server_exe(Path(runtimes[0].cfg.server_dir)))), [])
-            if not found:
-                continue
-            for proc in found:
+            by_dir.setdefault(_exe_key(str(ark_server_exe(Path(rt.cfg.server_dir)))), []).append(rt)
+        for key, candidates in by_dir.items():
+            procs = [x for x in everything.get(key, []) if x.pid not in claimed]
+            for proc in procs:
                 port = command_line_port(proc.command_line)
-                match = [rt for rt in runtimes if port is not None and int(rt.cfg.port) == port]
-                if not match and port is None and len(runtimes) == 1 and len(found) == 1:
-                    match = runtimes  # one profile, one process, nothing to tell them apart by
-                if len(match) != 1 or match[0].is_running():
+                free = [rt for rt in candidates if not rt.is_running()]
+                match = [rt for rt in free if port is not None and int(rt.cfg.port) == port]
+                if not match and len(candidates) == 1 and len(procs) == 1 and free:
+                    match = free  # one profile, one process on this install: it is that one
+                    if port is not None:
+                        free[0].logger.info(f"Its server runs on port {port}, not the saved {free[0].cfg.port}; attaching anyway.")
+                if len(match) != 1:
+                    if match or port is not None:
+                        self.logger.info(f"A server runs from {candidates[0].cfg.server_dir} (PID {proc.pid}, port {port}) "
+                                         "that no profile could be matched to; it was left alone.")
                     continue
                 rt = match[0]
-                try:
-                    handle = AttachedProcess(proc.pid)
-                except Exception as e:
-                    rt.logger.info(f"Found its server running (PID {proc.pid}) but cannot attach: {e}")
-                    continue
-                with rt.proc_lock:
-                    if rt.proc is not None:
-                        continue
-                    rt.proc = handle
-                    # Best guess at what it runs with: the saved profile.
-                    rt.run_cfg = copy.deepcopy(rt.cfg)
-                    rt.started_at = proc.started or datetime.now()
-                self._capture_runtime_rcon(rt, rt.run_cfg)
-                rt.stop_requested.clear()
-                threading.Thread(target=self._watch_attached, args=(rt, handle), daemon=True,
-                                 name=f"attached-{rt.server_id}").start()
-                if rt.cfg.discord_enable:
-                    with contextlib.suppress(Exception):
-                        self._discord_get_coordinator(rt).start_polling(rt.cfg)
-                rt.logger.info(f"Reattached to the running server (PID {proc.pid}); its console output is not available.")
-                attached.append(self._display_name(rt.server_id))
+                run = copy.deepcopy(rt.cfg)
+                if port is not None:
+                    run.port = port
+                live_port, live_password, live_enabled = live_rcon_settings(Path(run.server_dir))
+                if live_port is not None:
+                    run.rcon_port = live_port
+                if live_password is not None:
+                    run.admin_password = live_password
+                if live_enabled is not None:
+                    run.enable_rcon = live_enabled
+                attach(rt, proc, run, ours=False)
         if attached:
             self._ui(lambda: self._set_status(f"Reattached to running server(s): {', '.join(attached)}"))
         self._ui(self._refresh_buttons)
@@ -9662,14 +9853,18 @@ class ServerManagerApp:
         rt.rcon_snapshot = None
         rt.started_at = None
         rt.run_cfg = None
+        ours = rt.launched_by_us
+        rt.launched_by_us = False
+        clear_run_state(self.app_base, rt.server_id)
 
         # ARK writes config files during shutdown. Treat the live INIs as runtime-generated until
         # the manager explicitly restores or applies a user-authored baseline/staging copy.
-        for ini_name in (GAMEUSERSETTINGS_REL, GAME_INI_REL):
-            try:
-                write_server_ini_runtime_state_for_stage(Path(cfg.server_dir) / ini_name, live_is_runtime=True)
-            except Exception:
-                pass
+        if ours:
+            for ini_name in (GAMEUSERSETTINGS_REL, GAME_INI_REL):
+                try:
+                    write_server_ini_runtime_state_for_stage(Path(cfg.server_dir) / ini_name, live_is_runtime=True)
+                except Exception:
+                    pass
 
         log.info("Server stopped.")
 
@@ -9677,7 +9872,11 @@ class ServerManagerApp:
             backup_path = backup_server(cfg, self.app_base, log, rt.server_id)
             self._ui(lambda: self._set_backup_status(backup_path, label="Backup on stop", rt=rt))
 
-        restore_baseline_to_server(self.app_base, rt.server_id, Path(cfg.server_dir), log)
+        if ours:
+            restore_baseline_to_server(self.app_base, rt.server_id, Path(cfg.server_dir), log)
+        else:
+            # Started outside this manager: its live INIs may hold edits the baseline never saw.
+            log.info("Left the live INIs as they are: this server was not started by the manager.")
         self._ui(self._refresh_buttons)
 
     def _safe_stop(self, rt: ServerRuntime) -> None:
@@ -9843,6 +10042,11 @@ class ServerManagerApp:
             rt.proc = p
             rt.run_cfg = cfg
             rt.started_at = datetime.now()
+            rt.launched_by_us = True
+        try:
+            write_run_state(self.app_base, rt.server_id, p.pid, cfg)
+        except Exception as e:
+            rt.logger.info(f"Could not record the run state (reattach after a restart of the manager may guess): {e}")
 
         threading.Thread(target=self._server_log_reader, args=(rt, p), daemon=True, name=f"log-{rt.server_id}").start()
         self._discord_start_notifications(rt, p.pid)
@@ -11242,22 +11446,44 @@ class ServerManagerApp:
         now = time.monotonic()
         if hit is not None and hit[0] == self._cfg_generation and now - hit[1] < self.HEALTH_CACHE_SEC:
             return hit[2]
-        issues = self._cluster_health(view)
-        self._health_cache[key] = (self._cfg_generation, now, issues)
-        return issues
+        # Worked out on a thread: it touches the disk (installs, a shared cluster drive that
+        # may be slow or gone), which must never freeze the window. Until then, the last result.
+        if key not in self._health_running:
+            self._health_running.add(key)
+            generation = self._cfg_generation
+
+            def work() -> None:
+                try:
+                    issues = self._cluster_health(view)
+                    self._health_cache[key] = (generation, time.monotonic(), issues)
+                except Exception as e:
+                    self.logger.info(f"Cluster health check failed: {e}")
+                finally:
+                    self._health_running.discard(key)
+                self._ui(lambda: self._dash_refresh() if self._dash_visible() else None)
+
+            threading.Thread(target=work, daemon=True, name="health").start()
+        return hit[2] if hit is not None else []
 
     def _cluster_health(self, view: ClusterView) -> List[HealthIssue]:
-        members = [(sid, self._display_name(sid), self._runtime(sid).cfg) for sid in view.members]
+        # A running server is checked with what it runs on, which may differ from its saved
+        # profile until its next restart.
+        members = [(sid, self._display_name(sid), self._runtime(sid).live_cfg()) for sid in view.members]
         member_ids = set(view.members)
-        others = [(r.id, self._display_name(r.id), self._runtime(r.id).cfg)
+        others = [(r.id, self._display_name(r.id), self._runtime(r.id).live_cfg())
                   for r in self.global_cfg.servers if r.id not in member_ids]
         roots = {str(resolve_backup_root(cfg, self.app_base)) for _s, _n, cfg in members + others}
         return cluster_health(members, others, [Path(r) for r in roots])
 
     def _apply_profile_fields(self, server_id: str, **values: Any) -> None:
         """Change saved fields of any profile; the form follows when it shows that profile."""
-        if server_id == self.active_server_id:
-            self._save_form("Settings", show_error=False)  # nothing typed is lost
+        if server_id == self.active_server_id and not self._save_form("Settings", show_error=False):
+            # Reloading the form from disk now would throw away everything typed since the
+            # last save: refuse instead and let the user correct the form first.
+            raise RuntimeError(
+                "The profile on screen has an invalid value, so it cannot be saved first. "
+                "Correct it on the Server tab (the status bar names it), then try again."
+            )
         self._save_profile_fields(server_id, **values)
         if server_id == self.active_server_id:
             self._load_active_server_config(server_id)
@@ -11307,8 +11533,33 @@ class ServerManagerApp:
                         rt.server_id, cluster_enable=True, cluster_id=view.cluster_id,
                         cluster_custom_path_enable=True, cluster_dir_override=str(folder),
                     )
-            elif issue.fix in ("same_mods", "same_platform"):
-                field_name = "mods" if issue.fix == "same_mods" else "server_platform"
+            elif issue.fix == "same_mods":
+                # Never removes a mod (that would delete its dinos and structures from that map's
+                # world, or keep a mod map from loading): every map gets the mods any map has.
+                union: List[str] = []
+                for rt in members:
+                    for mod in rt.cfg.normalized_mods().split(","):
+                        if mod and mod not in union:
+                            union.append(mod)
+                gains = []
+                for rt in members:
+                    have = set(m for m in rt.cfg.normalized_mods().split(",") if m)
+                    new = [m for m in union if m not in have]
+                    if new:
+                        gains.append(f"- {self._display_name(rt.server_id)}: adds {', '.join(new)}")
+                if not gains:
+                    return
+                if ask and not messagebox.askyesno(
+                    "Cluster Health",
+                    "Give every map the same mods by adding the ones it lacks (none are removed):\n\n"
+                    + "\n".join(gains) + "\n\nThe servers download them on their next start.",
+                    parent=parent,
+                ):
+                    return
+                for rt in members:
+                    self._apply_profile_fields(rt.server_id, mods=",".join(union))
+            elif issue.fix == "same_platform":
+                field_name = "server_platform"
                 values: Dict[str, int] = {}
                 for rt in members:
                     v = rt.cfg.normalized_mods() if field_name == "mods" else (rt.cfg.server_platform or "").strip()
@@ -11354,6 +11605,10 @@ class ServerManagerApp:
     def copy_settings(self, source_id: str, targets: List[str], **opts: bool) -> None:
         src_rt = self._runtime(source_id)
         src_dir = Path(src_rt.cfg.server_dir)
+        if src_rt.is_busy():
+            # Its own task (a start, say) may be writing the very staging about to be copied.
+            messagebox.showwarning("Copy Settings", f"A task is running for {self._display_name(source_id)}; copy when it finishes.")
+            return
         # Synced here, once: the copies below run in parallel and must only read the source.
         source_running = self._install_running(str(src_dir))
         try:
@@ -11379,11 +11634,9 @@ class ServerManagerApp:
 
             def after(_sid: str = sid) -> None:
                 if _sid == self.active_server_id:
-                    # The INI Editor shows this server: show what was just staged.
-                    with contextlib.suppress(Exception):
-                        if self._ini_loaded_target:
-                            self._ini_load_target(self._ini_loaded_target)
-                        self._ini_visual_refresh_all()
+                    # The INI Editor shows this server: reload what was just staged straight from
+                    # the files, or its next edit would write its old copy back over the copy.
+                    self._ini_reload_from_staging()
 
             if self._run_task("Copy Settings", job, rt, then=after):
                 started.append(self._display_name(sid))
@@ -12553,6 +12806,18 @@ class ServerManagerApp:
     # ---------------------------------------------------------------------
     # INI Editor
     # ---------------------------------------------------------------------
+    def _ini_reload_from_staging(self) -> None:
+        """Re-read the staged INIs into the editor, without saving the form first."""
+        try:
+            if self._ini_loaded_target and self._ini_paths_current is not None:
+                self._ini_doc = read_ini(self._ini_paths_current.stage)
+                self._ini_refresh_tree()
+        except Exception as e:
+            self.logger.info(f"Reloading the INI Editor failed: {e}")
+            self._reset_ini_state()  # better unloaded than holding stale values
+        with contextlib.suppress(Exception):
+            self._ini_visual_refresh_all()
+
     def _ini_load_target(self, target: str) -> None:
         self.cfg = self._collect_vars_to_cfg()
         self._save_active_server_config(self.cfg)
@@ -12835,6 +13100,31 @@ class ServerManagerApp:
 # ENTRYPOINT
 # =============================================================================
 
+_INSTANCE_MUTEX: Any = None
+
+
+def acquire_single_instance(app_base: Path) -> bool:
+    """One manager per storage folder: a second one would reattach to the first one's
+    servers and run their saves, restarts and updates a second time."""
+    global _INSTANCE_MUTEX
+    if os.name != "nt":
+        return True
+    try:
+        k = ctypes.WinDLL("kernel32", use_last_error=True)
+        k.CreateMutexW.restype = wintypes.HANDLE
+        k.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
+        tag = hashlib.sha1(os.path.normcase(str(app_base)).encode("utf-8")).hexdigest()[:16]
+        handle = k.CreateMutexW(None, False, f"Local\\ARKASAManager-{tag}")
+        if not handle:
+            return True  # cannot tell; do not lock anyone out
+        if ctypes.get_last_error() == 183:  # ERROR_ALREADY_EXISTS
+            return False
+        _INSTANCE_MUTEX = handle  # held for the life of the process
+        return True
+    except Exception:
+        return True
+
+
 def launch_gui(cli_options: Optional[RuntimeCliOptions] = None) -> None:
     opts = cli_options or RuntimeCliOptions()
 
@@ -12878,6 +13168,15 @@ def launch_gui(cli_options: Optional[RuntimeCliOptions] = None) -> None:
             except Exception:
                 pass
         messagebox.showerror("Storage unavailable", str(e))
+        root.destroy()
+        return
+
+    if not acquire_single_instance(app_base):
+        messagebox.showwarning(
+            "Already open",
+            f"{APP_NAME} is already open (it may be minimized). Two managers on the same servers would "
+            "both save, restart and update them; use the window that is open.",
+        )
         root.destroy()
         return
 
