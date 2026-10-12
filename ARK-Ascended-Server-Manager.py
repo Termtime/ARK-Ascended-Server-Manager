@@ -1763,40 +1763,77 @@ def steamcmd_verify_install(install_dir: Path, app_id: int) -> bool:
     exe = install_dir / "ShooterGame" / "Binaries" / "Win64" / "ArkAscendedServer.exe"
     return manifest.exists() or exe.exists()
 
+def copy_file_atomic(src: Path, dst: Path) -> bool:
+    """Copy one file through a temp name, never over an existing file.
+
+    A copy cut short leaves no truncated file that a later "existing files win" rule would
+    keep for good, and os.rename refuses to overwrite on Windows, so a file someone else
+    wrote meanwhile wins. False when dst already existed.
+    """
+    if dst.exists():
+        return False
+    ensure_dir(dst.parent)
+    part = dst.with_name(dst.name + ".part")
+    with contextlib.suppress(OSError):
+        part.unlink()  # left over from a copy that was killed
+    try:
+        shutil.copy2(src, part)
+        os.rename(part, dst)
+    except FileExistsError:
+        with contextlib.suppress(OSError):
+            part.unlink()
+        return False
+    except BaseException:
+        with contextlib.suppress(OSError):
+            part.unlink()
+        raise
+    return True
+
+
+# Parts of an install that belong to that server, not to the game: never copied to a new map.
+SERVER_STATE_DIRS = (
+    ("ShooterGame", "Saved"),  # worlds, configs, logs, cluster data
+    ("ShooterGame", "Binaries", "Win64", "ArkApi"),  # ServerAPI plugins and their data
+    ("ShooterGame", "Binaries", "Win64", "ShooterGame", "ModsUserData"),  # mods' per-server data
+)
+COPY_MARKER_NAME = ".asa_manager_copying"  # present while a copy is unfinished
+
+
 def copy_server_install(src: Path, dst: Path, logger: logging.Logger) -> int:
     """Copy an ASA server install's program files to a new install folder, so SteamCMD only
-    has to bring it up to date instead of downloading the whole server.
+    has to check and finish it instead of downloading the whole server.
 
-    ShooterGame\\Saved (worlds, configs, logs, cluster data) is left out: the new server
-    starts clean. Files already in the target are kept. Returns the number of files copied.
+    What belongs to that server (SERVER_STATE_DIRS) is left out: the new server starts
+    clean. Files already in the target are kept, and a marker file stays until the copy
+    is complete, so an interrupted copy is resumed. Returns the number of files copied.
     """
-    src = src.resolve()
-    saved = (src / "ShooterGame" / "Saved").resolve()
-    copied = 0
+    if path_contains(src, dst):
+        raise ValueError(f"The new install folder {dst} lies inside the install it would copy ({src}).")
+    skip = {tuple(part.lower() for part in rel) for rel in SERVER_STATE_DIRS}
     ensure_dir(dst)
-    for root, dirs, files in os.walk(src):
-        root_path = Path(root)
-        if root_path == saved or saved in root_path.parents:
-            dirs[:] = []
-            continue
-        dirs[:] = [d for d in dirs if (root_path / d).resolve() != saved]
-        rel = root_path.relative_to(src)
-        target_dir = dst / rel
-        ensure_dir(target_dir)
+    marker = dst / COPY_MARKER_NAME
+    atomic_write_text(marker, f"copying from {src}\n", encoding="utf-8")
+
+    def fail(err: OSError) -> None:
+        raise err  # a folder that cannot be read must stop the copy, not leave holes in it
+
+    copied = 0
+    size = 0
+    next_report = 2 * 1024 ** 3
+    for root, dirs, files in os.walk(src, onerror=fail, followlinks=True):
+        rel = Path(root).relative_to(src)
+        rel_parts = tuple(part.lower() for part in rel.parts)
+        dirs[:] = [d for d in dirs if rel_parts + (d.lower(),) not in skip]
         for name in files:
-            target = target_dir / name
-            if target.exists():
-                continue
-            part = target.with_name(name + ".part")
-            try:
-                shutil.copy2(root_path / name, part)
-                os.replace(part, target)
-            except BaseException:
+            if copy_file_atomic(Path(root) / name, dst / rel / name):
+                copied += 1
                 with contextlib.suppress(OSError):
-                    part.unlink()
-                raise
-            copied += 1
-    logger.info(f"Copied {copied} server file(s) from {src} to {dst}.")
+                    size += (dst / rel / name).stat().st_size
+                if size >= next_report:
+                    logger.info(f"Copying server files: {size / 1024 ** 3:.0f} GB so far...")
+                    next_report += 2 * 1024 ** 3
+    marker.unlink()
+    logger.info(f"Copied {copied} server file(s) ({size / 1024 ** 3:.1f} GB) from {src} to {dst}.")
     return copied
 
 
@@ -3310,28 +3347,11 @@ def copy_cluster_data(src: Path, dst: Path, logger: logging.Logger) -> Tuple[int
     ]
     ensure_dir(dst)
     for path in files:
-        target = dst / path.relative_to(src)
-        if target.exists():
+        # Existing files win (an upload another map wrote meanwhile, too).
+        if copy_file_atomic(path, dst / path.relative_to(src)):
+            copied += 1
+        else:
             skipped += 1
-            continue
-        ensure_dir(target.parent)
-        # Through a temp name: a copy cut short must not leave a truncated upload that
-        # "existing files win" would then keep for good. os.rename refuses to overwrite on
-        # Windows, so an upload another map wrote meanwhile still wins.
-        part = target.with_name(target.name + ".part")
-        try:
-            shutil.copy2(path, part)
-            os.rename(part, target)
-        except FileExistsError:
-            with contextlib.suppress(OSError):
-                part.unlink()
-            skipped += 1
-            continue
-        except BaseException:
-            with contextlib.suppress(OSError):
-                part.unlink()
-            raise
-        copied += 1
     logger.info(f"Cluster data: copied {copied} file(s) from {src} to {dst} ({skipped} already there, kept).")
     return copied, skipped
 
@@ -9746,6 +9766,7 @@ class ServerManagerApp:
         *,
         quiet: bool = False,
         then: Optional[Callable[[], None]] = None,
+        after: Optional[Callable[[bool], None]] = None,
     ) -> bool:
         """Start fn on a worker thread for one server; False when that server already runs a task.
 
@@ -9755,7 +9776,7 @@ class ServerManagerApp:
         restarts) report failures in the log and status bar, never in a modal dialog that
         would sit there blocking the window until someone comes back. then runs on the
         Tk thread once fn succeeded and the server is free again, so it may start the
-        next task for it.
+        next task for it; after does the same whether fn worked or not, and is told which.
         """
         rt = rt or self.rt
         if not rt.try_claim(name):
@@ -9784,6 +9805,8 @@ class ServerManagerApp:
                 self._ui(self._refresh_buttons)
                 if ok and then is not None:
                     self._ui(then)
+                if after is not None:
+                    self._ui(lambda: after(ok))  # whatever happened, with whether it worked
 
         try:
             threading.Thread(target=worker, daemon=True, name=f"task-{name}").start()
@@ -9927,6 +9950,7 @@ class ServerManagerApp:
         *,
         copy_from: Optional[Path] = None,
         then: Optional[Callable[[], None]] = None,
+        after: Optional[Callable[[bool], None]] = None,
     ) -> bool:
         """Install the server. With copy_from (an existing install), its program files are
         copied first and SteamCMD only brings them up to date: much faster than a download."""
@@ -9949,27 +9973,38 @@ class ServerManagerApp:
                 steamcmd_exe = ensure_steamcmd(self.global_cfg.steamcmd_dir, log)
 
                 target = Path(rt.cfg.server_dir)
-                if (copy_from is not None and ark_server_exe(copy_from).exists()
-                        and not ark_server_exe(target).exists() and not same_path(copy_from, target)):
-                    log.info(f"Copying the server files from {copy_from} instead of downloading them...")
+                unfinished = (target / COPY_MARKER_NAME).exists()
+                copied = False
+                if (copy_from is not None and ark_server_exe(copy_from).exists() and not same_path(copy_from, target)
+                        and (unfinished or not ark_server_exe(target).exists())):
+                    log.info(f"{'Resuming the copy of' if unfinished else 'Copying'} the server files from {copy_from} "
+                             "instead of downloading them...")
                     copy_server_install(copy_from, target, log)
+                    copied = True
+                elif unfinished:
+                    copied = True  # half a copy and nothing to finish it from: let SteamCMD check every file
 
+                # A copy carries the source's manifest, so SteamCMD would take it as complete:
+                # validate, which only reads the local files, catches anything missing or damaged.
                 steamcmd_app_update(
                     logger=log,
                     steamcmd_exe=steamcmd_exe,
                     install_dir=target,
                     app_id=ARK_ASA_APP_ID,
-                    validate=False,
+                    validate=copied,
                     lock_root=self.app_base,
                     retries=2,
                 )
+                if copied:
+                    with contextlib.suppress(OSError):
+                        (target / COPY_MARKER_NAME).unlink()
             finally:
                 self._update_slot.release()
 
             exe = ark_server_exe(Path(rt.cfg.server_dir))
             log.info(f"Server executable: {exe if exe.exists() else 'NOT FOUND'}")
 
-        return self._run_task("First Install", job, rt, then=then)
+        return self._run_task("First Install", job, rt, then=then, after=after)
 
     def update_validate(self) -> None:
         if not self._save_form("Update / Validate"):
@@ -11990,6 +12025,18 @@ class ServerManagerApp:
             return
         ClusterWizardDialog(self, add_to)
 
+    def _installed_copy_source(self, template: AppConfig, exclude: Set[str]) -> Optional[Path]:
+        """An install to copy the server files from: the template's, else any installed profile's."""
+        if ark_server_exe(Path(template.server_dir)).exists():
+            return Path(template.server_dir)
+        for ref in self.global_cfg.servers:
+            if ref.id in exclude:
+                continue
+            folder = Path(self._runtime(ref.id).cfg.server_dir)
+            if ark_server_exe(folder).exists() and not (folder / COPY_MARKER_NAME).exists():
+                return folder
+        return None
+
     def create_cluster_profiles(
         self,
         plan: List[PlannedServer],
@@ -12066,7 +12113,7 @@ class ServerManagerApp:
         lines = [f"{'Added' if adding else 'Created'} {len(created)} profile(s) in cluster '{cluster['name']}':"]
         lines += [f"- {item.display_name}: {item.server_dir} (ports {item.port}/{item.query_port}/{item.rcon_port})" for item in plan]
         if install and created:
-            source = Path(template.server_dir) if ark_server_exe(Path(template.server_dir)).exists() else None
+            source = self._installed_copy_source(template, exclude=set(created))
             runtimes = [self._runtime(sid) for sid in created]
             if source is not None:
                 # Every map copies the program files of an install that is already there.
@@ -12078,11 +12125,15 @@ class ServerManagerApp:
                 first = runtimes[0]
                 rest = runtimes[1:]
 
-                def install_rest() -> None:
+                def install_rest(ok: bool) -> None:
+                    # Copied from the first map when it installed; downloaded each, if it did not.
+                    source_dir = Path(first.cfg.server_dir) if ok and ark_server_exe(Path(first.cfg.server_dir)).exists() else None
+                    if source_dir is None:
+                        self.logger.info("The first map did not install; the others are downloaded each.")
                     for rt in rest:
-                        self.first_install_for(rt, copy_from=Path(first.cfg.server_dir))
+                        self.first_install_for(rt, copy_from=source_dir)
 
-                self.first_install_for(first, then=install_rest if rest else None)
+                self.first_install_for(first, after=install_rest if rest else None)
                 how = "the first map with a full download, the others by copying it"
             lines.append(
                 f"They are being installed now ({how}); see the console. When they finish, use Start All "
