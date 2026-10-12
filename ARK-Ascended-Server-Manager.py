@@ -3410,6 +3410,130 @@ def group_clusters(
     return list(clusters.values()), standalone
 
 
+@dataclass
+class HealthIssue:
+    """One thing wrong with a cluster. fix names a repair the app can make, if any."""
+    severity: str  # "error" (transfers or starts break), "warning", "info"
+    text: str
+    fix: str = ""
+    servers: List[str] = field(default_factory=list)
+
+
+def _mod_set(csv: str) -> Tuple[str, ...]:
+    return tuple(sorted(m for m in (csv or "").split(",") if m))
+
+
+def cluster_health(
+    members: List[Tuple[str, str, AppConfig]],
+    others: List[Tuple[str, str, AppConfig]],
+    backup_roots: List[Path],
+) -> List[HealthIssue]:
+    """Check a cluster: members and other profiles as (server id, display name, settings).
+
+    Pure: reads no files except whether each member is installed.
+    """
+    issues: List[HealthIssue] = []
+    if not members:
+        return issues
+    names = {sid: name for sid, name, _ in members}
+
+    folders: Dict[str, List[str]] = {}
+    for sid, _name, cfg in members:
+        folder = effective_cluster_dir(cfg)
+        key = os.path.normcase(os.path.normpath(str(folder))) if folder else ""
+        folders.setdefault(key, []).append(sid)
+    if len(folders) > 1:
+        issues.append(HealthIssue(
+            "error",
+            "The maps do not share one cluster data folder, so survivors, dinos and items uploaded on one "
+            "map cannot be downloaded on the others.",
+            fix="same_folder",
+            servers=[sid for sid, _n, _c in members],
+        ))
+    for sid, name, cfg in members:
+        for w in cluster_config_warnings(cfg):
+            sev = "error" if ("spaces" in w or "relative path" in w) else "warning"
+            fix = "own_folder" if "inside this install" in w else ""
+            issues.append(HealthIssue(sev, f"{name}: {w}", fix=fix, servers=[sid]))
+        folder = effective_cluster_dir(cfg)
+        if folder is not None and cfg.cluster_custom_path_enable:
+            installs = [Path(c.server_dir) for _s, _n, c in members + others]
+            problem = cluster_folder_problem(folder, installs, backup_roots, allow_own_saved=False)
+            if problem and "spaces" not in problem and "full path" not in problem:
+                issues.append(HealthIssue("warning", f"{name}: {problem}", fix="same_folder", servers=[sid]))
+
+    mods = {}
+    for sid, _name, cfg in members:
+        mods.setdefault(_mod_set(cfg.normalized_mods()), []).append(sid)
+    if len(mods) > 1:
+        issues.append(HealthIssue(
+            "warning",
+            "The maps run different mod lists. Modded dinos and items are lost when they are moved to a "
+            "map that lacks the mod.",
+            fix="same_mods",
+            servers=[sid for sid, _n, _c in members],
+        ))
+
+    platforms = {(cfg.server_platform or "").strip() for _s, _n, cfg in members}
+    if len(platforms) > 1:
+        issues.append(HealthIssue(
+            "warning",
+            "The maps do not all allow the same platforms (crossplay), so some players cannot reach every map.",
+            fix="same_platform",
+            servers=[sid for sid, _n, _c in members],
+        ))
+
+    seen_ports: Dict[int, str] = {}
+    for sid, name, cfg in others + members:
+        ports = [int(cfg.port), int(cfg.query_port)] + ([int(cfg.rcon_port)] if cfg.enable_rcon else [])
+        for port in ports:
+            owner = seen_ports.get(port)
+            if owner is not None and owner != name and sid in names:
+                issues.append(HealthIssue(
+                    "error", f"{name} uses port {port}, which {owner} uses too; they cannot run at the same time.",
+                    fix="new_ports", servers=[sid],
+                ))
+                break
+            seen_ports.setdefault(port, name)
+
+    sessions: Dict[str, List[str]] = {}
+    for sid, _name, cfg in members:
+        sessions.setdefault((cfg.server_name or "").strip().lower(), []).append(sid)
+    for _key, sids in sessions.items():
+        if len(sids) > 1:
+            issues.append(HealthIssue(
+                "warning",
+                "These maps have the same server name, so players cannot tell them apart in the server list: "
+                + ", ".join(names[s] for s in sids),
+                fix="session_names",
+                servers=sids,
+            ))
+
+    dirs: Dict[str, List[str]] = {}
+    for sid, _name, cfg in members:
+        dirs.setdefault(os.path.normcase(os.path.normpath(cfg.server_dir)), []).append(sid)
+    for sids in dirs.values():
+        if len(sids) > 1:
+            issues.append(HealthIssue(
+                "warning",
+                "These maps share one install folder, and with it their GameUserSettings.ini and Game.ini: "
+                + ", ".join(names[s] for s in sids) + ". Give each map its own install to run them together.",
+                servers=sids,
+            ))
+
+    for sid, name, cfg in members:
+        if not cfg.enable_rcon or not (cfg.admin_password or "").strip():
+            issues.append(HealthIssue(
+                "warning",
+                f"{name}: RCON is off or has no admin password, so the world cannot be saved before a stop, "
+                "and Broadcast and the player count do not work.",
+                servers=[sid],
+            ))
+        if not ark_server_exe(Path(cfg.server_dir)).exists():
+            issues.append(HealthIssue("info", f"{name} is not installed yet (First Install on its Server tab).", servers=[sid]))
+    return issues
+
+
 def pretty_map_name(map_name: str) -> str:
     """'ScorchedEarth_WP' -> 'Scorched Earth'."""
     base = re.sub(r"_WP$", "", (map_name or "").strip(), flags=re.IGNORECASE)
@@ -3997,6 +4121,69 @@ def import_singleplayer_settings(
 
     return res
 
+# Spawn container entries name containers of one map; on another map they mean nothing.
+MAP_SPECIFIC_INI_KEYS = {
+    "configaddnpcspawnentriescontainer",
+    "configsubtractnpcspawnentriescontainer",
+    "configoverridenpcspawnentriescontainer",
+}
+
+
+@dataclass
+class IniCopyResult:
+    applied: Dict[str, int] = field(default_factory=dict)  # "GameUserSettings.ini" -> values written
+    preserved: List[str] = field(default_factory=list)
+
+
+def copy_ini_settings(
+    app_base: Path,
+    source_id: str,
+    source_dir: Path,
+    target_id: str,
+    target_dir: Path,
+    logger: logging.Logger,
+    *,
+    source_running: bool,
+    target_running: bool,
+    include_gus: bool = True,
+    include_game: bool = True,
+    include_map_specific: bool = False,
+) -> IniCopyResult:
+    """Merge one server's staged INI settings into another server's staging.
+
+    Each server keeps what belongs to it: name, ports, passwords, RCON and its mod list.
+    Values only the target has are kept. Applied on the target's next start, like any
+    INI Editor change.
+    """
+    res = IniCopyResult()
+    protected_anywhere = set(SP_MOD_KEYS_LOWER)
+    if not include_map_specific:
+        protected_anywhere |= MAP_SPECIFIC_INI_KEYS
+    for target, enabled in (("gus", include_gus), ("game", include_game)):
+        if not enabled:
+            continue
+        src_paths = ini_stage_paths(app_base, source_id, source_dir, target)
+        ensure_ini_staging_synced(src_paths, server_running=source_running, logger=logger)
+        dst_paths = ini_stage_paths(app_base, target_id, target_dir, target)
+        ensure_ini_staging_synced(dst_paths, server_running=target_running, logger=logger)
+        dest_doc = read_ini(dst_paths.stage)
+        applied, preserved, _ = merge_ini_sections(
+            dest_doc,
+            read_ini(src_paths.stage),
+            skip_sections=set(),
+            protected_keys=SP_PROTECTED_INI_KEYS,
+            protected_anywhere=protected_anywhere,
+            tidy_floats=False,
+        )
+        write_ini(dst_paths.stage, dest_doc)
+        res.applied[dst_paths.stage.name] = applied
+        for label in preserved:
+            if label not in res.preserved:
+                res.preserved.append(label)
+        logger.info(f"Copied {applied} setting(s) into staged {dst_paths.stage.name} from another server.")
+    return res
+
+
 # =============================================================================
 # BACKUP
 # =============================================================================
@@ -4580,6 +4767,115 @@ def find_server_processes(server_dir: Path) -> List[int]:
         if pid.isdigit() and exe and os.path.normcase(os.path.normpath(exe)) == want:
             pids.append(int(pid))
     return pids
+
+@dataclass
+class FoundProcess:
+    pid: int
+    command_line: str
+    started: Optional[datetime] = None
+
+
+def find_server_process_details(server_dir: Path) -> List[FoundProcess]:
+    """ArkAscendedServer.exe processes running from this install, with their command lines,
+    so each can be told apart by the ports it was started with."""
+    if os.name != "nt":
+        return []
+    script = (
+        "Get-CimInstance Win32_Process -Filter \"Name='ArkAscendedServer.exe'\" | "
+        "ForEach-Object { \"$($_.ProcessId)|$($_.CreationDate.ToString('yyyy-MM-dd HH:mm:ss'))|"
+        "$($_.ExecutablePath)|$($_.CommandLine)\" }"
+    )
+    try:
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+            capture_output=True,
+            text=True,
+            timeout=20,
+            creationflags=CREATE_NO_WINDOW,
+        ).stdout
+    except Exception:
+        return []
+    want = os.path.normcase(os.path.normpath(str(ark_server_exe(server_dir))))
+    found: List[FoundProcess] = []
+    for line in (out or "").splitlines():
+        parts = line.strip().split("|", 3)
+        if len(parts) < 3 or not parts[0].isdigit():
+            continue
+        exe = parts[2]
+        if not exe or os.path.normcase(os.path.normpath(exe)) != want:
+            continue
+        started = None
+        with contextlib.suppress(ValueError):
+            started = datetime.strptime(parts[1], "%Y-%m-%d %H:%M:%S")
+        found.append(FoundProcess(pid=int(parts[0]), command_line=parts[3] if len(parts) > 3 else "", started=started))
+    return found
+
+
+def command_line_port(command_line: str) -> Optional[int]:
+    """The game port in an ARK server command line ('...?Port=7777?...')."""
+    m = re.search(r"[?\s]Port=(\d+)", command_line or "", re.IGNORECASE)
+    return int(m.group(1)) if m else None
+
+
+class AttachedProcess:
+    """A server process this manager did not start (it was left running when the manager
+    closed), made to look enough like subprocess.Popen for the start/stop code to use it.
+    There is no stdout to read; a watcher thread waits for it to exit instead."""
+
+    _SYNCHRONIZE = 0x00100000
+    _PROCESS_TERMINATE = 0x0001
+    _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    _WAIT_OBJECT_0 = 0
+    _WAIT_TIMEOUT = 0x102
+    _INFINITE = 0xFFFFFFFF
+
+    def __init__(self, pid: int) -> None:
+        if os.name != "nt":
+            raise OSError("Attaching to a process is only supported on Windows.")
+        k = ctypes.windll.kernel32
+        k.OpenProcess.restype = wintypes.HANDLE
+        k.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        k.WaitForSingleObject.restype = wintypes.DWORD
+        k.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        k.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+        k.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+        k.CloseHandle.argtypes = [wintypes.HANDLE]
+        self._k = k
+        handle = k.OpenProcess(self._SYNCHRONIZE | self._PROCESS_TERMINATE | self._PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            raise OSError(f"Cannot open process {pid} (error {ctypes.GetLastError()}).")
+        self._handle = handle
+        self.pid = pid
+        self.stdout = None
+        self.returncode: Optional[int] = None
+
+    def _exit_code(self) -> Optional[int]:
+        code = wintypes.DWORD()
+        if self._k.GetExitCodeProcess(self._handle, ctypes.byref(code)):
+            return int(code.value)
+        return None
+
+    def poll(self) -> Optional[int]:
+        if self.returncode is None and self._k.WaitForSingleObject(self._handle, 0) == self._WAIT_OBJECT_0:
+            self.returncode = self._exit_code()
+        return self.returncode
+
+    def wait(self, timeout: Optional[float] = None) -> Optional[int]:
+        if self.returncode is not None:
+            return self.returncode
+        ms = self._INFINITE if timeout is None else max(0, int(timeout * 1000))
+        if self._k.WaitForSingleObject(self._handle, ms) == self._WAIT_TIMEOUT:
+            raise subprocess.TimeoutExpired("ArkAscendedServer.exe", timeout or 0)
+        return self.poll()
+
+    def terminate(self) -> None:
+        self._k.TerminateProcess(self._handle, 1)
+
+    kill = terminate
+
+    def __del__(self) -> None:
+        with contextlib.suppress(Exception):
+            self._k.CloseHandle(self._handle)
 
 # =============================================================================
 # GUI LOGGING
@@ -6610,6 +6906,186 @@ class ClusterWizardDialog(tk.Toplevel):
         self.app.create_cluster_profiles(plan, template, shared, cluster, install=install, adding=self.add_to is not None)
 
 
+class ClusterHealthDialog(tk.Toplevel):
+    """List what is wrong with a cluster and repair what can be repaired with one click."""
+
+    SEVERITY_LABELS = {"error": "Problem", "warning": "Warning", "info": "Note"}
+
+    def __init__(self, app: "ServerManagerApp", view: ClusterView) -> None:
+        super().__init__(app.root)
+        self.app = app
+        self.view = view
+        self._issues: List[HealthIssue] = []
+        self.var_summary = tk.StringVar(master=self, value="")
+        self.title(f"Cluster Health - {view.name}")
+        self.transient(app.root)
+        self.configure(background=THEME_COLORS["bg"])
+        apply_initial_window_geometry(self, 900, 520)
+        apply_min_window_size(self, 760, 420)
+        self._build()
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
+        self.bind("<Escape>", lambda _e: self.destroy())
+        self._recheck()
+        self.grab_set()
+        self.focus_set()
+
+    def _build(self) -> None:
+        root = ttk.Frame(self, padding=12)
+        root.grid(row=0, column=0, sticky="nsew")
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(0, weight=1)
+        root.columnconfigure(0, weight=1)
+        root.rowconfigure(1, weight=1)
+        ttk.Label(root, textvariable=self.var_summary, wraplength=860, justify="left").grid(row=0, column=0, sticky="w")
+        self.tree = ttk.Treeview(root, columns=("what", "fix"), show="headings", selectmode="browse")
+        self.tree.heading("what", text="What is wrong")
+        self.tree.heading("fix", text="One-click fix")
+        self.tree.column("what", width=640)
+        self.tree.column("fix", width=160)
+        self.tree.grid(row=1, column=0, sticky="nsew", pady=(8, 0))
+        self.tree.bind("<<TreeviewSelect>>", lambda _e: self._sync())
+        buttons = ttk.Frame(root)
+        buttons.grid(row=2, column=0, sticky="e", pady=(10, 0))
+        self.btn_fix = ttk.Button(buttons, text="Fix Selected", command=self._fix_selected)
+        self.btn_fix.grid(row=0, column=0, padx=(0, 8))
+        self.btn_fix_all = ttk.Button(buttons, text="Fix All", command=self._fix_all)
+        self.btn_fix_all.grid(row=0, column=1, padx=(0, 8))
+        ttk.Button(buttons, text="Check Again", command=self._recheck).grid(row=0, column=2, padx=(0, 8))
+        ttk.Button(buttons, text="Close", command=self.destroy).grid(row=0, column=3)
+
+    def _recheck(self) -> None:
+        view = self.app._cluster_view(self.view.cluster_id)
+        if view is not None:
+            self.view = view
+        self._issues = self.app._cluster_health(self.view)
+        self.tree.delete(*self.tree.get_children())
+        for i, issue in enumerate(self._issues):
+            fix = ServerManagerApp.HEALTH_FIX_LABELS.get(issue.fix, "")
+            self.tree.insert("", "end", iid=str(i), values=(f"{self.SEVERITY_LABELS.get(issue.severity, issue.severity)}: {issue.text}", fix))
+        counts = {sev: sum(1 for x in self._issues if x.severity == sev) for sev in ("error", "warning", "info")}
+        if not self._issues:
+            self.var_summary.set(f"{self.view.name}: no problems found.")
+        else:
+            self.var_summary.set(
+                f"{self.view.name}: {counts['error']} problem(s), {counts['warning']} warning(s), {counts['info']} note(s). "
+                "Fixes change the saved profiles; running maps pick them up on their next restart."
+            )
+        self._sync()
+
+    def _selected(self) -> Optional[HealthIssue]:
+        sel = self.tree.selection()
+        if not sel:
+            return None
+        idx = int(sel[0])
+        return self._issues[idx] if 0 <= idx < len(self._issues) else None
+
+    def _sync(self) -> None:
+        issue = self._selected()
+        self.btn_fix.configure(state="normal" if issue is not None and issue.fix else "disabled")
+        self.btn_fix_all.configure(state="normal" if any(x.fix for x in self._issues) else "disabled")
+
+    def _fix_selected(self) -> None:
+        issue = self._selected()
+        if issue is not None and issue.fix:
+            self.app._fix_health_issue(self.view, issue, parent=self)
+            self._recheck()
+
+    def _fix_all(self) -> None:
+        done: Set[Tuple[str, Tuple[str, ...]]] = set()
+        for issue in list(self._issues):
+            key = (issue.fix, tuple(issue.servers))
+            if issue.fix and key not in done:
+                done.add(key)
+                self.app._fix_health_issue(self.view, issue, parent=self, ask=False)
+        self._recheck()
+
+
+class CopySettingsDialog(tk.Toplevel):
+    """Copy one server's INI settings (rates, taming, breeding...) onto other servers."""
+
+    def __init__(self, app: "ServerManagerApp", source_id: str) -> None:
+        super().__init__(app.root)
+        self.app = app
+        self.source_id = source_id
+        self.var_gus = tk.BooleanVar(master=self, value=True)
+        self.var_game = tk.BooleanVar(master=self, value=True)
+        self.var_spawns = tk.BooleanVar(master=self, value=False)
+        self.var_targets: Dict[str, tk.BooleanVar] = {}
+        src_cfg = app._runtime(source_id).cfg
+        mates: Set[str] = set()
+        if effective_cluster_dir(src_cfg) is not None:
+            view = app._cluster_view(src_cfg.cluster_id.strip())
+            mates = set(view.members) if view else set()
+        self._order = [r.id for r in app.global_cfg.servers if r.id != source_id]
+        for sid in self._order:
+            self.var_targets[sid] = tk.BooleanVar(master=self, value=sid in mates)
+
+        self.title(f"Copy Settings - from {app._display_name(source_id)}")
+        self.transient(app.root)
+        self.configure(background=THEME_COLORS["bg"])
+        apply_initial_window_geometry(self, 680, 520)
+        apply_min_window_size(self, 560, 420)
+        self._build()
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
+        self.bind("<Escape>", lambda _e: self.destroy())
+        self.grab_set()
+        self.focus_set()
+
+    def _build(self) -> None:
+        theme = THEME_COLORS
+        root = ttk.Frame(self, padding=12)
+        root.grid(row=0, column=0, sticky="nsew")
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(0, weight=1)
+        root.columnconfigure(0, weight=1)
+        root.rowconfigure(1, weight=1)
+        ttk.Label(
+            root,
+            text=f"Copy the INI settings of {self.app._display_name(self.source_id)} onto the servers ticked below. "
+                 "Each server keeps its own name, ports, passwords, RCON and mod list, and any setting only it "
+                 "has. The copies are staged and apply on each server's next start.",
+            wraplength=640, justify="left",
+        ).grid(row=0, column=0, sticky="w")
+        lf = ttk.LabelFrame(root, text="Copy To", padding=10)
+        lf.grid(row=1, column=0, sticky="nsew", pady=(10, 0))
+        for i, sid in enumerate(self._order):
+            rt = self.app._runtime(sid)
+            note = "  (running: applies on restart)" if rt.is_running() else ""
+            ttk.Checkbutton(lf, text=self.app._display_name(sid) + note, variable=self.var_targets[sid]) \
+                .grid(row=i, column=0, sticky="w")
+        if not self._order:
+            ttk.Label(lf, text="There is no other server profile yet.", foreground=theme["muted"]).grid(row=0, column=0, sticky="w")
+        opts = ttk.LabelFrame(root, text="What", padding=10)
+        opts.grid(row=2, column=0, sticky="ew", pady=(10, 0))
+        ttk.Checkbutton(opts, text="GameUserSettings.ini (rates, taming, structures...)", variable=self.var_gus).grid(row=0, column=0, sticky="w")
+        ttk.Checkbutton(opts, text="Game.ini (per-level stats, breeding, spawns...)", variable=self.var_game).grid(row=1, column=0, sticky="w")
+        ttk.Checkbutton(
+            opts,
+            text="Also map-specific spawn container entries (only between servers on the same map)",
+            variable=self.var_spawns,
+        ).grid(row=2, column=0, sticky="w", pady=(4, 0))
+        buttons = ttk.Frame(root)
+        buttons.grid(row=3, column=0, sticky="e", pady=(10, 0))
+        ttk.Button(buttons, text="Copy", command=self._on_copy).grid(row=0, column=0, padx=(0, 8))
+        ttk.Button(buttons, text="Cancel", command=self.destroy).grid(row=0, column=1)
+
+    def _on_copy(self) -> None:
+        targets = [sid for sid in self._order if self.var_targets[sid].get()]
+        if not targets:
+            messagebox.showwarning("Copy Settings", "Tick at least one server to copy to.", parent=self)
+            return
+        if not (self.var_gus.get() or self.var_game.get()):
+            messagebox.showwarning("Copy Settings", "Tick GameUserSettings.ini, Game.ini or both.", parent=self)
+            return
+        opts = {
+            "include_gus": bool(self.var_gus.get()),
+            "include_game": bool(self.var_game.get()),
+            "include_map_specific": bool(self.var_spawns.get()),
+        }
+        self.destroy()
+        self.app.copy_settings(self.source_id, targets, **opts)
+
+
 class ServerManagerApp:
     def __init__(self, root: tk.Tk, app_base: Path):
         self.root = root
@@ -6718,6 +7194,8 @@ class ServerManagerApp:
         self._sync_auto_update_scheduler()
         self._start_scheduler()
         self._start_player_poll()
+        self._reattach_done = threading.Event()
+        threading.Thread(target=self._reattach_on_launch, daemon=True, name="reattach").start()
         self._dash_tick()
         # Several profiles: start on the overview. A single server: straight to its settings.
         self.nb.select(self.tab_dash if len(self.global_cfg.servers) > 1 else self.tab_server)
@@ -8023,6 +8501,10 @@ class ServerManagerApp:
         ttk.Button(ini_top, text="Load Game.ini", command=self.load_game_ini).grid(row=0, column=3, padx=4)
         ttk.Button(ini_top, text="Open Live + Staging", command=self.open_loaded_ini).grid(row=0, column=4, padx=4)
         ttk.Button(ini_top, text="Resync from Upstream", command=self._ini_resync_from_upstream).grid(row=0, column=5, padx=4)
+        ttk.Button(
+            ini_top, text="Copy Settings To...",
+            command=lambda: (self._save_form("Copy Settings", show_error=False), self.open_copy_settings(self.active_server_id)),
+        ).grid(row=0, column=6, padx=4)
 
         ttk.Label(ini_top, text="Filter").grid(row=1, column=0, sticky="w", pady=(6, 0))
         ent_filter = ttk.Entry(ini_top, textvariable=self.var_ini_filter)
@@ -8738,8 +9220,20 @@ class ServerManagerApp:
         self.logger.info(f"Logs: {self.log_dir / LOG_FILE_NAME}")
         self._set_status("Ready")
 
+    def _reattach_on_launch(self) -> None:
+        try:
+            self._reattach_running_servers()
+        except Exception as e:
+            self.logger.info(f"Looking for running servers failed: {e}")
+        finally:
+            self._reattach_done.set()
+
     def _auto_start_on_launch(self) -> None:
         if not safe_bool(self.global_cfg.start_on_startup):
+            return
+        # Wait for the scan of running servers, so a server already up is not started twice.
+        if not self._reattach_done.is_set():
+            self.root.after(500, self._auto_start_on_launch)
             return
         if self._is_busy() or self._is_server_running():
             return
@@ -8945,25 +9439,88 @@ class ServerManagerApp:
         except Exception as e:
             rt.logger.info(f"Log reader stopped: {e}")
         finally:
-            code: Optional[int] = None
-            try:
+            self._on_process_exit(rt, p)
+
+    def _watch_attached(self, rt: ServerRuntime, p: AttachedProcess) -> None:
+        """No stdout to follow for a reattached server: wait for it to exit instead."""
+        try:
+            p.wait()
+        except Exception as e:
+            rt.logger.info(f"Watching the reattached server stopped: {e}")
+        self._on_process_exit(rt, p)
+
+    def _on_process_exit(self, rt: ServerRuntime, p: Any) -> None:
+        code: Optional[int] = None
+        try:
+            # Output can end a moment before the process does; give it that moment.
+            code = p.wait(timeout=5)
+            if code is not None:
+                rt.logger.info(f"Server exited with code {code}")
+        except Exception:
+            with contextlib.suppress(Exception):
                 code = p.poll()
-                if code is not None:
-                    rt.logger.info(f"Server exited with code {code}")
-            except Exception:
-                pass
-            with rt.proc_lock:
-                mine = rt.proc is p
-                if mine:
-                    rt.proc = None
+        with rt.proc_lock:
+            mine = rt.proc is p
             if mine:
-                # RCON FIX: server is gone -> runtime snapshot is no longer valid
-                rt.rcon_snapshot = None
-                rt.started_at = None
-                rt.run_cfg = None
-                self._auto_restart_server(rt, code)
-                self._discord_stop_notifications(rt, requested=False, exit_code=code)
-            self._ui(self._refresh_buttons)
+                rt.proc = None
+        if mine:
+            # RCON FIX: server is gone -> runtime snapshot is no longer valid
+            rt.rcon_snapshot = None
+            rt.started_at = None
+            rt.run_cfg = None
+            self._auto_restart_server(rt, code)
+            self._discord_stop_notifications(rt, requested=False, exit_code=code)
+        self._ui(self._refresh_buttons)
+
+    def _reattach_running_servers(self) -> None:
+        """Pick up servers left running when the manager last closed (or started elsewhere).
+
+        Each install is scanned once; a process is matched to a profile by the game port
+        in its command line, which also tells apart profiles sharing one install.
+        """
+        by_dir: Dict[str, List[ServerRuntime]] = {}
+        for rt in self._all_runtimes():
+            if rt.is_running() or not ark_server_exe(Path(rt.cfg.server_dir)).exists():
+                continue
+            key = os.path.normcase(os.path.normpath(rt.cfg.server_dir))
+            by_dir.setdefault(key, []).append(rt)
+        attached: List[str] = []
+        for runtimes in by_dir.values():
+            found = find_server_process_details(Path(runtimes[0].cfg.server_dir))
+            if not found:
+                continue
+            for proc in found:
+                port = command_line_port(proc.command_line)
+                match = [rt for rt in runtimes if port is not None and int(rt.cfg.port) == port]
+                if not match and port is None and len(runtimes) == 1 and len(found) == 1:
+                    match = runtimes  # one profile, one process, nothing to tell them apart by
+                if len(match) != 1 or match[0].is_running():
+                    continue
+                rt = match[0]
+                try:
+                    handle = AttachedProcess(proc.pid)
+                except Exception as e:
+                    rt.logger.info(f"Found its server running (PID {proc.pid}) but cannot attach: {e}")
+                    continue
+                with rt.proc_lock:
+                    if rt.proc is not None:
+                        continue
+                    rt.proc = handle
+                    # Best guess at what it runs with: the saved profile.
+                    rt.run_cfg = copy.deepcopy(rt.cfg)
+                    rt.started_at = proc.started or datetime.now()
+                self._capture_runtime_rcon(rt, rt.run_cfg)
+                rt.stop_requested.clear()
+                threading.Thread(target=self._watch_attached, args=(rt, handle), daemon=True,
+                                 name=f"attached-{rt.server_id}").start()
+                if rt.cfg.discord_enable:
+                    with contextlib.suppress(Exception):
+                        self._discord_get_coordinator(rt).start_polling(rt.cfg)
+                rt.logger.info(f"Reattached to the running server (PID {proc.pid}); its console output is not available.")
+                attached.append(self._display_name(rt.server_id))
+        if attached:
+            self._ui(lambda: self._set_status(f"Reattached to running server(s): {', '.join(attached)}"))
+        self._ui(self._refresh_buttons)
 
     def _rcon_try(self, cmd: str, *, timeout: float = 4.0, rt: Optional[ServerRuntime] = None) -> str:
         rt = rt or self.rt
@@ -9893,8 +10450,8 @@ class ServerManagerApp:
                 "Server running",
                 f"{names}\n{what}.\n\n"
                 f"Yes: stop {them} safely (save, then shut down) and close.\n\n"
-                f"No: close the manager and leave {them} running. Reopening the manager does not "
-                f"reconnect yet; stop {them} later with DoExit from the RCON tab.\n\n"
+                f"No: close the manager and leave {them} running. The manager reconnects to "
+                f"{them} when it is opened again (console output is not available after that).\n\n"
                 "Cancel: keep the manager open.",
                 icon="warning",
             )
@@ -10072,9 +10629,10 @@ class ServerManagerApp:
             ("Back Up Now", lambda: self._dash_server_action("backup")),
             ("Open", self._dash_open_selected),
             ("Cluster...", lambda: self._dash_server_action("cluster")),
+            ("Copy Settings To...", lambda: self._dash_server_action("copy")),
         )):
             b = ttk.Button(srv, text=text, command=cmd)
-            b.grid(row=0, column=i, padx=(0, 6))
+            b.grid(row=i // 5, column=i % 5, padx=(0, 6), pady=(0, 4), sticky="ew")
             self._dash_server_buttons.append(b)
 
         cl = ttk.LabelFrame(tab, text="Selected Cluster", padding=8)
@@ -10087,11 +10645,12 @@ class ServerManagerApp:
             ("Update All", lambda: self._dash_cluster_action("update")),
             ("Back Up All", lambda: self._dash_cluster_action("backup")),
             ("Broadcast...", lambda: self._dash_cluster_action("broadcast")),
+            ("Health Check...", lambda: self._dash_cluster_action("health")),
             ("Rename...", lambda: self._dash_cluster_action("rename")),
             ("Start Delay...", lambda: self._dash_cluster_action("stagger")),
         )):
             b = ttk.Button(cl, text=text, command=cmd)
-            b.grid(row=0, column=i, padx=(0, 6))
+            b.grid(row=i // 5, column=i % 5, padx=(0, 6), pady=(0, 4), sticky="ew")
             self._dash_cluster_buttons.append(b)
         self.var_dash_hint = tk.StringVar(master=self.root, value="")
         ttk.Label(tab, textvariable=self.var_dash_hint, foreground=theme["muted"], wraplength=1100, justify="left") \
@@ -10181,6 +10740,12 @@ class ServerManagerApp:
             op = self._group_ops.get(view.cluster_id)
             if op:
                 status += f" - {op}"
+            try:
+                n_issues = sum(1 for i in self._cluster_health(view) if i.severity in ("error", "warning"))
+            except Exception:
+                n_issues = 0
+            if n_issues:
+                status += f" - {n_issues} issue(s), see Health Check"
             put(
                 f"c:{view.cluster_id}", "", ci,
                 f"Cluster: {view.name}",
@@ -10259,6 +10824,11 @@ class ServerManagerApp:
             if self.active_server_id == sid:
                 self._refresh_server_selector(sid)
                 self.open_cluster_setup()
+            return
+        if action == "copy":
+            if sid == self.active_server_id:
+                self._save_form("Copy Settings", show_error=False)
+            self.open_copy_settings(sid)
             return
         titles = {"start": "Start Server", "stop": "Stop Server", "restart": "Restart Server",
                   "update": "Update & Restart", "backup": "Backup"}
@@ -10386,6 +10956,10 @@ class ServerManagerApp:
         members = [self._runtime(sid) for sid in view.members]
         names = lambda rts: ", ".join(self._display_name(r.server_id) for r in rts)  # noqa: E731
 
+        if action == "health":
+            self.open_cluster_health(view)
+            self._dash_refresh()
+            return
         if action == "rename":
             new = simpledialog.askstring("Rename Cluster", "Display name:", initialvalue=view.name, parent=self.root)
             if new and new.strip():
@@ -10469,6 +11043,15 @@ class ServerManagerApp:
 
         if action == "start":
             stagger = view.stagger_sec
+            errors = [i for i in self._cluster_health(view) if i.severity == "error"]
+            if errors and not messagebox.askyesno(
+                "Start All",
+                f"{len(errors)} problem(s) found in {view.name}:\n- " + "\n- ".join(i.text for i in errors[:6])
+                + "\n\nStart anyway? Health Check... on the Dashboard fixes most of them.",
+                icon="warning",
+                default="no",
+            ):
+                return
 
             def start_all(cancel: threading.Event) -> None:
                 todo = []
@@ -10616,6 +11199,151 @@ class ServerManagerApp:
             "map's game and query ports (UDP) on your router, as for a single server."
         )
         messagebox.showinfo("Cluster", "\n".join(lines))
+
+    # ---------------------------------------------------------------------
+    # Cluster health and settings copy
+    # ---------------------------------------------------------------------
+    HEALTH_FIX_LABELS = {
+        "same_folder": "Use one data folder",
+        "own_folder": "Use the cluster's folder",
+        "same_mods": "Use one mod list",
+        "same_platform": "Use one platform setting",
+        "new_ports": "Pick free ports",
+        "session_names": "Rename servers",
+    }
+
+    def _cluster_health(self, view: ClusterView) -> List[HealthIssue]:
+        members = [(sid, self._display_name(sid), self._runtime(sid).cfg) for sid in view.members]
+        member_ids = set(view.members)
+        others = [(r.id, self._display_name(r.id), self._runtime(r.id).cfg)
+                  for r in self.global_cfg.servers if r.id not in member_ids]
+        roots = {str(resolve_backup_root(cfg, self.app_base)) for _s, _n, cfg in members + others}
+        return cluster_health(members, others, [Path(r) for r in roots])
+
+    def _apply_profile_fields(self, server_id: str, **values: Any) -> None:
+        """Change saved fields of any profile; the form follows when it shows that profile."""
+        if server_id == self.active_server_id:
+            self._save_form("Settings", show_error=False)  # nothing typed is lost
+        self._save_profile_fields(server_id, **values)
+        if server_id == self.active_server_id:
+            self._load_active_server_config(server_id)
+            self._show_active_profile()
+
+    def _cluster_common_folder(self, view: ClusterView) -> Path:
+        """The data folder a cluster should use: the one most members chose, if it is safe."""
+        installs = [Path(self._runtime(r.id).cfg.server_dir) for r in self.global_cfg.servers]
+        counts: Dict[str, int] = {}
+        for sid in view.members:
+            cfg = self._runtime(sid).cfg
+            if cfg.cluster_custom_path_enable and cfg.cluster_dir_override.strip():
+                folder = Path(cfg.cluster_dir_override.strip())
+                if cluster_folder_problem(folder, installs, [], allow_own_saved=False) is None:
+                    counts[str(folder)] = counts.get(str(folder), 0) + 1
+        if counts:
+            return Path(max(counts, key=lambda k: counts[k]))
+        first = self._runtime(view.members[0]).cfg
+        return default_cluster_dir(self.app_base, view.cluster_id, Path(first.server_dir))
+
+    def _fix_health_issue(self, view: ClusterView, issue: HealthIssue, *, parent: Any = None, ask: bool = True) -> None:
+        members = [self._runtime(sid) for sid in view.members]
+        targets = [self._runtime(sid) for sid in issue.servers if sid in view.members] or members
+        try:
+            if issue.fix in ("same_folder", "own_folder"):
+                folder = self._cluster_common_folder(view)
+                who = members if issue.fix == "same_folder" else targets
+                if ask and not messagebox.askyesno(
+                    "Cluster Health",
+                    f"Point {', '.join(self._display_name(r.server_id) for r in who)} at the data folder\n{folder}?\n\n"
+                    "Uploads stored in another folder stay there, so ask players to download them before "
+                    "the maps restart.",
+                    parent=parent,
+                ):
+                    return
+                ensure_dir(folder)
+                for rt in who:
+                    self._apply_profile_fields(
+                        rt.server_id, cluster_enable=True, cluster_id=view.cluster_id,
+                        cluster_custom_path_enable=True, cluster_dir_override=str(folder),
+                    )
+            elif issue.fix in ("same_mods", "same_platform"):
+                field_name = "mods" if issue.fix == "same_mods" else "server_platform"
+                values: Dict[str, int] = {}
+                for rt in members:
+                    v = rt.cfg.normalized_mods() if field_name == "mods" else (rt.cfg.server_platform or "").strip()
+                    values[v] = values.get(v, 0) + 1
+                # The most common one; on a tie, the first map's.
+                first = members[0].cfg.normalized_mods() if field_name == "mods" else (members[0].cfg.server_platform or "").strip()
+                best = max(values, key=lambda v: (values[v], v == first))
+                shown = best or "(none)"
+                if ask and not messagebox.askyesno(
+                    "Cluster Health", f"Set {'the mod list' if field_name == 'mods' else 'the platform setting'} "
+                    f"of every map to:\n{shown}?", parent=parent,
+                ):
+                    return
+                for rt in members:
+                    self._apply_profile_fields(rt.server_id, **{field_name: best})
+            elif issue.fix == "new_ports":
+                for rt in targets:
+                    cfg = copy.deepcopy(rt.cfg)
+                    game, query, rcon = self.auto_assign_ports(cfg, stride=10, max_tries=300, ignore_server_id=rt.server_id)
+                    self._apply_profile_fields(rt.server_id, port=game, query_port=query, rcon_port=rcon)
+                    rt.logger.info(f"Cluster Health: new ports {game}/{query}/{rcon}.")
+            elif issue.fix == "session_names":
+                taken: Set[str] = {(r.cfg.server_name or "").strip().lower() for r in members if r not in targets}
+                for rt in targets:
+                    base = f"{view.name} - {pretty_map_name(rt.cfg.map_name)}"
+                    name, n = base, 2
+                    while name.lower() in taken:
+                        name, n = f"{base} {n}", n + 1
+                    taken.add(name.lower())
+                    self._apply_profile_fields(rt.server_id, server_name=name)
+        except Exception as e:
+            messagebox.showerror("Cluster Health", f"The fix could not be applied: {e}", parent=parent)
+
+    def open_cluster_health(self, view: ClusterView) -> None:
+        ClusterHealthDialog(self, view)
+
+    def open_copy_settings(self, source_id: str) -> None:
+        if len(self.global_cfg.servers) < 2:
+            messagebox.showinfo("Copy Settings", "Add another server profile first; settings are copied between servers.")
+            return
+        CopySettingsDialog(self, source_id)
+
+    def copy_settings(self, source_id: str, targets: List[str], **opts: bool) -> None:
+        src_rt = self._runtime(source_id)
+        src_dir = Path(src_rt.cfg.server_dir)
+        refused: List[str] = []
+        started: List[str] = []
+        for sid in targets:
+            rt = self._runtime(sid)
+
+            def job(_rt: ServerRuntime = rt) -> None:
+                copy_ini_settings(
+                    self.app_base, source_id, src_dir, _rt.server_id, Path(_rt.cfg.server_dir), _rt.logger,
+                    source_running=self._install_running(str(src_dir)),
+                    target_running=self._install_running(_rt.cfg.server_dir),
+                    **opts,
+                )
+
+            def after(_sid: str = sid) -> None:
+                if _sid == self.active_server_id:
+                    # The INI Editor shows this server: show what was just staged.
+                    with contextlib.suppress(Exception):
+                        if self._ini_loaded_target:
+                            self._ini_load_target(self._ini_loaded_target)
+                        self._ini_visual_refresh_all()
+
+            if self._run_task("Copy Settings", job, rt, then=after):
+                started.append(self._display_name(sid))
+            else:
+                refused.append(self._display_name(sid))
+        lines = []
+        if started:
+            lines.append(f"Copying the settings of {self._display_name(source_id)} to: {', '.join(started)}. "
+                         "They apply on each server's next start.")
+        if refused:
+            lines.append(f"Skipped, a task is running for: {', '.join(refused)}. Copy to them when it finishes.")
+        messagebox.showinfo("Copy Settings", "\n\n".join(lines))
 
     # ---------------------------------------------------------------------
     # Scheduler (auto-saves and nightly updates)

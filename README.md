@@ -85,6 +85,12 @@ This manager separates *edit time* and *runtime*:
 - Other settings (backups, auto-saves, updates, Discord, advanced start options) are copied from a template profile you pick; game rates stay per map in each map's INI Editor
 - Cluster names and start delays are stored in the global config; which profiles belong to a cluster still comes from each profile's own cluster settings, so existing clusters show up without any migration
 
+### Cluster health, copying settings, reconnecting
+- **Health Check** (Dashboard, per cluster) lists what keeps a cluster from working: maps on different data folders, a folder kept inside one install, different mod lists or crossplay settings, ports another profile also uses, maps with the same server name, maps sharing one install, RCON off, maps not installed yet. Most have a one-click fix (Fix Selected / Fix All); fixes change the saved profiles and apply on each map's next restart
+- The cluster row on the Dashboard shows how many issues it has, and **Start All** asks before starting a cluster with problems
+- **Copy Settings To...** (Dashboard, per server, and the INI Editor) copies one server's staged GameUserSettings.ini / Game.ini onto other servers: rates, taming, breeding, structures and so on. Each target keeps its own name, ports, passwords, RCON, mod list and any setting only it has; map-specific spawn container entries stay out unless asked for. Applies on each target's next start
+- **Reconnect on launch**: servers left running when the manager closed (or started outside it) are found again by their install folder and game port and show as running, so they can be saved, stopped, backed up, sent RCON and auto-restarted after a crash as usual; only their console output is not available
+
 ### Several servers in one window
 - Every profile has its own runtime: servers run side by side, and the profile selector only picks which one the window shows and edits. Switching never stops anything, and running servers are marked in the selector
 - Start, stop, restart, update, back up and send RCON to the server on screen while others keep running; each server runs one task at a time, different servers run theirs in parallel
@@ -92,7 +98,7 @@ This manager separates *edit time* and *runtime*:
 - Starting refuses a game, query or RCON port another running server already uses
 - The console tags every line with its server and can show only the selected one; each server also logs to `servers/<id>/logs/server.log` (logs rotate at 20 MB, 3 kept)
 - Backups made in the same second by different servers get their own zip file
-- Closing the window offers to stop every running server safely (in parallel) before it closes
+- Closing the window offers to stop every running server safely (in parallel) before it closes, or to leave them running; the manager reconnects to them when it is opened again
 
 ### Clusters
 - **Set Up / Join Cluster...** (Advanced Start Args tab) turns an existing standalone server into the first map of a new cluster, or joins it to a cluster another profile already runs
