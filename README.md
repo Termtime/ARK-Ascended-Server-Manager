@@ -105,7 +105,7 @@ This manager separates *edit time* and *runtime*:
 - Starting refuses a game, query or RCON port another running server already uses
 - The console tags every line with its server and can show only the selected one; each server also logs to `servers/<id>/logs/server.log` (logs rotate at 20 MB, 3 kept)
 - Backups made in the same second by different servers get their own zip file
-- Closing the window offers to stop every running server safely (in parallel) before it closes, or to leave them running; the manager reconnects to them when it is opened again
+- Closing the window while servers run offers three choices: **keep running in the background** (the window hides, and auto-saves, nightly updates, crash restarts and countdowns go on; opening the manager again shows the window), stop every server safely and quit, or quit and leave them running (the manager reconnects to them when it is opened again)
 
 ### Clusters
 - **Set Up / Join Cluster...** (Advanced Start Args tab) turns an existing standalone server into the first map of a new cluster, or joins it to a cluster another profile already runs
@@ -216,7 +216,7 @@ Existing profiles keep working; a few things behave differently:
 - **Running servers are asked for their player count over RCON once a minute**, for the Dashboard
 - **Only one manager runs at a time.** Opening it a second time shows a message instead of a second window
 - **Two profiles never run the same world**: starting a profile is refused while another server runs the same map from the same install with the same save folder
-- Closing the window while servers run now asks whether to stop them or leave them running; servers left running are reconnected the next time the manager opens
+- Closing the window while servers run now asks whether to keep managing them in the background, stop them, or leave them running; opening the manager again while it runs in the background shows its window
 
 ## Running a cluster, step by step
 

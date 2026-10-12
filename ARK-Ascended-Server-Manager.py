@@ -7844,6 +7844,7 @@ class ServerManagerApp:
 
         self._autosave_after_id: Optional[str] = None
         self._autosave_guard = False
+        self._in_background = False  # window hidden, servers still managed
         self._status_key: Optional[Tuple[Any, ...]] = None
         # Ports of servers between their port check and their launch (see _reserve_ports).
         self._starting_ports: Dict[str, Set[int]] = {}
@@ -7910,6 +7911,7 @@ class ServerManagerApp:
         self._start_scheduler()
         self._start_player_poll()
         self._start_stats_sampler()
+        self.root.after(700, self._poll_show_request)
         self._reattach_done = threading.Event()
         threading.Thread(target=self._reattach_on_launch, daemon=True, name="reattach").start()
         self._dash_tick()
@@ -11401,6 +11403,15 @@ class ServerManagerApp:
             logger.info(f"[CLUSTER] Cluster '{cfg.cluster_id.strip()}', data folder {folder}")
 
     def _on_close(self) -> None:
+        running = self._running_runtimes()
+        choice: Optional[str] = None
+        if running:
+            choice = self._ask_close_choice(running)
+            if choice is None:
+                return
+            if choice == "background":
+                self._go_to_background()  # everything keeps going; no question needed
+                return
         with self._runtimes_lock:
             ops = sorted(set(self._group_ops.values()))
         if ops and not messagebox.askyesno(
@@ -11413,23 +11424,8 @@ class ServerManagerApp:
             return
         # Cancelled only once the window really goes (below): backing out of a later
         # question must leave the action running.
-        running = self._running_runtimes()
         if running:
-            names = "\n".join(f"- {self._display_name(rt.server_id)}" for rt in running)
-            what = "is still running" if len(running) == 1 else "are still running"
-            them = "it" if len(running) == 1 else "them"
-            choice = messagebox.askyesnocancel(
-                "Server running",
-                f"{names}\n{what}.\n\n"
-                f"Yes: stop {them} safely (save, then shut down) and close.\n\n"
-                f"No: close the manager and leave {them} running. The manager reconnects to "
-                f"{them} when it is opened again (console output is not available after that).\n\n"
-                "Cancel: keep the manager open.",
-                icon="warning",
-            )
-            if choice is None:
-                return
-            if choice is True:
+            if choice == "stop":
                 # Tasks of servers that are not running (an install, a restore) die with the
                 # window just the same once the running ones are down.
                 idle_busy = [rt for rt in self._all_runtimes() if rt.is_busy() and rt not in running]
@@ -11471,6 +11467,65 @@ class ServerManagerApp:
             self._cancel_countdowns_and_announce(counting)
         self._cancel_groups()
         self.root.destroy()
+
+    def _poll_show_request(self) -> None:
+        """A second launch of the manager asks this one to show its window."""
+        try:
+            if show_event_signaled():
+                self._show_window()
+        finally:
+            with contextlib.suppress(Exception):
+                self.root.after(700, self._poll_show_request)
+
+    def _show_window(self) -> None:
+        with contextlib.suppress(Exception):
+            self.root.deiconify()
+            self.root.state("normal")
+            self.root.lift()
+            self.root.focus_force()
+        if self._in_background:
+            self._in_background = False
+            self.logger.info("Back from the background.")
+
+    def _go_to_background(self) -> None:
+        """Hide the window but keep managing: auto-saves, nightly updates, crash restarts and
+        countdowns go on. Opening the manager again shows the window."""
+        self._in_background = True
+        self.logger.info("Running in the background: servers stay managed. Open the manager again to show this window.")
+        self.root.withdraw()
+
+    def _ask_close_choice(self, running: List[ServerRuntime]) -> Optional[str]:
+        """'stop', 'background', 'leave' or None (cancel), for closing while servers run."""
+        names = ", ".join(self._display_name(rt.server_id) for rt in running)
+        result: Dict[str, Optional[str]] = {"choice": None}
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Servers running")
+        dlg.transient(self.root)
+        dlg.configure(background=THEME_COLORS["bg"])
+        body = ttk.Frame(dlg, padding=14)
+        body.grid(row=0, column=0, sticky="nsew")
+        ttk.Label(body, text=f"Still running: {names}", wraplength=520, justify="left",
+                  font=("Segoe UI", 10, "bold")).grid(row=0, column=0, sticky="w")
+        options = (
+            ("background", "Keep running in the background",
+             "Hides this window; the servers stay managed (auto-saves, updates, crash restarts, countdowns). "
+             "Open the manager again to show it."),
+            ("stop", "Stop the servers and quit", "Saves and shuts down every running server, then quits."),
+            ("leave", "Quit and leave the servers running",
+             "The servers keep running without the manager; it reconnects to them when it is opened again."),
+        )
+        for i, (key, label, hint) in enumerate(options, start=1):
+            ttk.Button(body, text=label, command=lambda k=key: (result.__setitem__("choice", k), dlg.destroy())) \
+                .grid(row=2 * i - 1, column=0, sticky="ew", pady=(10 if i == 1 else 6, 0))
+            ttk.Label(body, text=hint, foreground=THEME_COLORS["muted"], wraplength=520, justify="left") \
+                .grid(row=2 * i, column=0, sticky="w")
+        ttk.Button(body, text="Cancel", command=dlg.destroy).grid(row=2 * len(options) + 1, column=0, sticky="e", pady=(12, 0))
+        dlg.protocol("WM_DELETE_WINDOW", dlg.destroy)
+        dlg.bind("<Escape>", lambda _e: dlg.destroy())
+        dlg.grab_set()
+        dlg.focus_set()
+        self.root.wait_window(dlg)
+        return result["choice"]
 
     def _stop_and_close(self, running: List[ServerRuntime]) -> None:
         # No new timer tasks while closing: one could claim a server between the check
@@ -14319,8 +14374,7 @@ def acquire_single_instance(app_base: Path) -> bool:
         k = ctypes.WinDLL("kernel32", use_last_error=True)
         k.CreateMutexW.restype = wintypes.HANDLE
         k.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
-        tag = hashlib.sha1(os.path.normcase(str(app_base)).encode("utf-8")).hexdigest()[:16]
-        handle = k.CreateMutexW(None, False, f"Local\\ARKASAManager-{tag}")
+        handle = k.CreateMutexW(None, False, f"Local\\ARKASAManager-{_instance_tag(app_base)}")
         err = ctypes.get_last_error()
         if not handle:
             # Access denied: a manager running with more rights holds it.
@@ -14331,6 +14385,62 @@ def acquire_single_instance(app_base: Path) -> bool:
         return True
     except Exception:
         return True
+
+
+_SHOW_EVENT: Any = None
+
+
+def _instance_tag(app_base: Path) -> str:
+    return hashlib.sha1(os.path.normcase(str(app_base)).encode("utf-8")).hexdigest()[:16]
+
+
+def create_show_event(app_base: Path) -> Any:
+    """The running manager's "show your window" signal (a named auto-reset event)."""
+    global _SHOW_EVENT
+    if os.name != "nt":
+        return None
+    try:
+        k = ctypes.WinDLL("kernel32", use_last_error=True)
+        k.CreateEventW.restype = wintypes.HANDLE
+        k.CreateEventW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.BOOL, wintypes.LPCWSTR]
+        _SHOW_EVENT = k.CreateEventW(None, False, False, f"Local\\ARKASAManager-show-{_instance_tag(app_base)}") or None
+    except Exception:
+        _SHOW_EVENT = None
+    return _SHOW_EVENT
+
+
+def show_event_signaled() -> bool:
+    """True once each time a second launch asked this manager to show itself."""
+    if _SHOW_EVENT is None:
+        return False
+    try:
+        k = ctypes.windll.kernel32
+        k.WaitForSingleObject.restype = wintypes.DWORD
+        k.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        return k.WaitForSingleObject(_SHOW_EVENT, 0) == 0
+    except Exception:
+        return False
+
+
+def signal_show_event(app_base: Path) -> bool:
+    """Ask the manager that is already running to show its window; False if it cannot be asked."""
+    if os.name != "nt":
+        return False
+    try:
+        k = ctypes.WinDLL("kernel32", use_last_error=True)
+        k.OpenEventW.restype = wintypes.HANDLE
+        k.OpenEventW.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.LPCWSTR]
+        k.SetEvent.argtypes = [wintypes.HANDLE]
+        k.CloseHandle.argtypes = [wintypes.HANDLE]
+        handle = k.OpenEventW(0x0002, False, f"Local\\ARKASAManager-show-{_instance_tag(app_base)}")  # EVENT_MODIFY_STATE
+        if not handle:
+            return False
+        try:
+            return bool(k.SetEvent(handle))
+        finally:
+            k.CloseHandle(handle)
+    except Exception:
+        return False
 
 
 def launch_gui(cli_options: Optional[RuntimeCliOptions] = None) -> None:
@@ -14380,13 +14490,16 @@ def launch_gui(cli_options: Optional[RuntimeCliOptions] = None) -> None:
         return
 
     if not acquire_single_instance(app_base):
-        messagebox.showwarning(
-            "Already open",
-            f"{APP_NAME} is already open (it may be minimized). Two managers on the same servers would "
-            "both save, restart and update them; use the window that is open.",
-        )
+        # Already running (perhaps in the background): bring that window up instead.
+        if not signal_show_event(app_base):
+            messagebox.showwarning(
+                "Already open",
+                f"{APP_NAME} is already open (it may be minimized or running in the background). Two managers "
+                "on the same servers would both save, restart and update them; use the one that is open.",
+            )
         root.destroy()
         return
+    create_show_event(app_base)
 
     _ = ServerManagerApp(root, app_base)
     root.mainloop()
