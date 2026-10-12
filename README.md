@@ -76,6 +76,15 @@ This manager separates *edit time* and *runtime*:
 
 ![INI Editor](docs/img/ASA_Server_Manager_Preview_5.png)
 
+### Dashboard and cluster wizard
+- **Dashboard** tab: every server at a glance, grouped by cluster (plus standalone servers), with status, current task, players, ports, uptime and install folder; it refreshes by itself
+- Per server: Start, Stop, Restart, Update & Restart, Back Up, Open (switch the other tabs to it) and Cluster... (set up or join)
+- Per cluster: **Start All** (stopped maps one after another, a configurable delay apart), **Stop All**, **Restart All** one map at a time so the rest stays up, **Update All** (running maps take turns and come back up; stopped installed maps are just updated), **Back Up All**, **Broadcast** a chat message to every running map, Rename and Start Delay
+- **New Cluster** wizard: pick a name and the maps, where the installs go, and the shared settings (admin and join password, max players, mods, crossplay). It previews every profile it will create with its install folder and ports, then creates one profile per map with its own install, all in one cluster with a shared data folder, and can install them right away
+- **Add Maps to Cluster**: the same wizard for an existing cluster; maps already in it are greyed out and the cluster's settings are prefilled
+- Other settings (backups, auto-saves, updates, Discord, advanced start options) are copied from a template profile you pick; game rates stay per map in each map's INI Editor
+- Cluster names and start delays are stored in the global config; which profiles belong to a cluster still comes from each profile's own cluster settings, so existing clusters show up without any migration
+
 ### Several servers in one window
 - Every profile has its own runtime: servers run side by side, and the profile selector only picks which one the window shows and edits. Switching never stops anything, and running servers are marked in the selector
 - Start, stop, restart, update, back up and send RCON to the server on screen while others keep running; each server runs one task at a time, different servers run theirs in parallel
