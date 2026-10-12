@@ -76,6 +76,14 @@ This manager separates *edit time* and *runtime*:
 
 ![INI Editor](docs/img/ASA_Server_Manager_Preview_5.png)
 
+### Several servers in one window
+- Every profile has its own runtime: servers run side by side, and the profile selector only picks which one the window shows and edits. Switching never stops anything, and running servers are marked in the selector
+- Start, stop, restart, update, back up and send RCON to the server on screen while others keep running; each server runs one task at a time, different servers run theirs in parallel
+- Auto-saves and the nightly Auto Update & Restart run for every profile that has them on, not just the one on screen
+- Starting refuses a game, query or RCON port another running server already uses
+- The console tags every line with its server and can show only the selected one; each server also logs to `servers/<id>/logs/server.log`
+- Closing the window offers to stop every running server safely (in parallel) before it closes
+
 ### Clusters
 - **Set Up / Join Cluster...** (Advanced Start Args tab) turns an existing standalone server into the first map of a new cluster, or joins it to a cluster another profile already runs
 - Sets the cluster ID and gives the cluster one shared data folder (by default `<manager storage>\clusters\<id>`), so transfers work across separate installs; without a shared folder each install keeps uploads in its own `Saved\clusters` and other maps never see them
