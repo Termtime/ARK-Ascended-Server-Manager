@@ -131,6 +131,7 @@ This manager separates *edit time* and *runtime*:
 - Logs
 - Mechanics / performance flags
 - Hover over any option to see what it does and the start option it sets (descriptions follow the ARK wiki)
+- **Address shown in the server browser** (Platform / Crossplay): the address the in-game server browser gives players for this server (`-PublicIPForEpic`). Empty, players get the internet address Epic sees, which only works with the game port forwarded. Set it to an address your players can reach, such as a VPN or LAN address, and they can join straight from the browser instead of typing `open <ip>:<port>`. **Use for Every Map in the Cluster** sets the same address on the cluster's other maps; it applies on each map's next start. It is left out of cluster exports, since it belongs to this network
 
 ### Backups + retention
 - Optional backup on stop

@@ -7,6 +7,7 @@ import contextlib
 import ctypes
 import copy
 import hashlib
+import ipaddress
 import json
 import logging
 import logging.handlers
@@ -678,6 +679,10 @@ START_OPTION_HELP: Dict[str, str] = {
                 "Lets two servers run from one install without sharing a save.",
     "crossplay": "-ServerPlatform=PC+XSX+WINGDK\nAccepts players on PC (Steam), Xbox Series X|S and the Microsoft Store\n"
                  "version. Off: PC players only.",
+    "public_ip": "-PublicIPForEpic=<IP>\nThe address the in-game server browser gives players for this server.\n"
+                 "Empty: the internet address Epic sees, which only works with the game port forwarded.\n"
+                 "Set it to the address your players can reach (for example a VPN or LAN address)\n"
+                 "to let them join straight from the server browser. Applies on the next start.",
     "battleye": "BattlEye anti-cheat. Off starts the server with -NoBattlEye\n(players then join without BattlEye running).",
     "dino_default": "Wild creatures spawn as usual.",
     "NoDinos": "-NoDinos\nNo wild creatures spawn.",
@@ -1426,6 +1431,9 @@ class AppConfig:
     mech_ignoredupeditems: bool = False
 
     custom_start_args: str = ""
+    # The address the in-game server browser gives players for this server
+    # (-PublicIPForEpic). Empty: the internet address Epic sees, as usual.
+    public_ip_for_epic: str = ""
 
     discord_enable: bool = False
     discord_webhook_url: str = ""
@@ -3351,6 +3359,20 @@ def server_config_dir(server_dir: Path) -> Path:
     return server_dir / "ShooterGame" / "Saved" / "Config" / "WindowsServer"
 
 
+def normalize_public_ip(raw: str) -> str:
+    """The server browser address as typed, checked: an IP address, or empty for none."""
+    text = (raw or "").strip()
+    if not text:
+        return ""
+    try:
+        return str(ipaddress.ip_address(text))
+    except ValueError:
+        raise ValueError(
+            f"'{text}' is not an IP address. The address shown in the server browser must be an IP "
+            "such as 203.0.113.5 (or empty to use the server's internet address)."
+        ) from None
+
+
 def split_custom_start_args(raw: str) -> List[str]:
     cleaned = (raw or "").strip()
     if not cleaned:
@@ -3452,7 +3474,13 @@ def build_server_command(cfg: AppConfig) -> List[str]:
     if cfg.mech_ignoredupeditems:
         flags.append("-ignoredupeditems")
 
-    flags.extend(split_custom_start_args(cfg.custom_start_args))
+    public_ip = (cfg.public_ip_for_epic or "").strip()
+    custom = split_custom_start_args(cfg.custom_start_args)
+    if public_ip:
+        # The setting is what counts: a copy typed into the custom arguments would conflict.
+        custom = [t for t in custom if not t.lower().startswith("-publicipforepic=")]
+        flags.append(f"-PublicIPForEpic={public_ip}")
+    flags.extend(custom)
 
     return [str(exe), url, *flags]
 
@@ -3935,6 +3963,7 @@ CLUSTER_EXPORT_FORMAT = "ark-asa-manager-cluster"
 EXPORT_LEFT_OUT_FIELDS = {
     "server_dir", "backup_dir", "cluster_dir_override", "admin_password", "join_password",
     "discord_webhook_url", "discord_webhook_url_enc", "schema_version", "rcon_host",
+    "public_ip_for_epic",  # an address of this network, not of the next machine
 }
 
 
@@ -8849,6 +8878,47 @@ class ServerManagerApp:
                 return f"{label} · {name}"
         return label
 
+    def _public_ip_use_for_cluster(self) -> None:
+        """Give every map of this profile's cluster the same server browser address."""
+        if not self._save_form("Server Browser Address"):
+            return
+        sid = self.active_server_id
+        view = self._cluster_of(sid)
+        if view is None:
+            messagebox.showinfo(
+                "Server Browser Address",
+                "This profile is not part of a cluster. Turn on Enable Cluster first (Server tab or Cluster...).",
+            )
+            return
+        others = [m for m in view.members if m != sid]
+        if not others:
+            messagebox.showinfo("Server Browser Address", f"{self._display_name(sid)} is the only map of {view.name} so far.")
+            return
+        value = self.rt.cfg.public_ip_for_epic
+        names = "\n".join(f"- {self._display_name(m)}" for m in others)
+        shown = value or "(empty: each map uses the server's internet address)"
+        if not messagebox.askyesno(
+            "Server Browser Address",
+            f"Set the address shown in the server browser to {shown} for these maps of {view.name}?\n\n{names}",
+        ):
+            return
+        done: List[str] = []
+        failed: List[str] = []
+        for other in others:
+            try:
+                self._save_profile_fields(other, public_ip_for_epic=value)
+                done.append(other)
+            except Exception as e:
+                failed.append(f"- {self._display_name(other)}: {e}")
+        running = [self._display_name(o) for o in done + [sid] if self._runtime(o).is_running()]
+        msg = f"Server browser address set on {len(done)} map(s). It applies when each map next starts."
+        if running:
+            msg += f"\n\nRestart these to use it now: {', '.join(running)}."
+        if failed:
+            messagebox.showwarning("Server Browser Address", msg + "\n\nNot set:\n" + "\n".join(failed))
+        else:
+            messagebox.showinfo("Server Browser Address", msg)
+
     def _discord_use_for_cluster(self) -> None:
         """Give every map of this profile's cluster the same Discord setup (webhook,
         notifications, mentions), so the whole cluster posts to one channel."""
@@ -9067,6 +9137,7 @@ class ServerManagerApp:
         self.var_m_ignoredupeditems = tk.BooleanVar(master=m)
 
         self.var_custom_start_args = tk.StringVar(master=m)
+        self.var_public_ip_for_epic = tk.StringVar(master=m)
 
         self.var_rcon_cmd = tk.StringVar(master=m)
         self.var_rcon_saved = tk.StringVar(master=m)
@@ -9523,6 +9594,21 @@ class ServerManagerApp:
             text="Enable BattlEye",
             variable=self.var_enable_battleye
         ), "battleye").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        lf_platform.columnconfigure(0, weight=1)
+        tip(ttk.Label(lf_platform, text="Address shown in the server browser (optional)"), "public_ip") \
+            .grid(row=2, column=0, sticky="w", pady=(10, 0))
+        ip_row = ttk.Frame(lf_platform)
+        ip_row.grid(row=3, column=0, sticky="ew", pady=(4, 0))
+        ip_row.columnconfigure(0, weight=1)
+        tip(ttk.Entry(ip_row, textvariable=self.var_public_ip_for_epic), "public_ip").grid(row=0, column=0, sticky="ew")
+        ttk.Button(ip_row, text="Use for Every Map in the Cluster", command=self._public_ip_use_for_cluster) \
+            .grid(row=0, column=1, padx=(6, 0))
+        ttk.Label(
+            lf_platform,
+            text="Players clicking the server in the browser connect to this address. Empty: the internet "
+                 "address, which needs the game port forwarded.",
+            foreground=theme["muted"], wraplength=440, justify="left",
+        ).grid(row=4, column=0, sticky="w", pady=(4, 0))
 
         lf_dinos = ttk.LabelFrame(self.tab_adv, text="Dinosaur Settings (mutual exclusive)", padding=10)
         lf_dinos.grid(row=0, column=1, sticky="nsew", padx=5, pady=5)
@@ -10052,6 +10138,7 @@ class ServerManagerApp:
         self.var_m_ignoredupeditems.set(cfg.mech_ignoredupeditems)
 
         self.var_custom_start_args.set(cfg.custom_start_args)
+        self.var_public_ip_for_epic.set(cfg.public_ip_for_epic)
 
         self._rcon_refresh_saved(cfg)
 
@@ -10068,6 +10155,7 @@ class ServerManagerApp:
         cfg.max_players = safe_int(self.var_max_players.get(), DEFAULT_MAX_PLAYERS) or DEFAULT_MAX_PLAYERS
 
         cfg.server_platform = "PC+XSX+WINGDK" if bool(self.var_server_platform_crossplay.get()) else ""
+        cfg.public_ip_for_epic = normalize_public_ip(self.var_public_ip_for_epic.get())
 
         # RCON FIX NOTE: keep mapping strict - JoinPassword != AdminPassword
         cfg.join_password = (self.var_join_password.get() or "").strip()
@@ -10206,7 +10294,7 @@ class ServerManagerApp:
             self.var_steamcmd_dir, self.var_auto_start_on_launch, self.var_server_dir,
             self.var_map_preset, self.var_map_custom, self.var_server_name,
             self.var_port, self.var_query_port, self.var_max_players,
-            self.var_server_platform_crossplay,
+            self.var_server_platform_crossplay, self.var_public_ip_for_epic,
             self.var_join_password, self.var_admin_password,
             self.var_enable_battleye, self.var_automanaged_mods, self.var_validate_on_update,
             self.var_enable_rcon, self.var_rcon_host, self.var_rcon_port,
