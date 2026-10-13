@@ -3365,12 +3365,53 @@ def normalize_public_ip(raw: str) -> str:
     if not text:
         return ""
     try:
-        return str(ipaddress.ip_address(text))
+        if "%" in text:
+            raise ValueError("scoped")
+        ip = ipaddress.ip_address(text)
     except ValueError:
         raise ValueError(
             f"'{text}' is not an IP address. The address shown in the server browser must be an IP "
             "such as 203.0.113.5 (or empty to use the server's internet address)."
         ) from None
+    if ip.is_unspecified or ip.is_multicast or str(ip) == "255.255.255.255":
+        raise ValueError(f"'{text}' is not an address players can connect to. Use the address they reach this PC on.")
+    return str(ip)
+
+
+def is_public_ip_arg(token: str) -> bool:
+    """A -PublicIPForEpic=... launch option, quoted or not."""
+    return token.strip().strip("\"'").lower().startswith("-publicipforepic=")
+
+
+def effective_public_ip(cfg: AppConfig) -> str:
+    """The server browser address this profile launches with: its setting when valid, else
+    a -PublicIPForEpic= typed into its custom arguments, else "" (the internet address)."""
+    try:
+        ip = normalize_public_ip(cfg.public_ip_for_epic)
+    except ValueError:
+        ip = ""
+    if ip:
+        return ip
+    for token in split_custom_start_args(cfg.custom_start_args):
+        if is_public_ip_arg(token):
+            return token.strip().strip("\"'").split("=", 1)[1].strip().strip("\"'")
+    return ""
+
+
+def public_ip_note(raw: str) -> str:
+    """What to tell the user about the address typed: why it is refused, or a caution."""
+    text = (raw or "").strip()
+    if not text:
+        return ""
+    try:
+        ip = ipaddress.ip_address(normalize_public_ip(text))
+    except ValueError as e:
+        return f"Not saved: {e}"
+    if ip.is_loopback:
+        return "Only this PC can reach this address; other players cannot join through it."
+    if ip.is_link_local:
+        return "A link-local address: usually only reachable on this one network cable or Wi-Fi."
+    return ""
 
 
 def split_custom_start_args(raw: str) -> List[str]:
@@ -3474,11 +3515,14 @@ def build_server_command(cfg: AppConfig) -> List[str]:
     if cfg.mech_ignoredupeditems:
         flags.append("-ignoredupeditems")
 
-    public_ip = (cfg.public_ip_for_epic or "").strip()
+    try:
+        public_ip = normalize_public_ip(cfg.public_ip_for_epic)
+    except ValueError:
+        public_ip = ""  # a hand-edited or broken value: the server's internet address, as without it
     custom = split_custom_start_args(cfg.custom_start_args)
     if public_ip:
         # The setting is what counts: a copy typed into the custom arguments would conflict.
-        custom = [t for t in custom if not t.lower().startswith("-publicipforepic=")]
+        custom = [t for t in custom if not is_public_ip_arg(t)]
         flags.append(f"-PublicIPForEpic={public_ip}")
     flags.extend(custom)
 
@@ -3881,6 +3925,16 @@ def cluster_health(
             servers=[sid for sid, _n, _c in members],
         ))
 
+    addresses = {effective_public_ip(cfg) for _s, _n, cfg in members}
+    if len(addresses) > 1:
+        issues.append(HealthIssue(
+            "warning",
+            "The maps give the server browser different addresses (" + ", ".join(sorted(a or "internet address" for a in addresses))
+            + "), so players can join some maps from the browser but not others.",
+            fix="same_public_ip",
+            servers=[sid for sid, _n, _c in members],
+        ))
+
     platforms = {(cfg.server_platform or "").strip() for _s, _n, cfg in members}
     if len(platforms) > 1:
         issues.append(HealthIssue(
@@ -3992,7 +4046,9 @@ def cluster_export_document(
     servers = []
     for display_name, cfg, ini in members:
         settings = {k: v for k, v in asdict(cfg).items() if k not in EXPORT_LEFT_OUT_FIELDS}
-        settings["custom_start_args"] = strip_arg_secrets(cfg.custom_start_args)
+        settings["custom_start_args"] = " ".join(
+            t for t in split_custom_start_args(strip_arg_secrets(cfg.custom_start_args)) if not is_public_ip_arg(t)
+        )
         servers.append({
             "display_name": display_name,
             "settings": settings,
@@ -4065,6 +4121,9 @@ def settings_from_export(values: Dict[str, Any]) -> AppConfig:
             pass
     if cfg.discord_enable and not cfg.discord_webhook_url.strip():
         cfg.discord_enable = False  # the webhook never travels in a cluster file
+    # The exporting network's server browser address never comes along, not even typed into
+    # the custom arguments (files made before it was left out of exports).
+    cfg.custom_start_args = " ".join(t for t in split_custom_start_args(cfg.custom_start_args) if not is_public_ip_arg(t))
     return cfg
 
 
@@ -7789,7 +7848,7 @@ class ClusterHealthDialog(tk.Toplevel):
 
     # Fixes that change nothing a player owns. Mod lists and data folders change what maps
     # load and where uploads live; those are fixed one at a time, each with its own question.
-    FIX_ALL_SAFE = ("new_ports", "session_names", "same_platform")
+    FIX_ALL_SAFE = ("new_ports", "session_names", "same_platform", "same_public_ip")
 
     def _fix_all(self) -> None:
         todo: List[HealthIssue] = []
@@ -8878,23 +8937,36 @@ class ServerManagerApp:
                 return f"{label} · {name}"
         return label
 
-    def _public_ip_use_for_cluster(self) -> None:
-        """Give every map of this profile's cluster the same server browser address."""
-        if not self._save_form("Server Browser Address"):
-            return
+    def _cluster_others(self, title: str) -> Optional[Tuple[str, ClusterView, List[str]]]:
+        """For a "use for every map" action: the on-screen profile (saved first), its cluster
+        and the cluster's other maps; None, with the reason shown, when there are none."""
+        if not self._save_form(title):
+            return None
         sid = self.active_server_id
         view = self._cluster_of(sid)
         if view is None:
             messagebox.showinfo(
-                "Server Browser Address",
-                "This profile is not part of a cluster. Turn on Enable Cluster first (Server tab or Cluster...).",
+                title, "This profile is not part of a cluster. Turn on Enable Cluster first (Server tab or Cluster...)."
             )
-            return
+            return None
         others = [m for m in view.members if m != sid]
         if not others:
-            messagebox.showinfo("Server Browser Address", f"{self._display_name(sid)} is the only map of {view.name} so far.")
+            messagebox.showinfo(title, f"{self._display_name(sid)} is the only map of {view.name} so far.")
+            return None
+        return sid, view, others
+
+    def _public_ip_use_for_cluster(self) -> None:
+        """Give every map of this profile's cluster the same server browser address."""
+        title = "Server Browser Address"
+        try:
+            value = normalize_public_ip(self.var_public_ip_for_epic.get())
+        except ValueError as e:
+            messagebox.showwarning(title, str(e))  # never copied to every map half typed
             return
-        value = self.rt.cfg.public_ip_for_epic
+        picked = self._cluster_others(title)
+        if picked is None:
+            return
+        sid, view, others = picked
         names = "\n".join(f"- {self._display_name(m)}" for m in others)
         shown = value or "(empty: each map uses the server's internet address)"
         if not messagebox.askyesno(
@@ -8910,7 +8982,14 @@ class ServerManagerApp:
                 done.append(other)
             except Exception as e:
                 failed.append(f"- {self._display_name(other)}: {e}")
-        running = [self._display_name(o) for o in done + [sid] if self._runtime(o).is_running()]
+        # Only maps running with another address need a restart (#5); runtimes not made yet are
+        # of maps nobody ran this session.
+        with self._runtimes_lock:
+            rts = {o: self._runtimes.get(o) for o in done + [sid]}
+        running = [
+            self._display_name(o) for o, r in rts.items()
+            if r is not None and r.is_running() and effective_public_ip(r.run_cfg or r.cfg) != value
+        ]
         msg = f"Server browser address set on {len(done)} map(s). It applies when each map next starts."
         if running:
             msg += f"\n\nRestart these to use it now: {', '.join(running)}."
@@ -8922,19 +9001,10 @@ class ServerManagerApp:
     def _discord_use_for_cluster(self) -> None:
         """Give every map of this profile's cluster the same Discord setup (webhook,
         notifications, mentions), so the whole cluster posts to one channel."""
-        if not self._save_form("Discord"):
+        picked = self._cluster_others("Discord")
+        if picked is None:
             return
-        sid = self.active_server_id
-        view = self._cluster_of(sid)
-        if view is None:
-            messagebox.showinfo(
-                "Discord", "This profile is not part of a cluster. Turn on Enable Cluster first (Server tab or Cluster...)."
-            )
-            return
-        others = [m for m in view.members if m != sid]
-        if not others:
-            messagebox.showinfo("Discord", f"{self._display_name(sid)} is the only map of {view.name} so far.")
-            return
+        sid, view, others = picked
         src = self.rt.cfg
         if src.discord_enable and not src.discord_webhook_url.strip():
             messagebox.showwarning("Discord", "Enter the webhook URL first (or turn Discord notifications off).")
@@ -9138,6 +9208,10 @@ class ServerManagerApp:
 
         self.var_custom_start_args = tk.StringVar(master=m)
         self.var_public_ip_for_epic = tk.StringVar(master=m)
+        self.var_public_ip_note = tk.StringVar(master=m, value="")
+        self.var_public_ip_for_epic.trace_add(
+            "write", lambda *_: self.var_public_ip_note.set(public_ip_note(self.var_public_ip_for_epic.get()))
+        )
 
         self.var_rcon_cmd = tk.StringVar(master=m)
         self.var_rcon_saved = tk.StringVar(master=m)
@@ -9604,11 +9678,15 @@ class ServerManagerApp:
         ttk.Button(ip_row, text="Use for Every Map in the Cluster", command=self._public_ip_use_for_cluster) \
             .grid(row=0, column=1, padx=(6, 0))
         ttk.Label(
+            lf_platform, textvariable=self.var_public_ip_note,
+            foreground=theme["warning"], wraplength=440, justify="left",
+        ).grid(row=4, column=0, sticky="w", pady=(2, 0))
+        ttk.Label(
             lf_platform,
             text="Players clicking the server in the browser connect to this address. Empty: the internet "
                  "address, which needs the game port forwarded.",
             foreground=theme["muted"], wraplength=440, justify="left",
-        ).grid(row=4, column=0, sticky="w", pady=(4, 0))
+        ).grid(row=5, column=0, sticky="w", pady=(4, 0))
 
         lf_dinos = ttk.LabelFrame(self.tab_adv, text="Dinosaur Settings (mutual exclusive)", padding=10)
         lf_dinos.grid(row=0, column=1, sticky="nsew", padx=5, pady=5)
@@ -10155,7 +10233,13 @@ class ServerManagerApp:
         cfg.max_players = safe_int(self.var_max_players.get(), DEFAULT_MAX_PLAYERS) or DEFAULT_MAX_PLAYERS
 
         cfg.server_platform = "PC+XSX+WINGDK" if bool(self.var_server_platform_crossplay.get()) else ""
-        cfg.public_ip_for_epic = normalize_public_ip(self.var_public_ip_for_epic.get())
+        try:
+            cfg.public_ip_for_epic = normalize_public_ip(self.var_public_ip_for_epic.get())
+        except ValueError:
+            # Often only half typed: background saves (autosave, an INI edit, a new profile) keep
+            # the last valid one; the note under the field says so, and actions the user clicks
+            # (Start, Restart, ...) refuse it in _save_form.
+            cfg.public_ip_for_epic = (self.cfg.public_ip_for_epic if self.cfg is not None else "") or ""
 
         # RCON FIX NOTE: keep mapping strict - JoinPassword != AdminPassword
         cfg.join_password = (self.var_join_password.get() or "").strip()
@@ -10437,6 +10521,14 @@ class ServerManagerApp:
 
     def _save_form(self, title: str = "Settings", *, show_error: bool = True) -> bool:
         """Save the form into the profile it shows, so a job can start from the saved settings."""
+        if show_error:
+            # An action the user asked for must not start with an address other than the one
+            # on screen (the background saves keep the last valid one instead).
+            try:
+                normalize_public_ip(self.var_public_ip_for_epic.get())
+            except ValueError as e:
+                messagebox.showerror(title, f"Address shown in the server browser: {e}")
+                return False
         try:
             self.cfg = self._collect_vars_to_cfg()
             self._save_active_server_config(self.cfg)
@@ -13350,6 +13442,7 @@ class ServerManagerApp:
         "own_folder": "Use the cluster's folder",
         "same_mods": "Use one mod list",
         "same_platform": "Use one platform setting",
+        "same_public_ip": "Use one server browser address",
         "new_ports": "Pick free ports",
         "session_names": "Rename servers",
     }
@@ -13477,6 +13570,22 @@ class ServerManagerApp:
                     return
                 for rt in members:
                     self._apply_profile_fields(rt.server_id, mods=",".join(union))
+            elif issue.fix == "same_public_ip":
+                # The address most maps were given (a set one wins over none: someone chose it).
+                counts: Dict[str, int] = {}
+                for rt in members:
+                    v = effective_public_ip(rt.cfg)  # a valid address only, never a broken string
+                    if v:
+                        counts[v] = counts.get(v, 0) + 1
+                best_ip = max(counts, key=lambda v: counts[v]) if counts else ""
+                if ask and not messagebox.askyesno(
+                    "Cluster Health",
+                    f"Set the address shown in the server browser of every map to:\n{best_ip or '(the internet address)'}?\n\n"
+                    "It applies when each map next starts.", parent=parent,
+                ):
+                    return
+                for rt in members:
+                    self._apply_profile_fields(rt.server_id, public_ip_for_epic=best_ip)
             elif issue.fix == "same_platform":
                 field_name = "server_platform"
                 values: Dict[str, int] = {}
