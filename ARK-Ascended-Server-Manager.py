@@ -2573,13 +2573,32 @@ def redact_webhook(url: str) -> str:
 
 
 class DiscordWebhookClient:
+    # Messages being sent right now, by any client: quitting waits for them (a crash report
+    # sent from a watcher thread would otherwise die with the process).
+    in_flight = 0
+    _flight_lock = threading.Lock()
+
     def __init__(self, webhook_url: str, logger: logging.Logger, timeout: float = 8.0):
         self.webhook_url = webhook_url.strip()
         validate_discord_webhook_url(self.webhook_url)
         self.logger = logger
         self.timeout = timeout
 
+    @classmethod
+    def sending(cls) -> bool:
+        with cls._flight_lock:
+            return cls.in_flight > 0
+
     def post(self, payload: Dict[str, Any]) -> None:
+        with DiscordWebhookClient._flight_lock:
+            DiscordWebhookClient.in_flight += 1
+        try:
+            self._send(payload)
+        finally:
+            with DiscordWebhookClient._flight_lock:
+                DiscordWebhookClient.in_flight -= 1
+
+    def _send(self, payload: Dict[str, Any]) -> None:
         if not self.webhook_url:
             self.logger.info("[Discord] Webhook URL missing; send skipped.")
             return
@@ -2611,6 +2630,7 @@ class DiscordWebhookClient:
                     delay = float(retry_after) if retry_after else 0.0
                 except Exception:
                     delay = 0.0
+                delay = min(delay, 10.0)  # Discord can ask for far longer; one retry is enough
                 if delay > 0:
                     self.logger.info(f"[Discord] Rate limited. Retrying in {delay:.1f}s.")
                     time.sleep(delay)
@@ -7941,6 +7961,7 @@ class ServerManagerApp:
         self._closing_stop = False  # "stop the servers and quit" is under way
         self._quit_when_idle = False  # in the background only until the running tasks finish
         self._quit_check_id: Optional[str] = None
+        self._grab_on_show: Any = None  # a modal dialog hidden with the window
         self._followups = 0  # tasks finished whose then/after have not run yet
         self._followups_lock = threading.Lock()
         self._status_key: Optional[Tuple[Any, ...]] = None
@@ -8720,7 +8741,7 @@ class ServerManagerApp:
             done.append(other)
             if rt.discord is not None:
                 rt.discord.update_config(rt.cfg)
-            if live:
+            if live and rt.is_running():  # it may have stopped since
                 rt.discord.start_polling(rt.cfg)
             elif rt.is_running():
                 later.append(self._display_name(other))
@@ -10145,6 +10166,7 @@ class ServerManagerApp:
         def worker() -> None:
             self._ui(self._refresh_buttons)
             ok = False
+            quiet_error: Optional[str] = None
             try:
                 rt.logger.info(f"=== {name} started ===")
                 fn()
@@ -10156,7 +10178,7 @@ class ServerManagerApp:
                 err = str(e)
                 rt.logger.error(f"{name} failed: {err}")
                 if quiet:
-                    self._ui(lambda _err=err: self._set_status_for(rt, f"{name} failed: {_err}"))
+                    quiet_error = err
                 else:
                     self._ui(lambda _err=err: messagebox.showerror(title, _err))
             finally:
@@ -10165,6 +10187,16 @@ class ServerManagerApp:
                     self._followups += 1
                 rt.release()
                 self._ui(self._refresh_buttons)
+                if quiet_error is not None:
+                    # After the refresh, which would put "Ready" over it. Finishing in the
+                    # background to quit, a failure is what the user must see: say it in a box
+                    # (which brings the window back and keeps it open).
+                    def report(_err: str = quiet_error) -> None:
+                        if self._quit_when_idle:
+                            messagebox.showwarning(title, f"{name} failed: {_err}")
+                        else:
+                            self._set_status_for(rt, f"{name} failed: {_err}")
+                    self._ui(report)
                 if ok and then is not None:
                     self._ui(then)
                 if after is not None:
@@ -10507,6 +10539,17 @@ class ServerManagerApp:
         self._on_process_exit(rt, p)
 
     def _on_process_exit(self, rt: ServerRuntime, p: Any) -> None:
+        # Work left until reported: finishing in the background must not quit before the
+        # crash message went out or an auto-restart claimed the server.
+        with self._followups_lock:
+            self._followups += 1
+        try:
+            self._handle_process_exit(rt, p)
+        finally:
+            with self._followups_lock:
+                self._followups -= 1
+
+    def _handle_process_exit(self, rt: ServerRuntime, p: Any) -> None:
         code: Optional[int] = None
         try:
             # Output can end a moment before the process does; give it that moment.
@@ -10557,6 +10600,7 @@ class ServerManagerApp:
                     return False
                 rt.proc = handle
                 rt.run_cfg = run
+                rt.ended_run_cfg = None
                 rt.started_at = proc.started or datetime.now()
                 rt.launched_by_us = ours
             self._capture_runtime_rcon(rt, run)
@@ -10797,8 +10841,13 @@ class ServerManagerApp:
         rt.stop_requested.set()
         pid = rt.pid()
         self._discord_request_stop(rt)
-        self._stop_server_impl(rt)
-        self._discord_stop_notifications(rt, requested=True, pid=pid)
+        try:
+            self._stop_server_impl(rt)
+        finally:
+            # Also when something after the shutdown failed (a backup on stop): the server is
+            # down, so say so. Still running means the stop itself failed: nothing to report.
+            if not rt.is_running():
+                self._discord_stop_notifications(rt, requested=True, pid=pid)
 
     def stop_server_safe(self) -> None:
         # Stopping needs nothing from the form, so an invalid field must not keep a server up.
@@ -10981,6 +11030,7 @@ class ServerManagerApp:
             )
             rt.proc = p
             rt.run_cfg = cfg
+            rt.ended_run_cfg = None
             rt.started_at = datetime.now()
             rt.launched_by_us = True
         try:
@@ -11688,7 +11738,7 @@ class ServerManagerApp:
                 # Tasks of servers that are not running (an install, a restore) die with the
                 # window just the same once the running ones are down.
                 idle_busy = [rt for rt in self._all_runtimes() if rt.is_busy() and rt not in running]
-                if idle_busy and not messagebox.askyesno(
+                if idle_busy and not tasks_cut_ok and not messagebox.askyesno(
                     "Task running",
                     "A task is still running for " + ", ".join(self._display_name(rt.server_id) for rt in idle_busy)
                     + ". It is cut off when the window closes, which can leave it half done.\n\n"
@@ -11736,6 +11786,14 @@ class ServerManagerApp:
                 self.root.after(700, self._poll_show_request)
 
     def _show_window(self) -> None:
+        grab, self._grab_on_show = self._grab_on_show, None
+        if grab is not None:
+            def regrab() -> None:
+                with contextlib.suppress(Exception):
+                    if grab.winfo_exists():
+                        grab.grab_set()
+            with contextlib.suppress(Exception):
+                self.root.after(150, regrab)  # once it is mapped again
         with contextlib.suppress(Exception):
             if self.root.state() == "iconic":
                 self.root.state("normal")  # back to maximized if it was
@@ -11747,9 +11805,13 @@ class ServerManagerApp:
             # Briefly on top: Windows may refuse a plain focus change from a background process.
             self.root.attributes("-topmost", True)
             self.root.after(300, lambda: self.root.attributes("-topmost", False))
-            self.root.focus_force()
+            modal = self.root.grab_current()  # an open dialog keeps the keyboard
+            (modal if modal is not None else self.root).focus_force()
         if self._in_background:
             self._in_background = False
+            with contextlib.suppress(Exception):
+                if self._dash_visible():
+                    self._dash_refresh()  # it was not redrawn while hidden
             self._quit_when_idle = False  # the user is back: never quit under them
             if self._quit_check_id is not None:
                 with contextlib.suppress(Exception):
@@ -11817,9 +11879,12 @@ class ServerManagerApp:
         dlg.focus_set()
         self.root.wait_window(dlg)
         if prev_grab is not None:
-            with contextlib.suppress(Exception):
-                if prev_grab.winfo_exists():
-                    prev_grab.grab_set()
+            if result["choice"] == "background":
+                self._grab_on_show = prev_grab  # hidden with the window: grab again once shown
+            else:
+                with contextlib.suppress(Exception):
+                    if prev_grab.winfo_exists():
+                        prev_grab.grab_set()
         return result["choice"]
 
     def _followups_done(self) -> None:
@@ -11848,7 +11913,7 @@ class ServerManagerApp:
     def _work_left(self) -> bool:
         with self._runtimes_lock:
             ops = bool(self._group_ops)
-        return ops or self._followups_pending() or self._any_busy()
+        return ops or self._followups_pending() or self._any_busy() or DiscordWebhookClient.sending()
 
     def _restore_if_minimized(self) -> None:
         """A dialog of a minimized window would stay out of sight."""
@@ -11908,11 +11973,27 @@ class ServerManagerApp:
         self.logger.info("Tasks finished; quitting.")
         self._quit_now()
 
+    QUIT_SEND_WAIT_SEC = 15.0
+
     def _quit_now(self) -> None:
-        """The window goes, and the manager with it."""
+        """The window goes, and the manager with it, once Discord messages being sent (a
+        crash report) went out, for at most QUIT_SEND_WAIT_SEC."""
         self._cancel_groups()
         close_show_event()
-        self.root.destroy()
+        if not DiscordWebhookClient.sending():
+            self.root.destroy()
+            return
+        with contextlib.suppress(Exception):
+            self.root.withdraw()
+        deadline = time.monotonic() + self.QUIT_SEND_WAIT_SEC
+
+        def wait() -> None:
+            if DiscordWebhookClient.sending() and time.monotonic() < deadline:
+                self.root.after(200, wait)
+            else:
+                self.root.destroy()
+
+        wait()
 
     def _can_background(self) -> bool:
         """Only where opening the manager again can bring the hidden window back."""
@@ -12233,7 +12314,7 @@ class ServerManagerApp:
 
     def _dash_tick(self) -> None:
         try:
-            if self._dash_visible():
+            if self._dash_visible() and not self._in_background:
                 self._dash_refresh()
         finally:
             with contextlib.suppress(Exception):
@@ -12422,10 +12503,13 @@ class ServerManagerApp:
             except Exception as e:
                 self.logger.error(f"Cluster {cluster_id}: {label} failed: {e}")
             finally:
+                with self._followups_lock:
+                    self._followups += 1  # what it queued (a failure warning) runs before any quit
                 with self._runtimes_lock:
                     self._group_ops.pop(cluster_id, None)
                     self._group_cancel.pop(cluster_id, None)
                 self._ui(self._dash_refresh)
+                self._ui(self._followups_done)
 
         threading.Thread(target=worker, daemon=True, name=f"group-{cluster_id}").start()
         return True
@@ -14828,6 +14912,12 @@ def create_show_event(app_base: Path) -> Any:
         try:
             name = f"Local\\ARKASAManager-show-{_instance_tag(app_base)}"
             _SHOW_EVENT = k.CreateEventW(ctypes.byref(sa) if sa is not None else None, False, False, name) or None
+            if _SHOW_EVENT is None and ctypes.get_last_error() == 5:
+                # It still exists (a launch has it open this instant), and its DACL refuses
+                # the full access CreateEvent asks for: wait and modify are all we need.
+                k.OpenEventW.restype = wintypes.HANDLE
+                k.OpenEventW.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.LPCWSTR]
+                _SHOW_EVENT = k.OpenEventW(0x100002, False, name) or None
         finally:
             if sd:
                 k.LocalFree(sd)
