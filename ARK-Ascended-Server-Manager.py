@@ -2731,17 +2731,39 @@ class DiscordNotificationCoordinator:
         self._server_instance_id: Optional[str] = None
         self._stop_requested = False
         # Which server a message is from ("PvE Land · The Island"), shown at the top of each
-        # one: several maps of a cluster often post to the same channel.
-        self.source_label = ""
+        # one: several maps of a cluster often post to the same channel. Asked for on every
+        # message, so a renamed cluster or a changed map shows at once.
+        self.label_fn: Optional[Callable[[], str]] = None
+        self.instance_pid: Optional[int] = None  # the server run start_instance was told about
+
+    def source_label(self) -> str:
+        fn = self.label_fn
+        if fn is None:
+            return ""
+        try:
+            return (fn() or "").strip()
+        except Exception as e:
+            self.logger.info(f"[Discord] Could not name the server for the message: {type(e).__name__}: {e}")
+            return ""
+
+    def end_instance(self, pid: Optional[int]) -> None:
+        """The run is over and reported: forget it, unless a newer run (another PID) took over."""
+        if pid is None or self.instance_pid in (None, pid):
+            self._server_instance_id = None
+            self.instance_pid = None
+
+    def polling(self) -> bool:
+        return bool(self._poll_thread and self._poll_thread.is_alive() and not self._stop_event.is_set())
 
     def _post(self, payload: Dict[str, Any]) -> None:
-        if not self._webhook:
+        webhook = self._webhook  # the settings can change meanwhile; send with the one checked
+        if not webhook:
             return
-        label = self.source_label.strip()
+        label = self.source_label()
         if label:
             for embed in payload.get("embeds") or []:
                 embed.setdefault("author", {"name": label[:256]})
-        self._webhook.post(payload)
+        webhook.post(payload)
 
     def update_config(self, cfg: AppConfig) -> None:
         self._cfg = cfg
@@ -2767,6 +2789,7 @@ class DiscordNotificationCoordinator:
         self.update_config(cfg)
         instance_id = f"{utc_now_iso()}_pid{pid}"
         self._server_instance_id = instance_id
+        self.instance_pid = pid
         self._stop_requested = False
         with self._state_lock:
             state = self.state_store.load()
@@ -5599,11 +5622,18 @@ class ServerRuntime:
         self.memory_bytes: Optional[int] = None
         self._cpu_sample: Optional[Tuple[float, float, int]] = None  # (wall clock, cpu seconds, pid)
         self.auto_update_time = ""  # the HH:MM auto_update_next was computed from
+        self.ended_run_cfg: Optional[AppConfig] = None  # the last run's settings, for its stop message
 
     def is_running(self) -> bool:
         with self.proc_lock:
             p = self.proc
         return p is not None and p.poll() is None
+
+    def end_run(self) -> None:
+        """The process is gone: its settings stay readable until its stop is reported."""
+        if self.run_cfg is not None:
+            self.ended_run_cfg = self.run_cfg
+        self.run_cfg = None
 
     def live_cfg(self) -> AppConfig:
         """Settings to act on for this server now.
@@ -8581,28 +8611,43 @@ class ServerManagerApp:
                 rt.logger,
                 lambda cmd, timeout, _rt=rt: self._rcon_try(cmd, timeout=timeout, rt=_rt),
             )
-        rt.discord.source_label = self._discord_source_label(rt.server_id)
+            rt.discord.label_fn = lambda _sid=rt.server_id: self._discord_source_label(_sid)
         rt.discord.update_config(rt.cfg)
         return rt.discord
 
     def _discord_update_config(self) -> None:
         rt = self.rt
         if rt.discord is not None:
-            rt.discord.source_label = self._discord_source_label(rt.server_id)
             rt.discord.update_config(rt.cfg)
 
     def _cluster_of(self, server_id: str) -> Optional[ClusterView]:
         return next((c for c in self._cluster_views()[0] if server_id in c.members), None)
 
     def _discord_source_label(self, server_id: str) -> str:
-        """'PvE Land · The Island' for a map of a cluster, else the profile's name."""
-        try:
-            view = self._cluster_of(server_id)
-            if view is not None:
-                return f"{view.name} · {pretty_map_name(self._runtime(server_id).cfg.map_name or DEFAULT_MAP)}"
-            return self._display_name(server_id)
-        except Exception:
-            return ""
+        """'PvE Land · The Island' for a map of a cluster, else the profile's name.
+
+        From what the server runs on (its map and cluster as started), and cheap: it is
+        asked on every message, from worker threads too."""
+        with self._runtimes_lock:
+            rt = self._runtimes.get(server_id)
+            others = [o for o in self._runtimes.values() if o is not rt and not o.removed]
+        name = self._display_name(server_id)
+        if rt is None:
+            return name
+        ended = rt.ended_run_cfg
+        cfg = rt.live_cfg() if ended is None or rt.is_running() else ended
+        if effective_cluster_dir(cfg) is None:
+            return name
+        cid = cfg.cluster_id.strip()
+        cluster = str((self.global_cfg.clusters.get(cid) or {}).get("name") or cid)
+        label = f"{cluster} · {pretty_map_name(cfg.map_name or DEFAULT_MAP)}"
+        # Two copies of one map in a cluster: the profile name tells them apart.
+        for o in others:
+            oc = o.live_cfg()
+            if (effective_cluster_dir(oc) is not None and oc.cluster_id.strip() == cid
+                    and (oc.map_name or DEFAULT_MAP).lower() == (cfg.map_name or DEFAULT_MAP).lower()):
+                return f"{label} · {name}"
+        return label
 
     def _discord_use_for_cluster(self) -> None:
         """Give every map of this profile's cluster the same Discord setup (webhook,
@@ -8624,33 +8669,53 @@ class ServerManagerApp:
         if src.discord_enable and not src.discord_webhook_url.strip():
             messagebox.showwarning("Discord", "Enter the webhook URL first (or turn Discord notifications off).")
             return
+        if src.discord_webhook_url.strip():
+            # A typo here would replace every map's working webhook with one that cannot post.
+            try:
+                validate_discord_webhook_url(src.discord_webhook_url)
+            except ValueError as e:
+                messagebox.showwarning("Discord", f"The webhook URL is not valid, so it was not copied:\n\n{e}")
+                return
         names = "\n".join(f"- {self._display_name(m)}" for m in others)
+        if src.discord_enable:
+            what = "Each message names its map, so one channel serves the whole cluster."
+        else:
+            what = ("Discord notifications are OFF on this profile, so this turns them off for these maps too"
+                    + ("" if src.discord_webhook_url.strip() else " (each keeps its own webhook URL)") + ".")
         if not messagebox.askyesno(
             "Use for Every Map",
             f"Give these maps of {view.name} the Discord settings of {self._display_name(sid)} "
-            f"(webhook, notifications, mentions)?\n\n{names}\n\n"
-            "Each message names its map, so one channel serves the whole cluster.",
+            f"(webhook, notifications, mentions)?\n\n{names}\n\n{what}",
         ):
             return
         values = {k: getattr(src, k) for k in DISCORD_SHARED_FIELDS}
+        if not src.discord_webhook_url.strip():
+            values.pop("discord_webhook_url")  # nothing to share: each map keeps its own
         done: List[str] = []
         failed: List[str] = []
+        later: List[str] = []
         for other in others:
+            rt = self._runtime(other)
+            # Discord on for this very run (told at its start, or polling since a reconnect):
+            # it follows the new settings now. Anything else picks them up at its next start.
+            live = rt.is_running() and rt.discord is not None and (
+                rt.discord.instance_pid == rt.pid() or rt.discord.polling()
+            )
             try:
                 self._save_profile_fields(other, **values)
             except Exception as e:
                 failed.append(f"- {self._display_name(other)}: {e}")
                 continue
             done.append(other)
-            rt = self._runtime(other)
-            if rt.discord is not None:  # running with Discord: it follows now
-                rt.discord.source_label = self._discord_source_label(other)
+            if rt.discord is not None:
                 rt.discord.update_config(rt.cfg)
-                if rt.is_running():
-                    rt.discord.start_polling(rt.cfg)
+            if live:
+                rt.discord.start_polling(rt.cfg)
+            elif rt.is_running():
+                later.append(self._display_name(other))
         msg = f"Discord settings copied to {len(done)} map(s)."
-        if any(self._runtime(o).is_running() and self._runtime(o).discord is None for o in done):
-            msg += " Maps that are running without Discord start posting from their next start."
+        if later and src.discord_enable:
+            msg += f"\n\nAlready running, so fully in effect from their next start: {', '.join(later)}."
         if failed:
             messagebox.showwarning("Discord", msg + "\n\nNot copied:\n" + "\n".join(failed))
         else:
@@ -8669,14 +8734,24 @@ class ServerManagerApp:
             return
         self._discord_get_coordinator(rt).request_stop()
 
-    def _discord_stop_notifications(self, rt: ServerRuntime, requested: bool, exit_code: Optional[int] = None) -> None:
-        if not rt.cfg.discord_enable:
-            if rt.discord is not None:
-                rt.discord.stop_polling()  # its poller must not outlive the server
-            return
-        coordinator = self._discord_get_coordinator(rt)
-        coordinator.notify_stop(rt.cfg, requested=requested, exit_code=exit_code)
-        coordinator.stop_polling()
+    def _discord_stop_notifications(
+        self, rt: ServerRuntime, requested: bool, exit_code: Optional[int] = None, pid: Optional[int] = None
+    ) -> None:
+        try:
+            if not rt.cfg.discord_enable:
+                if rt.discord is not None:
+                    rt.discord.stop_polling()  # its poller must not outlive the server
+                return
+            coordinator = self._discord_get_coordinator(rt)
+            coordinator.notify_stop(rt.cfg, requested=requested, exit_code=exit_code)
+            coordinator.stop_polling()
+        finally:
+            # The run's last word: a requested stop reports twice (its process watcher first,
+            # silently, then the stop itself), so only that second call, or a crash, ends it.
+            if requested or not rt.stop_requested.is_set():
+                rt.ended_run_cfg = None
+                if rt.discord is not None:
+                    rt.discord.end_instance(pid)
 
     def _discord_send_test(self) -> None:
         if not self._save_form():
@@ -10434,10 +10509,10 @@ class ServerManagerApp:
             # RCON FIX: server is gone -> runtime snapshot is no longer valid
             rt.rcon_snapshot = None
             rt.started_at = None
-            rt.run_cfg = None
+            rt.end_run()
             clear_run_state(self.app_base, rt.server_id)
             self._auto_restart_server(rt, code)
-            self._discord_stop_notifications(rt, requested=False, exit_code=code)
+            self._discord_stop_notifications(rt, requested=False, exit_code=code, pid=getattr(p, "pid", None))
         self._ui(self._refresh_buttons)
 
     def _reattach_running_servers(self) -> None:
@@ -10672,7 +10747,7 @@ class ServerManagerApp:
         # RCON FIX: server stopped -> snapshot invalid
         rt.rcon_snapshot = None
         rt.started_at = None
-        rt.run_cfg = None
+        rt.end_run()
         ours = rt.launched_by_us
         rt.launched_by_us = False
         clear_run_state(self.app_base, rt.server_id)
@@ -10705,9 +10780,10 @@ class ServerManagerApp:
             self._stop_server_impl(rt)
             return
         rt.stop_requested.set()
+        pid = rt.pid()
         self._discord_request_stop(rt)
         self._stop_server_impl(rt)
-        self._discord_stop_notifications(rt, requested=True)
+        self._discord_stop_notifications(rt, requested=True, pid=pid)
 
     def stop_server_safe(self) -> None:
         # Stopping needs nothing from the form, so an invalid field must not keep a server up.
