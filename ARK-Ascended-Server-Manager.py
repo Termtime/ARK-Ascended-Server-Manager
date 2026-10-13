@@ -63,7 +63,9 @@ try:
 except Exception:
     winreg = None
 
-_BEFORE_DIALOG: Optional[Callable[[], None]] = None
+# Called before every message box with its kind ("showinfo", "askyesno", ...), title and
+# message; returning False keeps that box from showing (only ever an info box).
+_BEFORE_DIALOG: Optional[Callable[[str, str, str], bool]] = None
 
 
 class _MessageBoxes:
@@ -79,8 +81,13 @@ class _MessageBoxes:
         def call(*args: Any, **kwargs: Any) -> Any:
             hook = _BEFORE_DIALOG
             if hook is not None:
-                with contextlib.suppress(Exception):
-                    hook()
+                title = str(args[0] if args else kwargs.get("title", ""))
+                message = str(args[1] if len(args) > 1 else kwargs.get("message", ""))
+                try:
+                    if hook(name, title, message) is False and name == "showinfo":
+                        return "ok"
+                except Exception:
+                    pass
             return fn(*args, **kwargs)
 
         return call
@@ -7933,6 +7940,9 @@ class ServerManagerApp:
         self._close_asking = False
         self._closing_stop = False  # "stop the servers and quit" is under way
         self._quit_when_idle = False  # in the background only until the running tasks finish
+        self._quit_check_id: Optional[str] = None
+        self._followups = 0  # tasks finished whose then/after have not run yet
+        self._followups_lock = threading.Lock()
         self._status_key: Optional[Tuple[Any, ...]] = None
         # Ports of servers between their port check and their launch (see _reserve_ports).
         self._starting_ports: Dict[str, Set[int]] = {}
@@ -8001,7 +8011,7 @@ class ServerManagerApp:
         self._start_stats_sampler()
         self.root.after(700, self._poll_show_request)
         global _BEFORE_DIALOG
-        _BEFORE_DIALOG = self._show_if_hidden
+        _BEFORE_DIALOG = self._before_dialog
         self._reattach_done = threading.Event()
         threading.Thread(target=self._reattach_on_launch, daemon=True, name="reattach").start()
         self._dash_tick()
@@ -10150,12 +10160,16 @@ class ServerManagerApp:
                 else:
                     self._ui(lambda _err=err: messagebox.showerror(title, _err))
             finally:
+                # Until its follow-ups ran (they may start the next task), the work is not done.
+                with self._followups_lock:
+                    self._followups += 1
                 rt.release()
                 self._ui(self._refresh_buttons)
                 if ok and then is not None:
                     self._ui(then)
                 if after is not None:
                     self._ui(lambda: after(ok))  # whatever happened, with whether it worked
+                self._ui(self._followups_done)
 
         try:
             threading.Thread(target=worker, daemon=True, name=f"task-{name}").start()
@@ -11613,7 +11627,8 @@ class ServerManagerApp:
                 ensure_dir(folder)
             logger.info(f"[CLUSTER] Cluster '{cfg.cluster_id.strip()}', data folder {folder}")
 
-    def _on_close(self) -> None:
+    def _on_close(self, tasks_cut_ok: bool = False) -> None:
+        """Closing the window. tasks_cut_ok: the user already chose to cut running tasks off."""
         if self._close_asking:
             return  # the close question is already open
         if self._closing_stop:
@@ -11624,7 +11639,6 @@ class ServerManagerApp:
             return
         running = self._running_runtimes()
         choice: Optional[str] = None
-        tasks_cut_ok = False  # the user already chose to cut running tasks off
         if running:
             self._close_asking = True
             try:
@@ -11646,10 +11660,15 @@ class ServerManagerApp:
                     self._close_asking = False
                 if busy_choice is None:
                     return
-                if busy_choice == "finish":
+                if self._running_runtimes():
+                    # A task started a server while the question was open: that one needs its
+                    # own question (stop it, leave it, or keep managing it).
+                    self._on_close(tasks_cut_ok=not busy_choice)
+                    return
+                if busy_choice:
                     self._quit_when_idle = True
                     self._go_to_background()
-                    self.root.after(2000, self._check_quit_when_idle)
+                    self._schedule_quit_check()
                     return
                 tasks_cut_ok = True
         with self._runtimes_lock:
@@ -11693,7 +11712,7 @@ class ServerManagerApp:
             return
         # Workers are daemon threads: closing kills them mid-write (INIs, zips, SteamCMD, a
         # restart), whether or not servers are left running.
-        if self._any_busy() and not tasks_cut_ok and not messagebox.askyesno(
+        if (self._any_busy() or self._followups_pending()) and not tasks_cut_ok and not messagebox.askyesno(
             "Task running",
             "A task is still running (see the console). Closing now can leave it half done, for example "
             "a partly written backup or settings file, or a server started but no longer tracked.\n\n"
@@ -11705,9 +11724,7 @@ class ServerManagerApp:
         # Every question answered: now cancel, and tell the players of any countdown.
         if counting:
             self._cancel_countdowns_and_announce(counting)
-        self._cancel_groups()
-        close_show_event()
-        self.root.destroy()
+        self._quit_now()
 
     def _poll_show_request(self) -> None:
         """A second launch of the manager asks this one to show its window."""
@@ -11733,12 +11750,26 @@ class ServerManagerApp:
             self.root.focus_force()
         if self._in_background:
             self._in_background = False
-            self._quit_when_idle = False
+            self._quit_when_idle = False  # the user is back: never quit under them
+            if self._quit_check_id is not None:
+                with contextlib.suppress(Exception):
+                    self.root.after_cancel(self._quit_check_id)
+                self._quit_check_id = None
             self.logger.info("Back from the background.")
 
     def _show_if_hidden(self) -> None:
         if self._in_background:
             self._show_window()
+
+    def _before_dialog(self, kind: str, title: str, message: str) -> bool:
+        """A message box is about to show. While finishing tasks in the background to quit, a
+        plain report ("Restore complete") goes to the log instead; a question or a problem
+        brings the window back, and it stays open."""
+        if self._quit_when_idle and kind == "showinfo":
+            self.logger.info(f"{title}: {message}")
+            return False
+        self._show_if_hidden()
+        return True
 
     def _go_to_background(self) -> None:
         """Hide the window but keep managing: auto-saves, nightly updates, crash restarts and
@@ -11753,9 +11784,7 @@ class ServerManagerApp:
         """'stop', 'background', 'leave' or None (cancel), for closing while servers run."""
         names = ", ".join(self._display_name(rt.server_id) for rt in running)
         result: Dict[str, Optional[str]] = {"choice": None}
-        with contextlib.suppress(Exception):
-            if self.root.state() == "iconic":
-                self.root.state("normal")  # a dialog of a minimized window would stay hidden
+        self._restore_if_minimized()
         prev_grab = None
         with contextlib.suppress(Exception):
             prev_grab = self.root.grab_current()  # an open dialog's; given back afterwards
@@ -11793,43 +11822,95 @@ class ServerManagerApp:
                     prev_grab.grab_set()
         return result["choice"]
 
+    def _followups_done(self) -> None:
+        with self._followups_lock:
+            self._followups -= 1
+        if self._quit_when_idle:
+            self._check_quit_when_idle()
+
     def _busy_task_names(self) -> List[str]:
         with self._runtimes_lock:
             items = list(self._runtimes.values())
             ops = sorted(set(self._group_ops.values()))
-        out = [f"{rt.task} ({self._display_name(rt.server_id)})" for rt in items if rt.task]
+        out = []
+        for rt in items:
+            task = rt.task  # read once: a worker may release it meanwhile
+            if task:
+                out.append(f"{task} ({self._display_name(rt.server_id)})")
+        if not out and self._followups_pending():
+            out.append("finishing a task (its next step is about to start)")
         return out + [f"{op} (cluster)" for op in ops]
 
-    def _ask_close_busy_choice(self, tasks: List[str]) -> Optional[str]:
-        """'finish' (in the background, then quit), 'quit' or None, for closing while tasks run."""
-        finish = messagebox.askyesnocancel(
+    def _followups_pending(self) -> bool:
+        with self._followups_lock:
+            return self._followups > 0
+
+    def _work_left(self) -> bool:
+        with self._runtimes_lock:
+            ops = bool(self._group_ops)
+        return ops or self._followups_pending() or self._any_busy()
+
+    def _restore_if_minimized(self) -> None:
+        """A dialog of a minimized window would stay out of sight."""
+        with contextlib.suppress(Exception):
+            if self.root.state() == "iconic":
+                self.root.state("normal")
+
+    def _ask_close_busy_choice(self, tasks: List[str]) -> Optional[bool]:
+        """True: finish in the background, then quit; False: quit now; None: keep the window."""
+        self._restore_if_minimized()
+        with self._runtimes_lock:
+            group = bool(self._group_ops)
+        cut = ("This cuts the task off and can leave it half done, for example a partly written backup, "
+               "a half-installed server or a map started but no longer tracked.")
+        if group:
+            cut += " A cluster action stops where it is; maps it has not reached yet are left as they are."
+        return messagebox.askyesnocancel(
             "Task running",
             "Still working: " + ", ".join(tasks) + ".\n\n"
             "Yes: finish in the background, then quit. The window hides now; opening the manager again shows it.\n\n"
-            "No: quit now. This cuts the task off and can leave it half done, for example a partly written "
-            "backup, a half-installed server or a map started but no longer tracked.\n\n"
+            f"No: quit now. {cut}\n\n"
             "Cancel: keep the window open.",
             icon="warning",
             default="yes",
         )
-        if finish is None:
-            return None
-        return "finish" if finish else "quit"
+
+    def _schedule_quit_check(self) -> None:
+        if self._quit_check_id is not None:
+            with contextlib.suppress(Exception):
+                self.root.after_cancel(self._quit_check_id)
+        self._quit_check_id = self.root.after(2000, self._check_quit_when_idle)
 
     def _check_quit_when_idle(self) -> None:
-        """In the background only to let tasks finish: quit once nothing runs any more."""
+        """In the background only to let tasks finish: quit once nothing runs any more.
+
+        Runs when a task's follow-ups are done and, as a fallback, every 2 seconds."""
+        if self._quit_check_id is not None:
+            with contextlib.suppress(Exception):
+                self.root.after_cancel(self._quit_check_id)  # reached early: that timer is not needed
+            self._quit_check_id = None
         if not self._quit_when_idle:
             return
-        if self._busy_task_names():
-            self.root.after(2000, self._check_quit_when_idle)
+        if self._work_left():
+            self._schedule_quit_check()
+            return
+        if show_event_signaled():
+            self._show_window()  # opened again just now: the user is back, so stay
             return
         self._quit_when_idle = False
         if self._running_runtimes():
-            # A task started a server (an install that starts it, a Start All): it now needs
-            # managing, so stay in the background instead of leaving it unwatched.
-            self.logger.info("Tasks finished; a server is running now, so the manager stays in the background.")
+            # A task started a server (an install that starts it, a Start All): quitting would
+            # leave it unwatched, and staying hidden would leave nobody knowing the manager is
+            # still there. Show the window instead.
+            self.logger.info("Tasks finished; a server is running now, so the manager stays open to look after it.")
+            self._show_window()
             return
         self.logger.info("Tasks finished; quitting.")
+        self._quit_now()
+
+    def _quit_now(self) -> None:
+        """The window goes, and the manager with it."""
+        self._cancel_groups()
         close_show_event()
         self.root.destroy()
 
