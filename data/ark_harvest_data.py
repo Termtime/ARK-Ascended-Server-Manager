@@ -55,7 +55,7 @@ _HARVEST_RESOURCES: dict[str, str] = {
     'Narcotic': 'PrimalItemConsumable_Narcotic_C',
     'Obsidian': 'PrimalItemResource_Obsidian_C',
     'Oil': 'PrimalItemResource_Oil_C',
-    'Oil': 'PrimalItemResource_SquidOil_C',
+    'Oil (Tusoteuthis)': 'PrimalItemResource_SquidOil_C',
     'Organic Polymer': 'PrimalItemResource_Polymer_Organic_C',
     'Pelt': 'PrimalItemResource_Pelt_C',
     'Pelt, Hair, or Wool': 'PrimalItemResource_PeltOrHair_C',

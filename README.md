@@ -73,6 +73,7 @@ This manager separates *edit time* and *runtime*:
 - booleans via `True/False` selector
 - numeric values via slider + tick marks
 - staged writes are debounced to avoid noisy updates
+- **Stack Size Overrides** is an editable table with one row per item: item, class, max quantity and Ignore Multiplier. Double-click a cell to change it (Ignore Multiplier switches on double-click), Find narrows the list, and adding an item that is already listed updates its row instead of adding a second line. Lines for the same item left by earlier versions are merged when the file is loaded, keeping the last one; lines the table does not understand are kept as written
 
 ![INI Editor](docs/img/ASA_Server_Manager_Preview_5.png)
 

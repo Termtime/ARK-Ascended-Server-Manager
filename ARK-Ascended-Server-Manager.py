@@ -2172,6 +2172,76 @@ def steamcmd_app_update(
 # INI Visual Editor
 # =============================================================================
 
+class _StackTableData:
+    """ConfigOverrideItemMaxQuantity as a table: one row per item class. A class listed more
+    than once keeps its last line (the most recent edit); a line the table does not
+    understand is kept exactly as it was."""
+
+    LINE_RE = re.compile(r'ItemClassString="([^"]+)"', re.IGNORECASE)
+    QTY_RE = re.compile(r"MaxItemQuantity=(\d+)", re.IGNORECASE)
+    IGNORE_RE = re.compile(r"bIgnoreMultiplier=(true|false)", re.IGNORECASE)
+
+    def __init__(self) -> None:
+        self.rows: Dict[str, Tuple[int, bool]] = {}  # class -> (max quantity, ignore multiplier)
+        self.raw_extra: List[str] = []
+        self.merged = 0  # duplicate lines folded into one when last loaded
+        self.on_change: Callable[[], None] = lambda: None
+
+    @classmethod
+    def parse(cls, raw: str) -> Optional[Tuple[str, int, bool]]:
+        m_cls, m_qty = cls.LINE_RE.search(raw or ""), cls.QTY_RE.search(raw or "")
+        if not m_cls or not m_qty:
+            return None
+        m_ign = cls.IGNORE_RE.search(raw)
+        return m_cls.group(1).strip(), int(m_qty.group(1)), bool(m_ign and m_ign.group(1).lower() == "true")
+
+    @staticmethod
+    def line(item_class: str, qty: int, ignore: bool) -> str:
+        return (f'(ItemClassString="{item_class}",'
+                f'Quantity=(MaxItemQuantity={int(qty)},bIgnoreMultiplier={"true" if ignore else "false"}))')
+
+    def load(self, values: List[str]) -> None:
+        self.rows, self.raw_extra, self.merged = {}, [], 0
+        for raw in values:
+            parsed = self.parse(raw)
+            if parsed is None:
+                if raw.strip():
+                    self.raw_extra.append(raw)
+                continue
+            item_class, qty, ignore = parsed
+            key = self.key_of(item_class)
+            if key is not None:
+                self.merged += 1
+                del self.rows[key]  # the later line wins; it takes the latest place too
+            self.rows[item_class] = (qty, ignore)
+        self.on_change()
+
+    def key_of(self, item_class: str) -> Optional[str]:
+        """The class as stored, matched without regard to case (ARK class names are not)."""
+        low = item_class.lower()
+        return next((k for k in self.rows if k.lower() == low), None)
+
+    def put(self, item_class: str, qty: int, ignore: bool, replacing: Optional[str] = None) -> bool:
+        """Set an item's row; True when that item already had one (updated, not added).
+        replacing: the row being edited, when its item changes."""
+        existed = self.key_of(item_class)
+        if replacing is not None and replacing in self.rows and (existed is None or existed != replacing):
+            del self.rows[replacing]
+        if existed is not None and existed in self.rows and existed != item_class:
+            del self.rows[existed]
+        self.rows[item_class] = (qty, ignore)
+        self.on_change()
+        return existed is not None and existed != replacing
+
+    def remove(self, item_classes: List[str]) -> None:
+        for c in item_classes:
+            self.rows.pop(c, None)
+        self.on_change()
+
+    def lines(self) -> List[str]:
+        return [self.line(c, q, i) for c, (q, i) in self.rows.items()] + list(self.raw_extra)
+
+
 class _SpawnListData:
     """Stores structured spawn entries for a spawn customization key."""
     def __init__(self, listbox: tk.Listbox):
@@ -14472,85 +14542,216 @@ class ServerManagerApp:
         start_row += 1
 
         ttk.Label(parent, text=(
-            "Override stack sizes for individual items. "
-            "Select an item from the dropdown, set the max quantity, "
-            "and whether to ignore the global stack multiplier."),
+            "Override stack sizes for individual items: one row per item. "
+            "Pick an item, set the max quantity and whether it ignores the global stack multiplier, then Add / Update."),
             foreground=theme["muted"], wraplength=700).grid(
             row=start_row, column=0, sticky="w", padx=4, pady=(0, 6))
         start_row += 1
 
         vk = self._ini_visual_var_key("game", _GM, "ConfigOverrideItemMaxQuantity")
+        data = _StackTableData()
+        self._ini_visual_vars[vk] = data
 
         frame = ttk.Frame(parent)
         frame.grid(row=start_row, column=0, sticky="ew", padx=2, pady=4)
         frame.columnconfigure(0, weight=1)
 
-        # Input row
+        # Add (or update) row
         input_frame = ttk.Frame(frame)
         input_frame.grid(row=0, column=0, sticky="ew", pady=(0, 4))
-
         ttk.Label(input_frame, text="Item:").grid(row=0, column=0, padx=(0, 4))
-        item_cb = ttk.Combobox(input_frame, values=_ITEM_NAMES_SORTED, width=32)
+        item_cb = ttk.Combobox(input_frame, values=_ITEM_NAMES_SORTED, width=36)
         item_cb.grid(row=0, column=1, padx=(0, 8))
         self._make_searchable_cb(item_cb, list(_ITEM_NAMES_SORTED))
-
         ttk.Label(input_frame, text="Max Qty:").grid(row=0, column=2, padx=(0, 4))
-        qty_var = tk.StringVar(value="100")
-        ttk.Entry(input_frame, textvariable=qty_var, width=8).grid(row=0, column=3, padx=(0, 8))
+        qty_var = tk.StringVar(master=frame, value="100")
+        ttk.Entry(input_frame, textvariable=qty_var, width=9).grid(row=0, column=3, padx=(0, 8))
+        ignore_var = tk.BooleanVar(master=frame, value=False)
+        ttk.Checkbutton(input_frame, text="Ignore Multiplier", variable=ignore_var).grid(row=0, column=4, padx=(0, 8))
 
-        ttk.Label(input_frame, text="Ignore Multiplier:").grid(row=0, column=4, padx=(0, 4))
-        ignore_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(input_frame, variable=ignore_var).grid(row=0, column=5, padx=(0, 8))
+        # Find
+        find_frame = ttk.Frame(frame)
+        find_frame.grid(row=1, column=0, sticky="ew", pady=(2, 4))
+        find_frame.columnconfigure(1, weight=1)
+        ttk.Label(find_frame, text="Find:").grid(row=0, column=0, padx=(0, 4))
+        find_var = tk.StringVar(master=frame, value="")
+        ttk.Entry(find_frame, textvariable=find_var).grid(row=0, column=1, sticky="ew")
+        note_var = tk.StringVar(master=frame, value="")
+        ttk.Label(find_frame, textvariable=note_var, foreground=theme["muted"]).grid(row=0, column=2, padx=(8, 0))
 
-        # Listbox for entries
-        list_frame = ttk.Frame(frame)
-        list_frame.grid(row=1, column=0, sticky="ew", pady=(2, 2))
-        list_frame.columnconfigure(0, weight=1)
+        # The table
+        table_frame = ttk.Frame(frame)
+        table_frame.grid(row=2, column=0, sticky="nsew")
+        table_frame.columnconfigure(0, weight=1)
+        cols = ("item", "class", "qty", "ignore")
+        tree = ttk.Treeview(table_frame, columns=cols, show="headings", height=18, selectmode="extended")
+        for col, text, width, stretch, anchor in (
+            ("item", "Item", 260, True, "w"),
+            ("class", "Class", 300, True, "w"),
+            ("qty", "Max Quantity", 110, False, "e"),
+            ("ignore", "Ignore Multiplier", 130, False, "center"),
+        ):
+            tree.heading(col, text=text)
+            tree.column(col, width=width, stretch=stretch, anchor=anchor)
+        tree.grid(row=0, column=0, sticky="nsew")
+        tsb = ttk.Scrollbar(table_frame, orient="vertical", command=tree.yview)
+        tsb.grid(row=0, column=1, sticky="ns")
+        tree.configure(yscrollcommand=tsb.set)
+        self._stack_tree = tree
 
-        lb = tk.Listbox(list_frame, height=8, font=("Consolas", 9))
-        lb.grid(row=0, column=0, sticky="ew")
-        sb = ttk.Scrollbar(list_frame, orient="vertical", command=lb.yview)
-        sb.grid(row=0, column=1, sticky="ns")
-        lb.configure(yscrollcommand=sb.set)
+        def item_name(item_class: str) -> str:
+            return _CLASS_TO_ITEM_NAME.get(item_class, item_class)
 
-        data = _SpawnListData(lb)
-        self._ini_visual_vars[vk] = data
+        def class_of(name_or_class: str) -> str:
+            info = _ITEM_DATA.get(name_or_class)
+            if info:
+                return info[0]
+            low = name_or_class.lower()
+            match = next((n for n in _ITEM_DATA if n.lower() == low), None)
+            return _ITEM_DATA[match][0] if match else name_or_class  # a class name typed as is
 
-        def _refresh_listbox():
-            lb.delete(0, "end")
-            for raw in data.entries:
-                display = self._stack_raw_to_display(raw)
-                lb.insert("end", display)
+        def refresh() -> None:
+            wanted = find_var.get().strip().lower()
+            keep = tree.selection()
+            tree.delete(*tree.get_children())
+            shown = 0
+            for item_class, (qty, ignore) in sorted(data.rows.items(), key=lambda kv: item_name(kv[0]).lower()):
+                name = item_name(item_class)
+                if wanted and wanted not in name.lower() and wanted not in item_class.lower():
+                    continue
+                tree.insert("", "end", iid=item_class, values=(name, item_class, qty, "Yes" if ignore else "No"))
+                shown += 1
+            sel = [i for i in keep if tree.exists(i)]
+            if sel:
+                tree.selection_set(sel)
+            parts = [f"{len(data.rows)} item(s)"]
+            if wanted:
+                parts.append(f"{shown} shown")
+            if data.raw_extra:
+                parts.append(f"{len(data.raw_extra)} line(s) kept as written")
+            note_var.set(", ".join(parts))
 
-        def add_entry():
-            item_name = item_cb.get().strip()
-            if not item_name:
+        data.on_change = refresh
+        find_var.trace_add("write", lambda *_: refresh())
+
+        def changed(message: str = "") -> None:
+            self._ini_visual_schedule_write(vk)
+            if message:
+                self._set_status(message)
+
+        def parse_qty(text: str) -> Optional[int]:
+            text = (text or "").strip()
+            if not text.isdigit() or int(text) < 1:
+                messagebox.showwarning("Stack Size", "Max quantity must be a whole number of 1 or more.")
+                return None
+            return int(text)
+
+        def add_entry() -> None:
+            name = item_cb.get().strip()
+            if not name:
                 return
-            item_info = _ITEM_DATA.get(item_name)
-            if item_info:
-                item_cls = item_info[0]
+            qty = parse_qty(qty_var.get())
+            if qty is None:
+                return
+            item_class = class_of(name)
+            updated = data.put(item_class, qty, bool(ignore_var.get()))
+            if tree.exists(item_class):
+                tree.selection_set(item_class)
+                tree.see(item_class)
+            changed(f"Stack size {'updated' if updated else 'added'}: {item_name(item_class)} = {qty}.")
+
+        def remove_entry() -> None:
+            sel = list(tree.selection())
+            if sel:
+                data.remove(sel)
+                changed(f"Stack size removed for {len(sel)} item(s).")
+
+        # In-place editing: double-click a cell (Ignore toggles on double-click)
+        editor: Dict[str, Any] = {"w": None}
+
+        def close_editor() -> None:
+            w = editor.get("w")
+            editor["w"] = None
+            if w is not None:
+                with contextlib.suppress(Exception):
+                    w.destroy()
+
+        def begin_edit(event: Any) -> None:
+            close_editor()
+            row = tree.identify_row(event.y)
+            col = tree.identify_column(event.x)
+            if not row or not col:
+                return
+            col_name = cols[int(col[1:]) - 1]
+            qty, ignore = data.rows.get(row, (0, False))
+            if col_name == "ignore":
+                data.put(row, qty, not ignore)
+                changed(f"Ignore Multiplier {'on' if not ignore else 'off'}: {item_name(row)}.")
+                return
+            bbox = tree.bbox(row, col)
+            if not bbox:
+                return
+            x, y, w, h = bbox
+            if col_name == "item":
+                widget: Any = ttk.Combobox(tree, values=_ITEM_NAMES_SORTED)
+                self._make_searchable_cb(widget, list(_ITEM_NAMES_SORTED))
+                widget.set(item_name(row))
             else:
-                item_cls = item_name  # allow raw class name as fallback
-            qty = qty_var.get().strip() or "100"
-            ignore = "true" if ignore_var.get() else "false"
-            raw = (f'(ItemClassString="{item_cls}",'
-                   f'Quantity=(MaxItemQuantity={qty},bIgnoreMultiplier={ignore}))')
-            data.add(raw, self._stack_raw_to_display(raw))
-            self._ini_visual_schedule_write(vk)
+                widget = ttk.Entry(tree)
+                widget.insert(0, str(qty) if col_name == "qty" else row)
+            widget.place(x=x, y=y, width=max(w, 160 if col_name != "qty" else w), height=h)
+            widget.focus_set()
+            with contextlib.suppress(Exception):
+                widget.select_range(0, "end")
+            editor["w"] = widget
 
-        def remove_entry():
-            sel = lb.curselection()
-            if not sel:
-                return
-            for s in reversed(sel):
-                if s < len(data.entries):
-                    del data.entries[s]
-            _refresh_listbox()
-            self._ini_visual_schedule_write(vk)
+            def commit(_e: Any = None) -> None:
+                if editor.get("w") is not widget:
+                    return
+                text = widget.get().strip()
+                close_editor()
+                if col_name == "qty":
+                    new_qty = parse_qty(text)
+                    if new_qty is not None and new_qty != qty:
+                        data.put(row, new_qty, ignore)
+                        changed(f"Stack size updated: {item_name(row)} = {new_qty}.")
+                    return
+                if not text:
+                    return
+                new_class = class_of(text) if col_name == "item" else text
+                if new_class == row:
+                    return
+                merged = data.key_of(new_class) is not None
+                data.put(new_class, qty, ignore, replacing=row)
+                if tree.exists(new_class):
+                    tree.selection_set(new_class)
+                    tree.see(new_class)
+                changed(
+                    f"{item_name(new_class)} already had a row: replaced with this one."
+                    if merged else f"Item changed to {item_name(new_class)}."
+                )
 
-        ttk.Button(input_frame, text="Add", command=add_entry, width=6).grid(row=0, column=6)
-        ttk.Button(frame, text="Remove Selected", command=remove_entry).grid(
-            row=2, column=0, sticky="w", pady=(2, 0))
+            widget.bind("<Return>", commit)
+            widget.bind("<KP_Enter>", commit)
+            widget.bind("<Escape>", lambda _e: close_editor())
+            widget.bind("<FocusOut>", lambda _e: widget.after(150, commit))  # after a dropdown pick
+            if col_name == "item":
+                widget.bind("<<ComboboxSelected>>", commit)
+
+        tree.bind("<Double-1>", begin_edit)
+        tree.bind("<Delete>", lambda _e: remove_entry())
+
+        ttk.Button(input_frame, text="Add / Update", command=add_entry).grid(row=0, column=5)
+        buttons = ttk.Frame(frame)
+        buttons.grid(row=3, column=0, sticky="ew", pady=(4, 0))
+        ttk.Button(buttons, text="Remove Selected", command=remove_entry).grid(row=0, column=0, sticky="w")
+        ttk.Label(
+            buttons,
+            text="Double-click a cell to edit it (Ignore Multiplier switches on double-click). "
+                 "Adding an item that is already listed updates its row.",
+            foreground=theme["muted"],
+        ).grid(row=0, column=1, sticky="w", padx=(10, 0))
+        refresh()
 
         start_row += 1
         return start_row
@@ -15068,6 +15269,18 @@ class ServerManagerApp:
                         var.insert("1.0", "\n".join(vals))
                     continue
 
+                if isinstance(var, _StackTableData):
+                    doc = gus_doc if ini_file == "gus" else game_doc
+                    if doc is None:
+                        continue
+                    var.load(doc.get_all_values(section, key))
+                    if var.merged:
+                        # Lines for the same item, from adds that appended instead of updating:
+                        # written back once, one line per item, the last of each kept.
+                        self._ini_visual_schedule_write(vk)
+                        self._set_status(f"Stack sizes: {var.merged} duplicate line(s) merged; the last of each item was kept.")
+                    continue
+
                 if isinstance(var, _SpawnListData):
                     doc = gus_doc if ini_file == "gus" else game_doc
                     if doc is None:
@@ -15207,6 +15420,16 @@ class ServerManagerApp:
                         if line.lower().startswith(key.lower() + "="):
                             line = line[len(key) + 1:]
                         doc.append_kv(section, key, line)
+                if ini_file == "gus":
+                    gus_dirty = True
+                else:
+                    game_dirty = True
+                continue
+
+            if isinstance(var, _StackTableData):
+                doc.remove_all_kv(section, key)
+                for raw_val in var.lines():
+                    doc.append_kv(section, key, raw_val)
                 if ini_file == "gus":
                     gus_dirty = True
                 else:
