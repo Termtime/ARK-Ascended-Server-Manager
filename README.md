@@ -78,7 +78,7 @@ This manager separates *edit time* and *runtime*:
 
 ### Dashboard and cluster wizard
 - **Dashboard** tab: every server at a glance, grouped by cluster (plus standalone servers), with status, current task, players, ports, uptime and install folder; it refreshes by itself
-- Per server: Start, Stop, Restart, Update & Restart, Back Up, Open (switch the other tabs to it) and Cluster... (set up or join)
+- Per server: Start, Stop, Restart, Update & Restart, Back Up, Open (switch the other tabs to it) and Cluster... (set up or join). Buttons follow the server's state as on the Server tab: no Start for a server that runs or is busy, no Stop or Restart for a stopped one, Cancel Countdown only during a countdown; a cluster's Start, Restart and Update All are off while one of its sequences runs (Stop All stays, to end it)
 - Per cluster: **Start All** (stopped maps one after another, a configurable delay apart), **Stop All**, **Restart All** one map at a time so the rest stays up, **Update All** (running maps take turns and come back up; stopped installed maps are just updated), **Back Up All**, **Broadcast** a chat message to every running map, Rename and Start Delay
 - **New Cluster** wizard: pick a name and the maps, where the installs go, and the shared settings (admin and join password, max players, mods, crossplay). It previews every profile it will create with its install folder and ports, then creates one profile per map with its own install, all in one cluster with a shared data folder, and can install them right away
 - **Add Maps to Cluster**: the same wizard for an existing cluster; maps already in it are greyed out and the cluster's settings are prefilled
@@ -86,6 +86,7 @@ This manager separates *edit time* and *runtime*:
 - Cluster names and start delays are stored in the global config; which profiles belong to a cluster still comes from each profile's own cluster settings, so existing clusters show up without any migration
 
 ### Planned restarts, warnings, moving clusters, resource use
+- **Wild dino wipe** (Server tab, Update Options): clears every wild creature over RCON (`DestroyWildDinos`) after a set number of hours the server has been running (24 by default), counted across restarts and manager restarts; fresh ones spawn and tamed creatures are never touched. Players get in-game warnings first (default 10, 5 and 1 minutes), timed so the wipe happens when due. **Wipe Now...** runs the same warned wipe by hand. Stopping the server calls the countdown off (the wipe follows after the next start), a daily restart or nightly update coming due takes precedence over it, and **Cancel Countdown** on the Dashboard skips that wipe until the next interval. Needs RCON
 - **Daily restart** (Server tab, Update Options): restarts a running server every day at a set time (safe: save, stop, start); it never starts a stopped one, and is skipped when the nightly update restarts the server at that same time
 - **Warn players first**: in-game chat countdowns over RCON (default 15, 5 and 1 minutes) before the daily restart, the nightly update and, if you choose, a Restart All. The countdown starts early, so the restart itself happens at the time set. The Dashboard and status bar show it; stopping the server or Cancel Countdown on the Dashboard calls it off
 - **Export / Import Cluster**: a cluster file holds its name, start delay and each map's settings and staged INIs, without passwords, the Discord webhook or folders of this machine. Import recreates it on another machine as a new cluster: you pick the install folder, data folder and passwords, every map gets free ports and its INI settings staged for its first start, and it can install them right away
@@ -129,6 +130,7 @@ This manager separates *edit time* and *runtime*:
 - Dino modes (mutually exclusive)
 - Logs
 - Mechanics / performance flags
+- Hover over any option to see what it does and the start option it sets (descriptions follow the ARK wiki)
 
 ### Backups + retention
 - Optional backup on stop
@@ -247,6 +249,10 @@ Existing profiles keep working; a few things behave differently:
 - **Export...** on the Dashboard writes the cluster to a file (no passwords or local folders in it); **Import Cluster...** on the other PC recreates it with new installs and free ports
 
 ## Usage notes
+
+### Maps
+- Map presets cover the official ASA maps: The Island, Scorched Earth, The Center, Aberration, Extinction, Astraeos, Ragnarok, Valguero, Lost Colony, Genesis Part 1 and Club ARK (`BobsMissions_WP`, which needs mod 1005639; the manager always passes it when that map runs). Any other map, such as a modded one, goes in **Custom...** by its exact name
+- The Server and Advanced Start Args tabs scroll when they are taller than the window; dialogs open inside the usable screen area, so a taskbar at the top never covers their title bar
 
 ### Multi-instance hosting
 - Use **unique ports per instance** (game/query/RCON)

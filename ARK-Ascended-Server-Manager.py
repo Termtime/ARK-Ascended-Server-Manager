@@ -1191,6 +1191,33 @@ def server_root(app_base: Path, server_id: str) -> Path:
     return app_base / SERVERS_DIR_NAME / server_id
 
 
+WILD_WIPE_STATE_NAME = "wild_wipe.json"
+WILD_WIPE_MIN_HOURS = 1
+WILD_WIPE_MAX_HOURS = 24 * 30
+
+
+def clamp_wild_wipe_hours(value: Any) -> int:
+    return max(WILD_WIPE_MIN_HOURS, min(WILD_WIPE_MAX_HOURS, safe_int(value, 24) or 24))
+
+
+def load_wild_wipe_seconds(app_base: Path, server_id: str) -> float:
+    """Running seconds since this server's last wild dino wipe (0 when never recorded)."""
+    try:
+        data = json.loads((server_config_path(app_base, server_id).parent / WILD_WIPE_STATE_NAME).read_text(encoding="utf-8"))
+        return max(0.0, float(data.get("running_sec", 0.0)))
+    except Exception:
+        return 0.0
+
+
+def save_wild_wipe_seconds(app_base: Path, server_id: str, seconds: float) -> None:
+    path = server_config_path(app_base, server_id).parent / WILD_WIPE_STATE_NAME
+    with contextlib.suppress(Exception):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"running_sec": round(seconds, 1), "saved": utc_now_iso()}), encoding="utf-8")
+        os.replace(tmp, path)
+
+
 def server_config_path(app_base: Path, server_id: str) -> Path:
     return server_root(app_base, server_id) / SERVER_CONFIG_NAME
 
@@ -1351,6 +1378,11 @@ class AppConfig:
     scheduled_restart_time: str = "06:00"
     restart_warnings_enabled: bool = True
     restart_warning_minutes: str = "15,5,1"
+    # Clear the wild creatures (DestroyWildDinos over RCON) every so many hours the server
+    # has been running, counted across restarts, with in-game warnings first.
+    wild_wipe_enabled: bool = False
+    wild_wipe_interval_hours: int = 24
+    wild_wipe_warning_minutes: str = "10,5,1"
     update_on_startup: bool = False
 
     install_optional_certificates: bool = True  # enforced True
@@ -5767,6 +5799,11 @@ class ServerRuntime:
         self._cpu_sample: Optional[Tuple[float, float, int]] = None  # (wall clock, cpu seconds, pid)
         self.auto_update_time = ""  # the HH:MM auto_update_next was computed from
         self.ended_run_cfg: Optional[AppConfig] = None  # the last run's settings, for its stop message
+        # Wild dino wipe: running seconds since the last one (loaded from disk on first use),
+        # when the scheduler last counted, and when it last wrote the count down.
+        self.wild_wipe_sec: Optional[float] = None
+        self.wild_wipe_tick: Optional[float] = None
+        self.wild_wipe_saved: float = 0.0
 
     def is_running(self) -> bool:
         with self.proc_lock:
@@ -8979,6 +9016,10 @@ class ServerManagerApp:
         self.var_scheduled_restart_time = tk.StringVar(master=m)
         self.var_restart_warnings_enabled = tk.BooleanVar(master=m)
         self.var_restart_warning_minutes = tk.StringVar(master=m)
+        self.var_wild_wipe_enabled = tk.BooleanVar(master=m)
+        self.var_wild_wipe_hours = tk.StringVar(master=m)
+        self.var_wild_wipe_warning_minutes = tk.StringVar(master=m)
+        self.var_wild_wipe_hint = tk.StringVar(master=m, value="")
 
         # Hide GameAnalytics spam (console only)
         self.var_hide_gameanalytics_console_logs = tk.BooleanVar(master=m)
@@ -9270,6 +9311,27 @@ class ServerManagerApp:
             wraplength=380,
             justify="left",
         ).grid(row=10, column=0, columnspan=3, sticky="w", padx=(24, 0))
+
+        chk_wipe = ttk.Checkbutton(update_frame, text="Wipe wild dinos every (running hours)", variable=self.var_wild_wipe_enabled)
+        chk_wipe.grid(row=11, column=0, sticky="w", pady=(10, 0))
+        ttk.Entry(update_frame, textvariable=self.var_wild_wipe_hours, validate="key", validatecommand=vcmd) \
+            .grid(row=11, column=1, sticky="ew", padx=6, pady=(10, 0))
+        self.btn_wild_wipe_now = ttk.Button(update_frame, text="Wipe Now...", command=self.wild_wipe_now)
+        self.btn_wild_wipe_now.grid(row=11, column=2, padx=(6, 0), pady=(10, 0))
+        ttk.Label(update_frame, text="Warn players, minutes before").grid(row=12, column=0, sticky="w", padx=(24, 0), pady=(6, 0))
+        ttk.Entry(update_frame, textvariable=self.var_wild_wipe_warning_minutes).grid(row=12, column=1, sticky="ew", padx=6, pady=(6, 0))
+        ttk.Label(
+            update_frame,
+            textvariable=self.var_wild_wipe_hint,
+            wraplength=380,
+            justify="left",
+        ).grid(row=13, column=0, columnspan=3, sticky="w", padx=(24, 0))
+        HoverTooltip(
+            chk_wipe,
+            "Clears every wild creature (RCON DestroyWildDinos) after this many hours of the server running,\n"
+            "counted across restarts; fresh ones spawn. Tamed creatures are not touched. Players get\n"
+            "in-game warnings first (for example 10,5,1 minutes before). Needs RCON.",
+        )
 
         backup_frame = ttk.LabelFrame(lf_ops, text="Backup", padding=8)
         backup_frame.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(10, 0))
@@ -9944,6 +10006,9 @@ class ServerManagerApp:
         self.var_scheduled_restart_time.set(cfg.scheduled_restart_time or "06:00")
         self.var_restart_warnings_enabled.set(cfg.restart_warnings_enabled)
         self.var_restart_warning_minutes.set(cfg.restart_warning_minutes)
+        self.var_wild_wipe_enabled.set(cfg.wild_wipe_enabled)
+        self.var_wild_wipe_hours.set(str(clamp_wild_wipe_hours(cfg.wild_wipe_interval_hours)))
+        self.var_wild_wipe_warning_minutes.set(cfg.wild_wipe_warning_minutes)
 
         self.var_hide_gameanalytics_console_logs.set(bool(cfg.hide_gameanalytics_console_logs))
         self._sync_console_log_filter_state()
@@ -10042,6 +10107,12 @@ class ServerManagerApp:
         if cfg.restart_warnings_enabled and not parse_warning_minutes(self.var_restart_warning_minutes.get()):
             raise ValueError("Warning minutes must be whole minutes from 1 to 120, for example 15,5,1 (or untick the warnings).")
         cfg.restart_warning_minutes = ",".join(map(str, parse_warning_minutes(self.var_restart_warning_minutes.get()))) or "15,5,1"
+        cfg.wild_wipe_enabled = bool(self.var_wild_wipe_enabled.get())
+        cfg.wild_wipe_interval_hours = clamp_wild_wipe_hours(self.var_wild_wipe_hours.get())
+        raw_wipe_warn = self.var_wild_wipe_warning_minutes.get().strip()
+        if raw_wipe_warn and not parse_warning_minutes(raw_wipe_warn):
+            raise ValueError("Wild dino wipe warnings must be whole minutes from 1 to 120, for example 10,5,1 (or empty for none).")
+        cfg.wild_wipe_warning_minutes = ",".join(map(str, parse_warning_minutes(raw_wipe_warn)))
 
         cfg.hide_gameanalytics_console_logs = bool(self.var_hide_gameanalytics_console_logs.get())
 
@@ -10134,6 +10205,7 @@ class ServerManagerApp:
             self.var_auto_update_restart, self.var_auto_update_time, self.var_update_on_startup,
             self.var_scheduled_restart_enabled, self.var_scheduled_restart_time,
             self.var_restart_warnings_enabled, self.var_restart_warning_minutes,
+            self.var_wild_wipe_enabled, self.var_wild_wipe_hours, self.var_wild_wipe_warning_minutes,
             self.var_hide_gameanalytics_console_logs,
             self.var_cluster_enable, self.var_cluster_id, self.var_cluster_custom_path_enable, self.var_cluster_dir_override,
             self.var_no_transfer_from_filtering, self.var_alt_save_directory_name,
@@ -10996,8 +11068,8 @@ class ServerManagerApp:
         def job() -> None:
             # Cancelled once the stop holds the server: a refused click must not drop a
             # planned restart players were told about.
-            if self._cancel_countdown(rt, kinds=("restart", "update")):
-                rt.logger.info("Stop: the planned restart was cancelled.")
+            if self._cancel_countdown(rt, kinds=("restart", "update", "wipe")):
+                rt.logger.info("Stop: the planned restart (or wild dino wipe) was cancelled.")
             self._detach_from_group_countdown(rt)
             self._safe_stop(rt)
 
@@ -12636,7 +12708,11 @@ class ServerManagerApp:
             return
         if action == "cancel_countdown":
             rt = self._runtime(sid)
+            wipe = rt.countdown_kind == "wipe"
             if self._cancel_countdown(rt, announce=True):
+                if wipe:
+                    self._reset_wild_wipe(rt)  # skip this one, rather than warn again a moment later
+                    rt.logger.info("Wild dino wipe skipped from the Dashboard; the next one comes a full interval later.")
                 rt.logger.info("Countdown cancelled from the Dashboard.")
             else:
                 messagebox.showinfo("Cancel Countdown", f"No restart countdown is running for {self._display_name(sid)}.")
@@ -13449,6 +13525,10 @@ class ServerManagerApp:
                     self._tick_auto_save(rt, time.monotonic())
                 except Exception as e:
                     rt.logger.info(f"Auto-save scheduler: {e}")
+                try:
+                    self._tick_wild_wipe(rt, time.monotonic())
+                except Exception as e:
+                    rt.logger.info(f"Wild dino wipe scheduler: {e}")
             self._ui(self._sync_auto_save_hint)
 
     def _tick_auto_save(self, rt: ServerRuntime, now: float) -> None:
@@ -13463,6 +13543,97 @@ class ServerManagerApp:
             rt.logger.info("Auto-save is due; waiting for the current task to finish.")
 
     COUNTDOWN_MINUTE_SEC = 60.0  # one countdown minute, in seconds
+    WILD_WIPE_SAVE_EVERY_SEC = 300.0  # how often the running-hours count is written down
+
+    def _wild_wipe_seconds(self, rt: ServerRuntime) -> float:
+        if rt.wild_wipe_sec is None:
+            rt.wild_wipe_sec = load_wild_wipe_seconds(self.app_base, rt.server_id)
+        return rt.wild_wipe_sec
+
+    def _reset_wild_wipe(self, rt: ServerRuntime) -> None:
+        rt.wild_wipe_sec = 0.0
+        rt.wild_wipe_saved = time.monotonic()
+        save_wild_wipe_seconds(self.app_base, rt.server_id, 0.0)
+
+    def _wild_wipe_due_in(self, rt: ServerRuntime) -> Optional[float]:
+        """Running seconds left until this server's next wild dino wipe (None when off)."""
+        if not rt.cfg.wild_wipe_enabled:
+            return None
+        interval = clamp_wild_wipe_hours(rt.cfg.wild_wipe_interval_hours) * 3600.0
+        return max(0.0, interval - self._wild_wipe_seconds(rt))
+
+    def _tick_wild_wipe(self, rt: ServerRuntime, now: float) -> None:
+        cfg = rt.cfg
+        if not cfg.wild_wipe_enabled or not rt.is_running():
+            rt.wild_wipe_tick = None  # counting starts afresh at the first tick it runs
+            return
+        last, rt.wild_wipe_tick = rt.wild_wipe_tick, now
+        # Count the time it ran since the last tick; a gap far beyond the tick (the PC slept)
+        # is not running time players had.
+        if last is not None:
+            rt.wild_wipe_sec = self._wild_wipe_seconds(rt) + min(max(0.0, now - last), 4 * AUTO_SAVE_TICK_SEC)
+        if now - rt.wild_wipe_saved >= self.WILD_WIPE_SAVE_EVERY_SEC:
+            rt.wild_wipe_saved = now
+            save_wild_wipe_seconds(self.app_base, rt.server_id, self._wild_wipe_seconds(rt))
+        left = self._wild_wipe_due_in(rt)
+        minutes = parse_warning_minutes(cfg.wild_wipe_warning_minutes)
+        lead = (minutes[0] * self.COUNTDOWN_MINUTE_SEC) if minutes and rt.live_cfg().enable_rcon else 0.0
+        if left is None or left > lead:
+            return
+        if not rt.live_cfg().enable_rcon:
+            if not getattr(rt, "_wild_wipe_no_rcon_logged", False):
+                rt._wild_wipe_no_rcon_logged = True  # type: ignore[attr-defined]
+                rt.logger.info("Wild dino wipe is due, but RCON is off for this server; it needs RCON.")
+            return
+        rt._wild_wipe_no_rcon_logged = False  # type: ignore[attr-defined]
+        if rt.countdown is not None:
+            return  # a restart or update countdown first; tried again on the next tick
+        if self._start_wild_wipe(rt):
+            rt.logger.info("Wild dino wipe due.")
+
+    def _start_wild_wipe(self, rt: ServerRuntime) -> bool:
+        """Warn the players, then clear the wild creatures. False if a countdown already runs."""
+        minutes = parse_warning_minutes(rt.cfg.wild_wipe_warning_minutes)
+        return self._countdown_then(
+            rt, "wild dino wipe", lambda: self._wild_wipe_now(rt), kind="wipe", minutes=minutes,
+            message="Wild creatures will be cleared in {m} minute{s}. Tamed creatures are not affected.",
+        )
+
+    def _wild_wipe_now(self, rt: ServerRuntime) -> bool:
+        def job() -> None:
+            if not rt.is_running():
+                raise TaskCancelled("The server is no longer running; the wild dino wipe is skipped.")
+            rt.logger.info("Wild dino wipe: RCON DestroyWildDinos")
+            self._rcon_try("DestroyWildDinos", timeout=60.0, rt=rt)
+            self._reset_wild_wipe(rt)
+            with contextlib.suppress(Exception):
+                self._rcon_try("ServerChat Wild creatures were cleared; new ones are spawning.", timeout=5.0, rt=rt)
+            hours = clamp_wild_wipe_hours(rt.cfg.wild_wipe_interval_hours)
+            rt.logger.info(f"Wild dino wipe done. The next one is due after {hours} more running hour(s).")
+            self._ui(lambda: self._set_status_for(rt, "Wild creatures cleared."))
+
+        return self._run_task("Wild Dino Wipe", job, rt, quiet=True)
+
+    def wild_wipe_now(self) -> None:
+        """The Wipe Now button: the same warned wipe, started by hand."""
+        if not self._save_form("Wild Dino Wipe"):
+            return
+        rt = self.rt
+        if not rt.is_running():
+            messagebox.showinfo("Wild Dino Wipe", "The server is not running.")
+            return
+        if not rt.live_cfg().enable_rcon:
+            messagebox.showwarning("Wild Dino Wipe", "Clearing wild creatures needs RCON. Turn it on (Advanced Start Args) and restart the server.")
+            return
+        minutes = parse_warning_minutes(rt.cfg.wild_wipe_warning_minutes)
+        when = f"after warning the players ({', '.join(map(str, minutes))} minutes before)" if minutes else "right away"
+        if not messagebox.askyesno(
+            "Wild Dino Wipe",
+            f"Clear all wild creatures on {self._display_name(rt.server_id)} {when}?\n\nTamed creatures are not affected.",
+        ):
+            return
+        if not self._start_wild_wipe(rt):
+            messagebox.showwarning("Wild Dino Wipe", "A countdown is already running for this server. Try again when it is over.")
 
     def _warning_minutes(self, rt: ServerRuntime) -> List[int]:
         cfg = rt.cfg
@@ -13475,6 +13646,7 @@ class ServerManagerApp:
         minutes: List[int],
         cancel: threading.Event,
         on_step: Optional[Callable[[int], None]] = None,
+        message: Optional[str] = None,
     ) -> bool:
         """Tell the players of these servers, over RCON, that they go down in N minutes, at
         each of the given minutes before, then wait out the last one. False if cancelled."""
@@ -13489,7 +13661,8 @@ class ServerManagerApp:
                 return False
             if on_step is not None:
                 on_step(m)
-            text = f"Server {reason} in {m} minute{'s' if m != 1 else ''}."
+            plural = "s" if m != 1 else ""
+            text = message.format(m=m, s=plural) if message else f"Server {reason} in {m} minute{plural}."
             for rt in runtimes:
                 if rt.is_running() and rt.live_cfg().enable_rcon:
                     try:
@@ -13501,7 +13674,10 @@ class ServerManagerApp:
 
     COUNTDOWN_RETRY_SEC = 2 * 60 * 60  # how long a planned action waits for a busy server
 
-    def _countdown_then(self, rt: ServerRuntime, reason: str, then: Callable[[], bool], kind: str = "restart") -> bool:
+    def _countdown_then(
+        self, rt: ServerRuntime, reason: str, then: Callable[[], bool], kind: str = "restart",
+        minutes: Optional[List[int]] = None, message: Optional[str] = None,
+    ) -> bool:
         """Warn the players of a running server first, then run then() once the server is free.
 
         Without warnings set (or RCON off) there is no countdown, but then() still waits for
@@ -13509,7 +13685,7 @@ class ServerManagerApp:
         is not lost to a task that happens to be running. False when a countdown (or a
         planned action waiting) is already there for this server.
         """
-        minutes = self._warning_minutes(rt)
+        minutes = self._warning_minutes(rt) if minutes is None else list(minutes)
         if not rt.is_running() or not rt.live_cfg().enable_rcon:
             minutes = []
         cancel = threading.Event()
@@ -13530,7 +13706,7 @@ class ServerManagerApp:
             try:
                 if minutes:
                     rt.logger.info(f"Countdown started: the server {reason} in {minutes[0]} minute(s).")
-                if not self._run_countdown([rt], reason, minutes, cancel, step):
+                if not self._run_countdown([rt], reason, minutes, cancel, step, message=message):
                     rt.logger.info("Countdown cancelled.")
                     return
                 if minutes and not rt.is_running():
@@ -13572,10 +13748,11 @@ class ServerManagerApp:
         before the window (and its threads) go."""
         threads = []
         for rt in runtimes:
-            told = rt.countdown_announced
+            told, kind = rt.countdown_announced, rt.countdown_kind
             if self._cancel_countdown(rt) and told and rt.live_cfg().enable_rcon:
+                text = self._countdown_cancel_text(kind)
                 t = threading.Thread(
-                    target=lambda _rt=rt: self._rcon_try("ServerChat The announced restart is cancelled.", timeout=3.0, rt=_rt),
+                    target=lambda _rt=rt, _text=text: self._rcon_try(_text, timeout=3.0, rt=_rt),
                     daemon=True,
                 )
                 t.start()
@@ -13584,11 +13761,19 @@ class ServerManagerApp:
         for t in threads:
             t.join(max(0.0, end - time.monotonic()))
 
-    def _announce_countdown_cancelled(self, rt: ServerRuntime) -> None:
-        """Tell players the announced restart is off, on a thread (RCON can be slow)."""
+    @staticmethod
+    def _countdown_cancel_text(kind: Optional[str]) -> str:
+        if kind == "wipe":
+            return "ServerChat The announced wild creature wipe is cancelled."
+        return "ServerChat The announced restart is cancelled."
+
+    def _announce_countdown_cancelled(self, rt: ServerRuntime, kind: Optional[str] = None) -> None:
+        """Tell players the announced restart (or wipe) is off, on a thread (RCON can be slow)."""
+        text = self._countdown_cancel_text(kind)
+
         def send() -> None:
             with contextlib.suppress(Exception):
-                self._rcon_try("ServerChat The announced restart is cancelled.", timeout=5.0, rt=rt)
+                self._rcon_try(text, timeout=5.0, rt=rt)
 
         threading.Thread(target=send, daemon=True, name="countdown-cancel").start()
 
@@ -13611,8 +13796,25 @@ class ServerManagerApp:
         if announce:
             for target in warned:
                 if target.is_running():
-                    self._announce_countdown_cancelled(target)
+                    self._announce_countdown_cancelled(target, kind)
         return True
+
+    def _drop_wipe_countdown(self, rt: ServerRuntime) -> None:
+        """A planned restart or update comes first: a wild dino wipe counting down is called
+        off (players told), and since its hours stay counted it follows after the restart."""
+        with rt.task_lock:
+            if rt.countdown_kind != "wipe" or rt.countdown_cancel is None:
+                return
+            ev, told = rt.countdown_cancel, rt.countdown_announced
+            # Cleared here, not by its thread, so the restart can claim the countdown now.
+            rt.countdown = None
+            rt.countdown_cancel = None
+            rt.countdown_kind = None
+            rt.countdown_announced = False
+        ev.set()
+        rt.logger.info("Wild dino wipe called off: a planned restart or update comes first; the wipe follows later.")
+        if told and rt.is_running():
+            self._announce_countdown_cancelled(rt, "wipe")
 
     def _detach_from_group_countdown(self, rt: ServerRuntime) -> None:
         """A map stopped during a Restart All countdown: the others go on; it just leaves."""
@@ -13662,6 +13864,7 @@ class ServerManagerApp:
         if cfg.auto_update_restart and self._minutes_apart(cfg.auto_update_time, cfg.scheduled_restart_time) < 30:
             rt.logger.info("Daily restart skipped: the nightly update restarts the server within half an hour of it.")
             return
+        self._drop_wipe_countdown(rt)
         if rt.countdown is not None:
             rt.logger.info("Daily restart skipped: a countdown or planned restart is already running for this server.")
             return
@@ -13700,6 +13903,7 @@ class ServerManagerApp:
         # Due. A busy server keeps it due and is tried again on the next tick, so a task
         # running at 03:00 delays tonight's update instead of skipping it. With warnings set,
         # players are told first and the update follows the countdown.
+        self._drop_wipe_countdown(rt)
         if rt.countdown is not None or not self._countdown_then(
             rt, "restarts for an update",
             lambda: self.update_and_restart_for(rt, quiet=True, from_countdown=True, only_if_running=True),
@@ -13782,7 +13986,24 @@ class ServerManagerApp:
         )
         return " ".join(parts)
 
+    def _wild_wipe_hint_text(self) -> str:
+        rt = self.rt
+        if not rt.cfg.wild_wipe_enabled:
+            return "Off. Tamed creatures are never touched."
+        left = self._wild_wipe_due_in(rt)
+        if rt.countdown_kind == "wipe" and rt.countdown:
+            return f"Wipe {rt.countdown}."
+        if left is None:
+            return ""
+        when = describe_span(left) if left > 60 else "due now"
+        tail = "" if rt.is_running() else " (counts only while the server is running)"
+        return f"Next wipe in about {when} of running time{tail}. Tamed creatures are never touched."
+
     def _sync_auto_save_hint(self) -> None:
+        with contextlib.suppress(Exception):
+            text = self._wild_wipe_hint_text()
+            if text != self.var_wild_wipe_hint.get():
+                self.var_wild_wipe_hint.set(text)
         try:
             text = self._auto_save_hint_text()
             if text != self.var_auto_save_hint.get():
