@@ -138,10 +138,22 @@ MAP_PRESETS = [
     "TheCenter_WP",
     "Aberration_WP",
     "Extinction_WP",
+    "Astraeos_WP",
     "Ragnarok_WP",
     "Valguero_WP",
     "LostColony_WP",
+    "Genesis_WP",
+    "BobsMissions_WP",
 ]
+# Names shown for maps whose ID does not read as one.
+MAP_DISPLAY_NAMES = {
+    "Genesis_WP": "Genesis Part 1",
+    "BobsMissions_WP": "Club ARK",
+}
+# Maps that only load with a mod: always passed in -mods= when the map runs.
+MAP_REQUIRED_MODS = {
+    "BobsMissions_WP": "1005639",
+}
 MAP_CUSTOM_SENTINEL = "Custom..."
 
 APPDATA_DIR_NAME = "ARK-Ascended-Server-Manager"
@@ -650,6 +662,61 @@ def _scaled_dimension(root: tk.Tk, size: int) -> int:
     return max(1, int(size * scaling))
 
 
+# What the Advanced Start Args options do, shown when hovering them. Wording follows the
+# ARK wiki's server configuration page, with what it means in practice.
+START_OPTION_HELP: Dict[str, str] = {
+    "cluster_enable": "-clusterid=<ID>\nMakes this server part of a cluster: servers with the same cluster ID\n"
+                      "share uploaded survivors, creatures and items (Cross-ARK transfers).",
+    "cluster_id": "The cluster's name. Every map of one cluster uses exactly the same ID.",
+    "no_transfer_filtering": "-NoTransferFromFiltering\nBlocks ARK data (uploaded survivors, creatures and items) coming\n"
+                             "from single player and from servers that have no cluster ID.",
+    "cluster_custom_path": "Use the folder below for the cluster's shared transfer data\n"
+                           "(-ClusterDirOverride). Off: each install keeps its own, inside its Saved folder.",
+    "cluster_dir": "-ClusterDirOverride=<folder>\nWhere the cluster's cross-server transfer data is stored.\n"
+                   "Every map of the cluster must point to the same folder.",
+    "alt_save": "?AltSaveDirectoryName=<name>\nA custom folder name for this server's world save (under Saved\\SavedArks).\n"
+                "Lets two servers run from one install without sharing a save.",
+    "crossplay": "-ServerPlatform=PC+XSX+WINGDK\nAccepts players on PC (Steam), Xbox Series X|S and the Microsoft Store\n"
+                 "version. Off: PC players only.",
+    "battleye": "BattlEye anti-cheat. Off starts the server with -NoBattlEye\n(players then join without BattlEye running).",
+    "dino_default": "Wild creatures spawn as usual.",
+    "NoDinos": "-NoDinos\nNo wild creatures spawn.",
+    "NoDinosExceptForcedSpawn": "-NoDinosExceptForcedSpawn\nNo wild creatures spawn, except forced spawns.",
+    "NoDinosExceptStreamingSpawn": "-NoDinosExceptStreamingSpawn\nNo wild creatures spawn, except streaming spawns.",
+    "NoDinosExceptManualSpawn": "-NoDinosExceptManualSpawn\nNo wild creatures spawn, except ones spawned manually\n(admin commands, for example).",
+    "NoDinosExceptWaterSpawn": "-NoDinosExceptWaterSpawn\nNo wild creatures spawn, except water spawns.",
+    "servergamelog": "-servergamelog\nWrites the server admin log (admin commands, chat and more),\nalso readable over RCON.",
+    "servergamelogincludetribelogs": "-servergamelogincludetribelogs\nAdds tribe logs to the server game log.",
+    "serverrconoutputtribelogs": "-ServerRCONOutputTribeLogs\nIncludes tribe logs in the RCON output.",
+    "automanaged_mods": "-automanagedmods\nThe server downloads, installs and updates the mods in the Mods list\nby itself when it starts.",
+    "enable_rcon": "Remote console (RCONEnabled + RCONPort). The manager needs it for saving before stops\n"
+                   "and backups, in-game warnings and broadcasts, player counts and safe shutdowns.",
+    "rcon_host": "Address the manager connects to for RCON: 127.0.0.1 for a server on this PC.",
+    "rcon_port": "The RCON port of this server. Each server on the PC needs its own.",
+    "DisableCustomCosmetics": "-DisableCustomCosmetics\nTurns off the custom cosmetic (skin) system.",
+    "AutoDestroyStructures": "-AutoDestroyStructures\nOld structures are destroyed automatically after a while\n"
+                             "(abandoned bases decay away).",
+    "ForceRespawnDinos": "-ForceRespawnDinos\nDestroys all wild creatures every time the server starts, so they\n"
+                         "respawn fresh. Tamed creatures are not touched.",
+    "NoWildBabies": "-NoWildBabies\nWild baby creatures no longer spawn.",
+    "ForceAllowCaveFlyers": "-ForceAllowCaveFlyers\nFlying creatures are allowed into caves.",
+    "disabledinonetrangescaling": "-disabledinonetrangescaling\nTurns off an optimization that shortens how far away creatures are\n"
+                                  "sent to players. Creatures stay visible farther, at more CPU and bandwidth.",
+    "UnstasisDinoObstructionCheck": "-UnstasisDinoObstructionCheck\nShould stop creatures from ghosting through meshes and structures\n"
+                                    "when they come back into view.",
+    "AlwaysTickDedicatedSkeletalMeshes": "-AlwaysTickDedicatedSkeletalMeshes\nTurns off an optimization that pauses the animations of idle creatures.\n"
+                                         "Can help hit detection, at a CPU cost.",
+    "disableCharacterTracker": "-disableCharacterTracker\nTurns off character tracking.",
+    "UseServerNetSpeedCheck": "-UseServerNetSpeedCheck\nKeeps players from piling up too much movement data per server tick\n"
+                              "(against speed and lag exploits).",
+    "StasisKeepControllers": "-StasisKeepControllers\nKeeps creatures' AI controllers in memory while they are in stasis:\n"
+                             "less work when they wake up, more memory used.",
+    "ignoredupeditems": "-ignoredupeditems\nAn item detected as duplicated in an inventory is ignored\n(left alone instead of acted on).",
+    "open_app": "The manager's own folder: global settings, server profiles, logs and backups by default.",
+    "open_server_cfg": "This server's profile folder (its settings, staged INIs and logs).",
+}
+
+
 class HoverTooltip:
     def __init__(self, widget: tk.Widget, text: str, delay_ms: int = 500) -> None:
         self.widget = widget
@@ -726,14 +793,58 @@ def apply_min_window_size(root: tk.Tk, width: int, height: int) -> None:
     root.minsize(min(scaled_w, screen_w), min(scaled_h, screen_h))
 
 
-def apply_initial_window_geometry(root: tk.Tk, width: int, height: int) -> None:
+class _MonitorInfo(ctypes.Structure):
+    _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", wintypes.RECT), ("rcWork", wintypes.RECT),
+                ("dwFlags", wintypes.DWORD)]
+
+
+def screen_work_area(x: int, y: int, fallback: Tuple[int, int]) -> Tuple[int, int, int, int]:
+    """(left, top, width, height) of the usable area of the monitor at (x, y): the screen
+    without the taskbar, wherever the taskbar sits."""
+    if os.name == "nt":
+        try:
+            u = ctypes.windll.user32
+            u.MonitorFromPoint.restype = wintypes.HANDLE
+            u.MonitorFromPoint.argtypes = [wintypes.POINT, wintypes.DWORD]
+            u.GetMonitorInfoW.argtypes = [wintypes.HANDLE, ctypes.POINTER(_MonitorInfo)]
+            mon = u.MonitorFromPoint(wintypes.POINT(int(x), int(y)), 2)  # MONITOR_DEFAULTTONEAREST
+            info = _MonitorInfo()
+            info.cbSize = ctypes.sizeof(_MonitorInfo)
+            if mon and u.GetMonitorInfoW(mon, ctypes.byref(info)):
+                r = info.rcWork
+                if r.right > r.left and r.bottom > r.top:
+                    return r.left, r.top, r.right - r.left, r.bottom - r.top
+        except Exception:
+            pass
+    return 0, 0, fallback[0], fallback[1]
+
+
+def apply_initial_window_geometry(root: tk.Misc, width: int, height: int) -> None:
+    """Size a window to fit the usable screen area and place it there: centred on the window
+    it belongs to (or the screen), with its title bar never under a taskbar or off screen."""
     scaled_w = _scaled_dimension(root, width)
     scaled_h = _scaled_dimension(root, height)
-    screen_w = root.winfo_screenwidth()
-    screen_h = root.winfo_screenheight()
-    target_w = min(scaled_w, int(screen_w * 0.95))
-    target_h = min(scaled_h, int(screen_h * 0.9))
-    root.geometry(f"{target_w}x{target_h}")
+    screen = (root.winfo_screenwidth(), root.winfo_screenheight())
+    parent = None
+    with contextlib.suppress(Exception):
+        master = root.master
+        if master is not None and master.winfo_ismapped():
+            parent = master.winfo_toplevel()
+    if parent is not None:
+        cx = parent.winfo_rootx() + parent.winfo_width() // 2
+        cy = parent.winfo_rooty() + parent.winfo_height() // 2
+    else:
+        cx, cy = 0, 0  # the main window opens on the primary monitor, as Windows would place it
+    left, top, work_w, work_h = screen_work_area(cx, cy, screen)
+    target_w = min(scaled_w, int(work_w * 0.95))
+    target_h = min(scaled_h, int(work_h * 0.9))
+    if parent is None:
+        cx, cy = left + work_w // 2, top + work_h // 2
+    # The frame's top-left is placed; leave room for the title bar and borders below it.
+    frame_h = 40
+    x = max(left, min(cx - target_w // 2, left + work_w - target_w))
+    y = max(top, min(cy - (target_h + frame_h) // 2, top + work_h - target_h - frame_h))
+    root.geometry(f"{target_w}x{target_h}+{int(x)}+{int(y)}")
 
 # =============================================================================
 # LOW-LEVEL UTILITIES
@@ -3248,6 +3359,9 @@ def build_server_command(cfg: AppConfig) -> List[str]:
         flags.append("-automanagedmods")
 
     mods = cfg.normalized_mods()
+    required = next((mod for m, mod in MAP_REQUIRED_MODS.items() if m.lower() == map_name.lower()), None)
+    if required and required not in mods.split(","):
+        mods = ",".join(x for x in (mods, required) if x)  # the map does not load without it
     if mods:
         flags.append(f"-mods={mods}")
         
@@ -3892,6 +4006,9 @@ def settings_from_export(values: Dict[str, Any]) -> AppConfig:
 
 def pretty_map_name(map_name: str) -> str:
     """'ScorchedEarth_WP' -> 'Scorched Earth'."""
+    for known, shown in MAP_DISPLAY_NAMES.items():
+        if (map_name or "").strip().lower() == known.lower():
+            return shown
     base = re.sub(r"_WP$", "", (map_name or "").strip(), flags=re.IGNORECASE)
     return re.sub(r"(?<=[a-z])(?=[A-Z])", " ", base) or map_name
 
@@ -7956,6 +8073,8 @@ class ServerManagerApp:
         self._autosave_after_id: Optional[str] = None
         self._autosave_guard = False
         self._in_background = False  # window hidden, servers still managed
+        self._scroll_canvases: List[tk.Canvas] = []
+        self.root.bind_all("<MouseWheel>", self._on_wheel, add="+")
         self._was_zoomed = False  # maximized when it went to the background
         self._close_asking = False
         self._closing_stop = False  # "stop the servers and quit" is under way
@@ -8037,7 +8156,7 @@ class ServerManagerApp:
         threading.Thread(target=self._reattach_on_launch, daemon=True, name="reattach").start()
         self._dash_tick()
         # Several profiles: start on the overview. A single server: straight to its settings.
-        self.nb.select(self.tab_dash if len(self.global_cfg.servers) > 1 else self.tab_server)
+        self.nb.select(self.tab_dash if len(self.global_cfg.servers) > 1 else self.page_server)
         self._sync_auto_save_hint()
         self.root.after(800, self._auto_start_on_launch)
 
@@ -8942,15 +9061,18 @@ class ServerManagerApp:
         ttk.Label(header, textvariable=self.var_status, anchor="e").grid(row=0, column=1, sticky="e", padx=(6, 0))
 
         self.tab_dash = ttk.Frame(self.nb, padding=10)
-        self.tab_server = ttk.Frame(self.nb, padding=10)
-        self.tab_adv = ttk.Frame(self.nb, padding=10)
+        # Taller than many screens: these two pages scroll.
+        self.page_server = ttk.Frame(self.nb)
+        self.tab_server = self._make_scroll_page(self.page_server)
+        self.page_adv = ttk.Frame(self.nb)
+        self.tab_adv = self._make_scroll_page(self.page_adv)
         self.tab_rcon = ttk.Frame(self.nb, padding=10)
         self.tab_discord = ttk.Frame(self.nb, padding=10)
         self.tab_ini = ttk.Frame(self.nb, padding=10)
 
         self.nb.add(self.tab_dash, text="Dashboard")
-        self.nb.add(self.tab_server, text="Server")
-        self.nb.add(self.tab_adv, text="Advanced Start Args")
+        self.nb.add(self.page_server, text="Server")
+        self.nb.add(self.page_adv, text="Advanced Start Args")
         self.nb.add(self.tab_rcon, text="RCON")
         self.nb.add(self.tab_discord, text="Discord")
         self.nb.add(self.tab_ini, text="INI Editor")
@@ -9286,39 +9408,47 @@ class ServerManagerApp:
         ttk.Separator(lf_cluster).grid(row=2, column=0, columnspan=2, sticky="ew", pady=(10, 4))
         ttk.Label(lf_cluster, text="Manual settings", foreground=theme["muted"]).grid(row=3, column=0, sticky="w")
 
-        ttk.Checkbutton(
+        def tip(widget: tk.Widget, key: str) -> tk.Widget:
+            HoverTooltip(widget, START_OPTION_HELP[key])
+            return widget
+
+        tip(ttk.Checkbutton(
             lf_cluster, text="Enable Cluster", variable=self.var_cluster_enable,
             command=self._on_cluster_enable_toggled,
-        ).grid(row=4, column=0, sticky="w", pady=(4, 0))
-        ttk.Label(lf_cluster, text="Cluster ID").grid(row=5, column=0, sticky="w", pady=(6, 0))
-        ttk.Entry(lf_cluster, textvariable=self.var_cluster_id).grid(row=5, column=1, sticky="ew", padx=6, pady=(6, 0))
+        ), "cluster_enable").grid(row=4, column=0, sticky="w", pady=(4, 0))
+        tip(ttk.Label(lf_cluster, text="Cluster ID"), "cluster_id").grid(row=5, column=0, sticky="w", pady=(6, 0))
+        tip(ttk.Entry(lf_cluster, textvariable=self.var_cluster_id), "cluster_id").grid(row=5, column=1, sticky="ew", padx=6, pady=(6, 0))
 
-        ttk.Checkbutton(lf_cluster, text="NoTransferFromFiltering", variable=self.var_no_transfer_from_filtering).grid(row=6, column=0, sticky="w", pady=(8, 0))
+        tip(ttk.Checkbutton(lf_cluster, text="NoTransferFromFiltering", variable=self.var_no_transfer_from_filtering),
+            "no_transfer_filtering").grid(row=6, column=0, sticky="w", pady=(8, 0))
 
-        ttk.Checkbutton(lf_cluster, text="Enable Cluster Custom Path", variable=self.var_cluster_custom_path_enable).grid(row=7, column=0, sticky="w", pady=(8, 0))
-        ttk.Label(lf_cluster, text="ClusterDirOverride Path").grid(row=8, column=0, sticky="w", pady=(6, 0))
+        tip(ttk.Checkbutton(lf_cluster, text="Enable Cluster Custom Path", variable=self.var_cluster_custom_path_enable),
+            "cluster_custom_path").grid(row=7, column=0, sticky="w", pady=(8, 0))
+        tip(ttk.Label(lf_cluster, text="ClusterDirOverride Path"), "cluster_dir").grid(row=8, column=0, sticky="w", pady=(6, 0))
         path_row = ttk.Frame(lf_cluster)
         path_row.grid(row=8, column=1, sticky="ew", padx=6, pady=(6, 0))
         path_row.columnconfigure(0, weight=1)
-        ttk.Entry(path_row, textvariable=self.var_cluster_dir_override).grid(row=0, column=0, sticky="ew")
+        tip(ttk.Entry(path_row, textvariable=self.var_cluster_dir_override), "cluster_dir").grid(row=0, column=0, sticky="ew")
         ttk.Button(path_row, text="Browse", command=self._browse_cluster_dir).grid(row=0, column=1, padx=(6, 0))
 
-        ttk.Label(lf_cluster, text="AltSaveDirectoryName (optional, per instance)").grid(row=9, column=0, sticky="w", pady=(8, 0))
-        ttk.Entry(lf_cluster, textvariable=self.var_alt_save_directory_name).grid(row=9, column=1, sticky="ew", padx=6, pady=(8, 0))
+        tip(ttk.Label(lf_cluster, text="AltSaveDirectoryName (optional, per instance)"), "alt_save") \
+            .grid(row=9, column=0, sticky="w", pady=(8, 0))
+        tip(ttk.Entry(lf_cluster, textvariable=self.var_alt_save_directory_name), "alt_save") \
+            .grid(row=9, column=1, sticky="ew", padx=6, pady=(8, 0))
 
         # moved: ServerPlatform
         lf_platform = ttk.LabelFrame(self.tab_adv, text="Platform / Crossplay", padding=10)
         lf_platform.grid(row=1, column=0, sticky="nsew", padx=5, pady=5)
-        ttk.Checkbutton(
+        tip(ttk.Checkbutton(
             lf_platform,
             text='ServerPlatform: PC+XSX+WINGDK',
             variable=self.var_server_platform_crossplay
-        ).grid(row=0, column=0, sticky="w")
-        ttk.Checkbutton(
+        ), "crossplay").grid(row=0, column=0, sticky="w")
+        tip(ttk.Checkbutton(
             lf_platform,
             text="Enable BattlEye",
             variable=self.var_enable_battleye
-        ).grid(row=1, column=0, sticky="w", pady=(6, 0))
+        ), "battleye").grid(row=1, column=0, sticky="w", pady=(6, 0))
 
         lf_dinos = ttk.LabelFrame(self.tab_adv, text="Dinosaur Settings (mutual exclusive)", padding=10)
         lf_dinos.grid(row=0, column=1, sticky="nsew", padx=5, pady=5)
@@ -9332,26 +9462,33 @@ class ServerManagerApp:
             ("No Dinos Except Water Spawn", "NoDinosExceptWaterSpawn"),
         ]
         for i, (label, val) in enumerate(dino_opts):
-            ttk.Radiobutton(lf_dinos, text=label, variable=self.var_dino_mode, value=val).grid(row=i, column=0, sticky="w")
+            tip(ttk.Radiobutton(lf_dinos, text=label, variable=self.var_dino_mode, value=val), val or "dino_default") \
+                .grid(row=i, column=0, sticky="w")
 
         lf_logs = ttk.LabelFrame(self.tab_adv, text="Logs", padding=10)
         lf_logs.grid(row=1, column=1, sticky="nsew", padx=5, pady=5)
-        ttk.Checkbutton(lf_logs, text="servergamelog", variable=self.var_log_servergamelog).grid(row=0, column=0, sticky="w")
-        ttk.Checkbutton(lf_logs, text="servergamelogincludetribelogs", variable=self.var_log_servergamelogincludetribelogs).grid(row=1, column=0, sticky="w")
-        ttk.Checkbutton(lf_logs, text="ServerRCONOutputTribeLogs", variable=self.var_log_serverrconoutputtribelogs).grid(row=2, column=0, sticky="w")
+        tip(ttk.Checkbutton(lf_logs, text="servergamelog", variable=self.var_log_servergamelog), "servergamelog") \
+            .grid(row=0, column=0, sticky="w")
+        tip(ttk.Checkbutton(lf_logs, text="servergamelogincludetribelogs", variable=self.var_log_servergamelogincludetribelogs),
+            "servergamelogincludetribelogs").grid(row=1, column=0, sticky="w")
+        tip(ttk.Checkbutton(lf_logs, text="ServerRCONOutputTribeLogs", variable=self.var_log_serverrconoutputtribelogs),
+            "serverrconoutputtribelogs").grid(row=2, column=0, sticky="w")
 
         lf_runtime = ttk.LabelFrame(self.tab_adv, text="Mods & RCON", padding=10)
         lf_runtime.grid(row=2, column=1, sticky="nsew", padx=5, pady=5)
         lf_runtime.columnconfigure(1, weight=1)
 
-        ttk.Checkbutton(lf_runtime, text="Automanaged Mods", variable=self.var_automanaged_mods).grid(row=0, column=0, sticky="w")
-        ttk.Checkbutton(lf_runtime, text="Enable RCON", variable=self.var_enable_rcon).grid(row=1, column=0, sticky="w", pady=(6, 0))
+        tip(ttk.Checkbutton(lf_runtime, text="Automanaged Mods", variable=self.var_automanaged_mods), "automanaged_mods") \
+            .grid(row=0, column=0, sticky="w")
+        tip(ttk.Checkbutton(lf_runtime, text="Enable RCON", variable=self.var_enable_rcon), "enable_rcon") \
+            .grid(row=1, column=0, sticky="w", pady=(6, 0))
 
-        ttk.Label(lf_runtime, text="RCON Host").grid(row=2, column=0, sticky="w", pady=(6, 0))
-        ttk.Entry(lf_runtime, textvariable=self.var_rcon_host).grid(row=2, column=1, sticky="ew", padx=6, pady=(6, 0))
+        tip(ttk.Label(lf_runtime, text="RCON Host"), "rcon_host").grid(row=2, column=0, sticky="w", pady=(6, 0))
+        tip(ttk.Entry(lf_runtime, textvariable=self.var_rcon_host), "rcon_host").grid(row=2, column=1, sticky="ew", padx=6, pady=(6, 0))
 
-        ttk.Label(lf_runtime, text="RCON Port").grid(row=3, column=0, sticky="w", pady=(6, 0))
-        ttk.Entry(lf_runtime, textvariable=self.var_rcon_port, validate="key", validatecommand=vcmd).grid(row=3, column=1, sticky="ew", padx=6, pady=(6, 0))
+        tip(ttk.Label(lf_runtime, text="RCON Port"), "rcon_port").grid(row=3, column=0, sticky="w", pady=(6, 0))
+        tip(ttk.Entry(lf_runtime, textvariable=self.var_rcon_port, validate="key", validatecommand=vcmd), "rcon_port") \
+            .grid(row=3, column=1, sticky="ew", padx=6, pady=(6, 0))
 
         lf_mech = ttk.LabelFrame(self.tab_adv, text="Mechanics / Performance", padding=10)
         lf_mech.grid(row=2, column=0, sticky="nsew", padx=5, pady=5)
@@ -9371,12 +9508,20 @@ class ServerManagerApp:
             ("ignoredupeditems", self.var_m_ignoredupeditems),
         ]
         for i, (label, var) in enumerate(mech_items):
-            ttk.Checkbutton(lf_mech, text=label, variable=var).grid(row=i // 2, column=i % 2, sticky="w", padx=(0, 14), pady=2)
+            tip(ttk.Checkbutton(lf_mech, text=label, variable=var), label) \
+                .grid(row=i // 2, column=i % 2, sticky="w", padx=(0, 14), pady=2)
 
         lf_tools = ttk.LabelFrame(self.tab_adv, text="Folders", padding=10)
         lf_tools.grid(row=3, column=1, sticky="nsew", padx=5, pady=5)
         self.btn_open_app = ttk.Button(lf_tools, text="Open App Folder", command=lambda: open_folder(self.app_base))
         self.btn_open_server_cfg = ttk.Button(lf_tools, text="Open Server Config", command=self.open_server_config_dir)
+        tip(self.btn_open_app, "open_app")
+        tip(self.btn_open_server_cfg, "open_server_cfg")
+        ttk.Label(
+            self.tab_adv,
+            text="Hover over any option to see what it does and the start option it sets. Changes apply on the next start.",
+            foreground=theme["muted"],
+        ).grid(row=4, column=0, columnspan=2, sticky="w", padx=5, pady=(6, 0))
         self.btn_open_app.grid(row=0, column=0, sticky="ew", pady=(0, 6))
         self.btn_open_server_cfg.grid(row=1, column=0, sticky="ew")
 
@@ -9617,18 +9762,7 @@ class ServerManagerApp:
 
             canvas.grid(row=1, column=0, sticky="nsew")
             vscroll.grid(row=1, column=1, sticky="ns")
-
-            def _on_mousewheel(event, c=canvas):
-                c.yview_scroll(int(-1 * (event.delta / 120)), "units")
-
-            def _bind_wheel(event, c=canvas, handler=_on_mousewheel):
-                c.bind_all("<MouseWheel>", handler)
-
-            def _unbind_wheel(event, c=canvas):
-                c.unbind_all("<MouseWheel>")
-
-            canvas.bind("<Enter>", _bind_wheel)
-            canvas.bind("<Leave>", _unbind_wheel)
+            self._scroll_canvases.append(canvas)  # the shared wheel handler scrolls it
 
             row_i = 0
 
@@ -10278,6 +10412,9 @@ class ServerManagerApp:
         else:
             self.var_map_custom.set(choice)
             self.ent_map_custom.configure(state="disabled")
+        mod = MAP_REQUIRED_MODS.get(choice)
+        if mod:
+            self._set_status(f"{pretty_map_name(choice)} needs mod {mod}; it is added to the start command automatically.")
 
     # ---------------------------------------------------------------------
     # Browsers
@@ -12093,6 +12230,58 @@ class ServerManagerApp:
     def _cluster_view(self, cluster_id: str) -> Optional[ClusterView]:
         return next((c for c in self._cluster_views()[0] if c.cluster_id == cluster_id), None)
 
+    # Widgets that scroll themselves with the wheel; a page under them is left alone.
+    _SELF_SCROLLING = {"Text", "Listbox", "Treeview", "TCombobox", "TSpinbox", "Spinbox"}
+
+    def _make_scroll_page(self, page: ttk.Frame, padding: int = 10) -> ttk.Frame:
+        """A page that scrolls when it is taller than the window. Returns the frame to fill."""
+        page.rowconfigure(0, weight=1)
+        page.columnconfigure(0, weight=1)
+        canvas = tk.Canvas(page, highlightthickness=0, borderwidth=0, background=THEME_COLORS["bg"])
+        vbar = ttk.Scrollbar(page, orient="vertical", command=canvas.yview)
+        inner = ttk.Frame(canvas, padding=padding)
+        win = canvas.create_window((0, 0), window=inner, anchor="nw")
+        canvas.configure(yscrollcommand=vbar.set)
+        canvas.grid(row=0, column=0, sticky="nsew")
+        vbar.grid(row=0, column=1, sticky="ns")
+
+        def sync(_e: Any = None) -> None:
+            canvas.configure(scrollregion=(0, 0, inner.winfo_reqwidth(), inner.winfo_reqheight()))
+            if inner.winfo_reqheight() > canvas.winfo_height() > 1:
+                vbar.grid()
+            else:
+                vbar.grid_remove()  # all of it fits: no bar, nothing to scroll
+                canvas.yview_moveto(0)
+
+        def fit_width(e: Any) -> None:
+            canvas.itemconfigure(win, width=e.width)
+            sync()
+
+        inner.bind("<Configure>", sync)
+        canvas.bind("<Configure>", fit_width)
+        self._scroll_canvases.append(canvas)
+        return inner
+
+    def _on_wheel(self, event: Any) -> None:
+        """Scroll the page under the pointer (Windows sends the wheel to the focused widget)."""
+        try:
+            w = self.root.winfo_containing(event.x_root, event.y_root)
+        except Exception:
+            return
+        while w is not None:
+            try:
+                if w.winfo_class() in self._SELF_SCROLLING:
+                    return  # a list or text box under the pointer scrolls itself
+            except Exception:
+                return
+            if w in self._scroll_canvases:
+                first, last = w.yview()
+                if first > 0.0 or last < 1.0:
+                    steps = max(1, abs(int(event.delta)) // 120)
+                    w.yview_scroll(-steps if event.delta > 0 else steps, "units")
+                return
+            w = getattr(w, "master", None)
+
     def _build_dashboard_tab(self) -> None:
         theme = THEME_COLORS
         tab = self.tab_dash
@@ -12148,39 +12337,43 @@ class ServerManagerApp:
         srv = ttk.LabelFrame(tab, text="Selected Server", padding=8)
         srv.grid(row=2, column=0, sticky="ew", pady=(8, 0))
         self._dash_server_buttons: List[ttk.Button] = []
-        for i, (text, cmd) in enumerate((
-            ("Start", lambda: self._dash_server_action("start")),
-            ("Stop (Safe)", lambda: self._dash_server_action("stop")),
-            ("Restart (Safe)", lambda: self._dash_server_action("restart")),
-            ("Update & Restart", lambda: self._dash_server_action("update")),
-            ("Back Up Now", lambda: self._dash_server_action("backup")),
-            ("Open", self._dash_open_selected),
-            ("Cluster...", lambda: self._dash_server_action("cluster")),
-            ("Copy Settings To...", lambda: self._dash_server_action("copy")),
-            ("Cancel Countdown", lambda: self._dash_server_action("cancel_countdown")),
+        self._dash_server_btn: Dict[str, ttk.Button] = {}
+        for i, (key, text, cmd) in enumerate((
+            ("start", "Start", lambda: self._dash_server_action("start")),
+            ("stop", "Stop (Safe)", lambda: self._dash_server_action("stop")),
+            ("restart", "Restart (Safe)", lambda: self._dash_server_action("restart")),
+            ("update", "Update & Restart", lambda: self._dash_server_action("update")),
+            ("backup", "Back Up Now", lambda: self._dash_server_action("backup")),
+            ("open", "Open", self._dash_open_selected),
+            ("cluster", "Cluster...", lambda: self._dash_server_action("cluster")),
+            ("copy", "Copy Settings To...", lambda: self._dash_server_action("copy")),
+            ("cancel_countdown", "Cancel Countdown", lambda: self._dash_server_action("cancel_countdown")),
         )):
             b = ttk.Button(srv, text=text, command=cmd)
             b.grid(row=i // 5, column=i % 5, padx=(0, 6), pady=(0, 4), sticky="ew")
             self._dash_server_buttons.append(b)
+            self._dash_server_btn[key] = b
 
         cl = ttk.LabelFrame(tab, text="Selected Cluster", padding=8)
         cl.grid(row=3, column=0, sticky="ew", pady=(8, 0))
         self._dash_cluster_buttons: List[ttk.Button] = []
-        for i, (text, cmd) in enumerate((
-            ("Start All", lambda: self._dash_cluster_action("start")),
-            ("Stop All (Safe)", lambda: self._dash_cluster_action("stop")),
-            ("Restart All (one by one)", lambda: self._dash_cluster_action("restart")),
-            ("Update All", lambda: self._dash_cluster_action("update")),
-            ("Back Up All", lambda: self._dash_cluster_action("backup")),
-            ("Broadcast...", lambda: self._dash_cluster_action("broadcast")),
-            ("Health Check...", lambda: self._dash_cluster_action("health")),
-            ("Export...", lambda: self._dash_cluster_action("export")),
-            ("Rename...", lambda: self._dash_cluster_action("rename")),
-            ("Start Delay...", lambda: self._dash_cluster_action("stagger")),
+        self._dash_cluster_btn: Dict[str, ttk.Button] = {}
+        for i, (key, text, cmd) in enumerate((
+            ("start", "Start All", lambda: self._dash_cluster_action("start")),
+            ("stop", "Stop All (Safe)", lambda: self._dash_cluster_action("stop")),
+            ("restart", "Restart All (one by one)", lambda: self._dash_cluster_action("restart")),
+            ("update", "Update All", lambda: self._dash_cluster_action("update")),
+            ("backup", "Back Up All", lambda: self._dash_cluster_action("backup")),
+            ("broadcast", "Broadcast...", lambda: self._dash_cluster_action("broadcast")),
+            ("health", "Health Check...", lambda: self._dash_cluster_action("health")),
+            ("export", "Export...", lambda: self._dash_cluster_action("export")),
+            ("rename", "Rename...", lambda: self._dash_cluster_action("rename")),
+            ("stagger", "Start Delay...", lambda: self._dash_cluster_action("stagger")),
         )):
             b = ttk.Button(cl, text=text, command=cmd)
             b.grid(row=i // 5, column=i % 5, padx=(0, 6), pady=(0, 4), sticky="ew")
             self._dash_cluster_buttons.append(b)
+            self._dash_cluster_btn[key] = b
         self.var_dash_hint = tk.StringVar(master=self.root, value="")
         ttk.Label(tab, textvariable=self.var_dash_hint, foreground=theme["muted"], wraplength=1100, justify="left") \
             .grid(row=4, column=0, sticky="w", pady=(6, 0))
@@ -12197,12 +12390,63 @@ class ServerManagerApp:
             return "cluster", iid[2:]
         return "", ""
 
+    def _dash_server_button_states(self, rt: ServerRuntime) -> Dict[str, bool]:
+        """Which actions make sense for this server now, as the Server tab's buttons do: no
+        Start for one that runs or is starting, no Stop for one that is stopped or busy."""
+        busy = rt.is_busy()
+        running = rt.is_running()
+        cfg = rt.live_cfg()
+        with self._runtimes_lock:
+            # A cluster sequence (Start All, Restart All, ...) is taking care of this map.
+            in_group = effective_cluster_dir(cfg) is not None and cfg.cluster_id.strip() in self._group_ops
+        return {
+            "start": not busy and not running and not in_group,
+            "stop": running and not busy,
+            "restart": running and not busy and not in_group,
+            "update": not busy and not in_group,
+            "backup": not busy,
+            "open": True,
+            "cluster": not busy,
+            "copy": True,
+            "cancel_countdown": rt.countdown is not None,
+        }
+
+    def _dash_cluster_button_states(self, view: ClusterView) -> Dict[str, bool]:
+        with self._runtimes_lock:
+            group = view.cluster_id in self._group_ops
+        rts = [self._runtime(sid) for sid in view.members]
+        any_running = any(r.is_running() for r in rts)
+        any_stopped = any(not r.is_running() for r in rts)
+        return {
+            "start": not group and any_stopped,
+            "stop": group or any_running,  # Stop All also ends a running sequence
+            "restart": not group and any_running,
+            "update": not group,
+            "backup": True,
+            "broadcast": any_running,
+            "health": True,
+            "export": True,
+            "rename": True,
+            "stagger": True,
+        }
+
     def _dash_sync_buttons(self) -> None:
         kind, ident = self._dash_selection()
-        for b in self._dash_server_buttons:
-            b.configure(state="normal" if kind == "server" else "disabled")
-        for b in self._dash_cluster_buttons:
-            b.configure(state="normal" if kind == "cluster" else "disabled")
+        server_states: Dict[str, bool] = {}
+        cluster_states: Dict[str, bool] = {}
+        try:
+            if kind == "server":
+                server_states = self._dash_server_button_states(self._runtime(ident))
+            elif kind == "cluster":
+                view = self._dash_views.get(ident)
+                if view is not None:
+                    cluster_states = self._dash_cluster_button_states(view)
+        except Exception:
+            pass  # a profile removed meanwhile: everything off until the next refresh
+        for key, b in self._dash_server_btn.items():
+            b.configure(state="normal" if server_states.get(key) else "disabled")
+        for key, b in self._dash_cluster_btn.items():
+            b.configure(state="normal" if cluster_states.get(key) else "disabled")
         self.btn_dash_add_maps.configure(state="normal" if kind == "cluster" else "disabled")
         hint = ""
         if kind == "cluster":
@@ -12372,7 +12616,7 @@ class ServerManagerApp:
         self._switch_server_profile(ident)
         if self.active_server_id == ident:
             self._refresh_server_selector(ident)
-            self.nb.select(self.tab_server)
+            self.nb.select(self.page_server)
 
     def _dash_prepare(self, server_id: str, title: str) -> bool:
         """The form holds unsaved edits only for the profile on screen; save them first."""
