@@ -221,6 +221,7 @@ Existing profiles keep working; a few things behave differently:
 - **-ClusterDirOverride is only passed while *Enable Cluster* is on.** A profile with a custom cluster path but the cluster off no longer gets it
 - **Running servers are asked for their player count over RCON once a minute**, for the Dashboard
 - **Only one manager runs at a time.** Opening it a second time brings the open manager's window up (also from the background) instead of starting a second one
+- **"Oil" in Stack Size Overrides and the harvest table now means regular oil.** Earlier versions wrote Tusoteuthis oil (`PrimalItemResource_SquidOil_C`) when Oil was picked, so an existing Oil override shows up as **Oil (Tusoteuthis)**; set regular Oil again if that was what you meant. Likewise, the second Purple Coloring is listed as **Purple Coloring (Magenta_C)**
 - **Two profiles never run the same world**: starting a profile is refused while another server runs the same map from the same install with the same save folder
 - Closing the window while servers run now asks whether to keep managing them in the background, stop them, or leave them running; opening the manager again while it runs in the background shows its window
 

@@ -920,7 +920,7 @@ _ITEM_DATA: dict[str, tuple[str, str, int]] = {
     'Pulmonoscorpius Saddle': ('PrimalItemArmor_ScorpionSaddle_C', 'Saddles', 1),
     'Pump-Action Shotgun': ('PrimalItem_WeaponMachinedShotgun_C', 'Weapons', 1),
     'Purple Coloring': ('PrimalItemDye_Purple_C', 'Coloring', 100),
-    'Magenta Coloring': ('PrimalItemDye_Magenta_C', 'Coloring', 100),
+    'Purple Coloring (Magenta_C)': ('PrimalItemDye_Magenta_C', 'Coloring', 100),
     'Purple-Ball Winter Beanie Skin': ('PrimalItemSkin_WW_WinterHatC_C', 'Skins', 1),
     'Purple-Ball Winter Beanie Skin (Winter Wonderland 5)': ('PrimalItemSkin_WW_WinterHatE_C', 'Skins', 1),
     'Pygocentrus Trophy': ('PrimalItemTrophy_Pygocentrus_C', 'Trophies', 1),

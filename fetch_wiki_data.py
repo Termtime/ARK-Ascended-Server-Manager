@@ -78,6 +78,23 @@ def main():
             seen.add(class_name)
             unique_items.append((name, category, stack_size, class_name))
 
+    # Two items sharing a display name would make one of them unreachable by name (the later
+    # dict key replaces the earlier): known ones get a fixed name, any other gets its class.
+    NAME_OVERRIDES = {
+        "PrimalItemResource_SquidOil_C": "Oil (Tusoteuthis)",
+        "PrimalItemDye_Magenta_C": "Purple Coloring (Magenta_C)",
+    }
+    named = []
+    for name, category, stack_size, class_name in unique_items:
+        named.append((NAME_OVERRIDES.get(class_name, name), category, stack_size, class_name))
+    taken = set()
+    unique_items = []
+    for name, category, stack_size, class_name in named:
+        if name in taken:
+            name = f"{name} ({class_name})"
+        taken.add(name)
+        unique_items.append((name, category, stack_size, class_name))
+
     unique_items.sort(key=lambda x: x[0])
 
     print(f"\nTotal unique items: {len(unique_items)}", file=sys.stderr)

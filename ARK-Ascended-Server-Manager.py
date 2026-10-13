@@ -2174,26 +2174,34 @@ def steamcmd_app_update(
 
 class _StackTableData:
     """ConfigOverrideItemMaxQuantity as a table: one row per item class. A class listed more
-    than once keeps its last line (the most recent edit); a line the table does not
-    understand is kept exactly as it was."""
+    than once keeps its last line (the most recent edit). Only lines in the standard form
+    become rows; any other line (another spelling, extra fields) is kept exactly as written,
+    in its place, so nothing is rewritten with a different meaning."""
 
-    LINE_RE = re.compile(r'ItemClassString="([^"]+)"', re.IGNORECASE)
-    QTY_RE = re.compile(r"MaxItemQuantity=(\d+)", re.IGNORECASE)
-    IGNORE_RE = re.compile(r"bIgnoreMultiplier=(true|false)", re.IGNORECASE)
+    ROW_RE = re.compile(
+        r'^\(\s*ItemClassString\s*=\s*"([^"]*)"\s*,\s*Quantity\s*=\s*\(\s*MaxItemQuantity\s*=\s*(\d+)\s*'
+        r'(?:,\s*bIgnoreMultiplier\s*=\s*(true|false)\s*)?\)\s*\)$',
+        re.IGNORECASE,
+    )
 
     def __init__(self) -> None:
         self.rows: Dict[str, Tuple[int, bool]] = {}  # class -> (max quantity, ignore multiplier)
-        self.raw_extra: List[str] = []
+        # The file's lines in order: ("row", class) or ("raw", text kept as written).
+        self.order: List[Tuple[str, str]] = []
         self.merged = 0  # duplicate lines folded into one when last loaded
+        self.reloaded = False  # the last change was a load (an open cell editor is stale)
         self.on_change: Callable[[], None] = lambda: None
+
+    @property
+    def raw_extra(self) -> List[str]:
+        return [text for kind, text in self.order if kind == "raw"]
 
     @classmethod
     def parse(cls, raw: str) -> Optional[Tuple[str, int, bool]]:
-        m_cls, m_qty = cls.LINE_RE.search(raw or ""), cls.QTY_RE.search(raw or "")
-        if not m_cls or not m_qty:
+        m = cls.ROW_RE.match((raw or "").strip())
+        if not m or not m.group(1).strip():
             return None
-        m_ign = cls.IGNORE_RE.search(raw)
-        return m_cls.group(1).strip(), int(m_qty.group(1)), bool(m_ign and m_ign.group(1).lower() == "true")
+        return m.group(1).strip(), int(m.group(2)), (m.group(3) or "false").lower() == "true"
 
     @staticmethod
     def line(item_class: str, qty: int, ignore: bool) -> str:
@@ -2201,19 +2209,22 @@ class _StackTableData:
                 f'Quantity=(MaxItemQuantity={int(qty)},bIgnoreMultiplier={"true" if ignore else "false"}))')
 
     def load(self, values: List[str]) -> None:
-        self.rows, self.raw_extra, self.merged = {}, [], 0
+        self.rows, self.order, self.merged = {}, [], 0
         for raw in values:
             parsed = self.parse(raw)
             if parsed is None:
                 if raw.strip():
-                    self.raw_extra.append(raw)
+                    self.order.append(("raw", raw))
                 continue
             item_class, qty, ignore = parsed
             key = self.key_of(item_class)
             if key is not None:
                 self.merged += 1
-                del self.rows[key]  # the later line wins; it takes the latest place too
+                del self.rows[key]  # the later line wins, in the later line's place
+                self.order.remove(("row", key))
             self.rows[item_class] = (qty, ignore)
+            self.order.append(("row", item_class))
+        self.reloaded = True
         self.on_change()
 
     def key_of(self, item_class: str) -> Optional[str]:
@@ -2222,24 +2233,37 @@ class _StackTableData:
         return next((k for k in self.rows if k.lower() == low), None)
 
     def put(self, item_class: str, qty: int, ignore: bool, replacing: Optional[str] = None) -> bool:
-        """Set an item's row; True when that item already had one (updated, not added).
-        replacing: the row being edited, when its item changes."""
+        """Set an item's row; True when another row of that item was already there (updated
+        or replaced, not added). replacing: the row being edited, when its item changes."""
         existed = self.key_of(item_class)
-        if replacing is not None and replacing in self.rows and (existed is None or existed != replacing):
+        place = None
+        if replacing is not None and replacing in self.rows and existed != replacing:
+            place = self.order.index(("row", replacing))
             del self.rows[replacing]
-        if existed is not None and existed in self.rows and existed != item_class:
-            del self.rows[existed]
+            self.order.remove(("row", replacing))
+        if existed is not None and existed in self.rows:
+            idx = self.order.index(("row", existed))
+            self.order[idx] = ("row", item_class)  # in place (also for a change of case)
+            if existed != item_class:
+                del self.rows[existed]
+        elif place is not None:
+            self.order.insert(place, ("row", item_class))
+        else:
+            self.order.append(("row", item_class))
         self.rows[item_class] = (qty, ignore)
+        self.reloaded = False
         self.on_change()
         return existed is not None and existed != replacing
 
     def remove(self, item_classes: List[str]) -> None:
         for c in item_classes:
-            self.rows.pop(c, None)
+            if self.rows.pop(c, None) is not None:
+                self.order.remove(("row", c))
+        self.reloaded = False
         self.on_change()
 
     def lines(self) -> List[str]:
-        return [self.line(c, q, i) for c, (q, i) in self.rows.items()] + list(self.raw_extra)
+        return [self.line(text, *self.rows[text]) if kind == "row" else text for kind, text in self.order]
 
 
 class _SpawnListData:
@@ -14611,6 +14635,11 @@ class ServerManagerApp:
             return _ITEM_DATA[match][0] if match else name_or_class  # a class name typed as is
 
         def refresh() -> None:
+            if data.reloaded:
+                close_editor()  # another file or profile: what was being typed belongs to neither
+            elif editor.get("commit") is not None:
+                pending = editor["commit"]
+                pending()  # the rows are about to move: the open edit goes in first
             wanted = find_var.get().strip().lower()
             keep = tree.selection()
             tree.delete(*tree.get_children())
@@ -14641,10 +14670,21 @@ class ServerManagerApp:
 
         def parse_qty(text: str) -> Optional[int]:
             text = (text or "").strip()
-            if not text.isdigit() or int(text) < 1:
-                messagebox.showwarning("Stack Size", "Max quantity must be a whole number of 1 or more.")
+            if not re.fullmatch(r"[0-9]+", text) or not 1 <= int(text) <= 2147483647:
+                messagebox.showwarning("Stack Size", "Max quantity must be a whole number from 1 to 2147483647.")
                 return None
             return int(text)
+
+        def resolve_class(text: str) -> Optional[str]:
+            """An item name from the list, or a class name (modded items: Something_C)."""
+            item_class = class_of(text)
+            if item_class != text or re.fullmatch(r"[A-Za-z0-9_./]+_c", item_class, re.IGNORECASE):
+                return item_class
+            messagebox.showwarning(
+                "Stack Size",
+                f"'{text}' is not an item from the list or an item class name (such as PrimalItemResource_Stone_C).",
+            )
+            return None
 
         def add_entry() -> None:
             name = item_cb.get().strip()
@@ -14653,7 +14693,9 @@ class ServerManagerApp:
             qty = parse_qty(qty_var.get())
             if qty is None:
                 return
-            item_class = class_of(name)
+            item_class = resolve_class(name)
+            if item_class is None:
+                return
             updated = data.put(item_class, qty, bool(ignore_var.get()))
             if tree.exists(item_class):
                 tree.selection_set(item_class)
@@ -14667,19 +14709,28 @@ class ServerManagerApp:
                 changed(f"Stack size removed for {len(sel)} item(s).")
 
         # In-place editing: double-click a cell (Ignore toggles on double-click)
-        editor: Dict[str, Any] = {"w": None}
+        editor: Dict[str, Any] = {"w": None, "commit": None}
 
         def close_editor() -> None:
             w = editor.get("w")
             editor["w"] = None
+            editor["commit"] = None
             if w is not None:
                 with contextlib.suppress(Exception):
                     w.destroy()
 
         def begin_edit(event: Any) -> None:
-            close_editor()
+            # Which cell was clicked, before anything moves: committing an open editor can
+            # re-sort the rows, and the click must not land on a neighbouring row.
             row = tree.identify_row(event.y)
             col = tree.identify_column(event.x)
+            pending = editor.get("commit")
+            if pending is not None:
+                before = list(tree.get_children())
+                pending()  # what was typed in the open editor is kept, not dropped
+                if list(tree.get_children()) != before:
+                    return  # the rows moved: this double-click no longer points where it did
+            close_editor()
             if not row or not col:
                 return
             col_name = cols[int(col[1:]) - 1]
@@ -14710,19 +14761,23 @@ class ServerManagerApp:
                     return
                 text = widget.get().strip()
                 close_editor()
+                if row not in data.rows:
+                    return  # removed while the editor was open: not brought back
+                cur_qty, cur_ignore = data.rows[row]  # as it is now, not as when the editor opened
                 if col_name == "qty":
                     new_qty = parse_qty(text)
-                    if new_qty is not None and new_qty != qty:
-                        data.put(row, new_qty, ignore)
+                    if new_qty is not None and new_qty != cur_qty:
+                        data.put(row, new_qty, cur_ignore)
                         changed(f"Stack size updated: {item_name(row)} = {new_qty}.")
                     return
-                if not text:
+                if not text or text.lower() in (row.lower(), item_name(row).lower()):
+                    return  # left as it was
+                new_class = resolve_class(text)
+                if new_class is None or new_class == row:
                     return
-                new_class = class_of(text) if col_name == "item" else text
-                if new_class == row:
-                    return
-                merged = data.key_of(new_class) is not None
-                data.put(new_class, qty, ignore, replacing=row)
+                other = data.key_of(new_class)
+                merged = other is not None and other != row
+                data.put(new_class, cur_qty, cur_ignore, replacing=row)
                 if tree.exists(new_class):
                     tree.selection_set(new_class)
                     tree.see(new_class)
@@ -14731,14 +14786,32 @@ class ServerManagerApp:
                     if merged else f"Item changed to {item_name(new_class)}."
                 )
 
+            def commit_unless_still_editing() -> None:
+                # Opening the item dropdown moves the focus to its list: still editing.
+                try:
+                    focus = str(widget.tk.call("focus"))
+                except Exception:
+                    focus = ""
+                if focus and focus.startswith(str(widget)):
+                    return  # its own dropdown list (any other widget: the edit is over)
+                commit()
+
+            editor["commit"] = commit
             widget.bind("<Return>", commit)
             widget.bind("<KP_Enter>", commit)
             widget.bind("<Escape>", lambda _e: close_editor())
-            widget.bind("<FocusOut>", lambda _e: widget.after(150, commit))  # after a dropdown pick
+            widget.bind("<FocusOut>", lambda _e: widget.after(150, commit_unless_still_editing))
             if col_name == "item":
                 widget.bind("<<ComboboxSelected>>", commit)
 
         tree.bind("<Double-1>", begin_edit)
+
+        def commit_open_editor(_e: Any = None) -> None:
+            pending = editor.get("commit")
+            if pending is not None:
+                pending()  # scrolling would leave it floating over another row
+
+        tree.bind("<MouseWheel>", commit_open_editor, add="+")
         tree.bind("<Delete>", lambda _e: remove_entry())
 
         ttk.Button(input_frame, text="Add / Update", command=add_entry).grid(row=0, column=5)
@@ -14915,29 +14988,9 @@ class ServerManagerApp:
         return start_row
 
     @staticmethod
-    def _stack_raw_to_display(raw: str) -> str:
-        """Convert a raw ConfigOverrideItemMaxQuantity value to display text."""
-        m_item = re.search(r'ItemClassString="([^"]*)"', raw)
-        m_qty = re.search(r'MaxItemQuantity=(\d+)', raw)
-        m_ignore = re.search(r'bIgnoreMultiplier=(true|false)', raw, re.IGNORECASE)
-        cls = m_item.group(1) if m_item else "?"
-        item = _CLASS_TO_ITEM_NAME.get(cls, cls)
-        qty = m_qty.group(1) if m_qty else "?"
-        ignore = m_ignore.group(1).lower() if m_ignore else "false"
-        return f"{item}  qty={qty}  ignore={ignore}"
-
-    @staticmethod
     def _spawn_raw_to_display(key: str, raw: str) -> str:
         """Convert a raw INI spawn value to a human-readable display string."""
-        if key == "ConfigOverrideItemMaxQuantity":
-            m_item = re.search(r'ItemClassString="([^"]*)"', raw)
-            m_qty = re.search(r'MaxItemQuantity=(\d+)', raw)
-            m_ignore = re.search(r'bIgnoreMultiplier=(true|false)', raw, re.IGNORECASE)
-            item = m_item.group(1) if m_item else "?"
-            qty = m_qty.group(1) if m_qty else "?"
-            ignore = m_ignore.group(1).lower() if m_ignore else "false"
-            return f"{item}  qty={qty}  ignore={ignore}"
-        elif key == "NPCReplacements":
+        if key == "NPCReplacements":
             m = re.search(r'FromClassName="([^"]*)".*?ToClassName="([^"]*)"', raw)
             if m:
                 from_id, to_id = m.group(1), m.group(2)
@@ -15243,6 +15296,12 @@ class ServerManagerApp:
 
     def _ini_visual_refresh_all(self) -> None:
         """Read current INI values and populate all visual controls."""
+        if self._ini_visual_debounce_id:
+            # An edit still waiting for its debounced write would be lost to the reload.
+            with contextlib.suppress(Exception):
+                self.root.after_cancel(self._ini_visual_debounce_id)
+            with contextlib.suppress(Exception):
+                self._ini_visual_write_all()
         self._ini_visual_loading = True
         try:
             gus_doc = self._ini_visual_get_doc("gus")
@@ -15272,13 +15331,16 @@ class ServerManagerApp:
                 if isinstance(var, _StackTableData):
                     doc = gus_doc if ini_file == "gus" else game_doc
                     if doc is None:
+                        var.load([])  # never another profile's rows, written into this one later
                         continue
                     var.load(doc.get_all_values(section, key))
                     if var.merged:
                         # Lines for the same item, from adds that appended instead of updating:
-                        # written back once, one line per item, the last of each kept.
-                        self._ini_visual_schedule_write(vk)
-                        self._set_status(f"Stack sizes: {var.merged} duplicate line(s) merged; the last of each item was kept.")
+                        # written back once, one line per item, the last of each kept. Only these
+                        # lines: nothing else in the file changes without the user.
+                        self._ini_visual_write_keys(
+                            {vk}, f"Stack sizes: {var.merged} duplicate line(s) merged; the last of each item was kept."
+                        )
                     continue
 
                 if isinstance(var, _SpawnListData):
@@ -15375,9 +15437,27 @@ class ServerManagerApp:
         finally:
             self._ini_visual_loading = False
 
-    def _ini_visual_write_all(self) -> None:
-        """Write all visual control values to staged INI files."""
-        self._ini_visual_debounce_id = None
+    def _ini_visual_write_keys(self, keys: Set[str], message: str = "") -> None:
+        """Write just these visual settings to the staged INI (not every control: those the
+        user did not touch must not be pinned to the editor's values)."""
+        self._ini_visual_write_for = self.active_server_id
+
+        def run() -> None:
+            if self._ini_apply_after_id:
+                # A Raw Editor change still waiting: in first, before the lines shift.
+                with contextlib.suppress(Exception):
+                    self.root.after_cancel(self._ini_apply_after_id)
+                self._ini_apply_now()
+            self._ini_visual_write_all(only=keys)
+            if message:
+                self._set_status(message)
+
+        self.root.after(0, run)
+
+    def _ini_visual_write_all(self, only: Optional[Set[str]] = None) -> None:
+        """Write all visual control values (or only these keys) to staged INI files."""
+        if only is None:
+            self._ini_visual_debounce_id = None
         if getattr(self, "_ini_visual_write_for", self.active_server_id) != self.active_server_id:
             return  # the edits were for a profile no longer on screen; never write them into this one
 
@@ -15400,7 +15480,7 @@ class ServerManagerApp:
         game_dirty = False
 
         for vk, var in self._ini_visual_vars.items():
-            if "|scale" in vk:
+            if "|scale" in vk or (only is not None and vk not in only):
                 continue
             parts = vk.split("|", 2)
             if len(parts) != 3:
