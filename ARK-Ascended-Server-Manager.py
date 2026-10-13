@@ -7932,6 +7932,7 @@ class ServerManagerApp:
         self._was_zoomed = False  # maximized when it went to the background
         self._close_asking = False
         self._closing_stop = False  # "stop the servers and quit" is under way
+        self._quit_when_idle = False  # in the background only until the running tasks finish
         self._status_key: Optional[Tuple[Any, ...]] = None
         # Ports of servers between their port check and their launch (see _reserve_ports).
         self._starting_ports: Dict[str, Set[int]] = {}
@@ -11623,6 +11624,7 @@ class ServerManagerApp:
             return
         running = self._running_runtimes()
         choice: Optional[str] = None
+        tasks_cut_ok = False  # the user already chose to cut running tasks off
         if running:
             self._close_asking = True
             try:
@@ -11634,9 +11636,25 @@ class ServerManagerApp:
             if choice == "background":
                 self._go_to_background()  # everything keeps going; no question needed
                 return
+        elif self._can_background():
+            tasks = self._busy_task_names()
+            if tasks:
+                self._close_asking = True
+                try:
+                    busy_choice = self._ask_close_busy_choice(tasks)
+                finally:
+                    self._close_asking = False
+                if busy_choice is None:
+                    return
+                if busy_choice == "finish":
+                    self._quit_when_idle = True
+                    self._go_to_background()
+                    self.root.after(2000, self._check_quit_when_idle)
+                    return
+                tasks_cut_ok = True
         with self._runtimes_lock:
             ops = sorted(set(self._group_ops.values()))
-        if ops and not messagebox.askyesno(
+        if ops and not tasks_cut_ok and not messagebox.askyesno(
             "Cluster action running",
             f"A cluster-wide action is still running ({', '.join(ops)}). Closing cancels it; maps it has not "
             "reached yet are left as they are.\n\nContinue closing?",
@@ -11675,7 +11693,7 @@ class ServerManagerApp:
             return
         # Workers are daemon threads: closing kills them mid-write (INIs, zips, SteamCMD, a
         # restart), whether or not servers are left running.
-        if self._any_busy() and not messagebox.askyesno(
+        if self._any_busy() and not tasks_cut_ok and not messagebox.askyesno(
             "Task running",
             "A task is still running (see the console). Closing now can leave it half done, for example "
             "a partly written backup or settings file, or a server started but no longer tracked.\n\n"
@@ -11715,6 +11733,7 @@ class ServerManagerApp:
             self.root.focus_force()
         if self._in_background:
             self._in_background = False
+            self._quit_when_idle = False
             self.logger.info("Back from the background.")
 
     def _show_if_hidden(self) -> None:
@@ -11773,6 +11792,46 @@ class ServerManagerApp:
                 if prev_grab.winfo_exists():
                     prev_grab.grab_set()
         return result["choice"]
+
+    def _busy_task_names(self) -> List[str]:
+        with self._runtimes_lock:
+            items = list(self._runtimes.values())
+            ops = sorted(set(self._group_ops.values()))
+        out = [f"{rt.task} ({self._display_name(rt.server_id)})" for rt in items if rt.task]
+        return out + [f"{op} (cluster)" for op in ops]
+
+    def _ask_close_busy_choice(self, tasks: List[str]) -> Optional[str]:
+        """'finish' (in the background, then quit), 'quit' or None, for closing while tasks run."""
+        finish = messagebox.askyesnocancel(
+            "Task running",
+            "Still working: " + ", ".join(tasks) + ".\n\n"
+            "Yes: finish in the background, then quit. The window hides now; opening the manager again shows it.\n\n"
+            "No: quit now. This cuts the task off and can leave it half done, for example a partly written "
+            "backup, a half-installed server or a map started but no longer tracked.\n\n"
+            "Cancel: keep the window open.",
+            icon="warning",
+            default="yes",
+        )
+        if finish is None:
+            return None
+        return "finish" if finish else "quit"
+
+    def _check_quit_when_idle(self) -> None:
+        """In the background only to let tasks finish: quit once nothing runs any more."""
+        if not self._quit_when_idle:
+            return
+        if self._busy_task_names():
+            self.root.after(2000, self._check_quit_when_idle)
+            return
+        self._quit_when_idle = False
+        if self._running_runtimes():
+            # A task started a server (an install that starts it, a Start All): it now needs
+            # managing, so stay in the background instead of leaving it unwatched.
+            self.logger.info("Tasks finished; a server is running now, so the manager stays in the background.")
+            return
+        self.logger.info("Tasks finished; quitting.")
+        close_show_event()
+        self.root.destroy()
 
     def _can_background(self) -> bool:
         """Only where opening the manager again can bring the hidden window back."""

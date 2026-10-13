@@ -107,6 +107,7 @@ This manager separates *edit time* and *runtime*:
 - The console tags every line with its server and can show only the selected one; each server also logs to `servers/<id>/logs/server.log` (logs rotate at 20 MB, 3 kept)
 - Backups made in the same second by different servers get their own zip file
 - Closing the window while servers run offers three choices: **keep running in the background** (the window hides, and auto-saves, nightly updates, crash restarts and countdowns go on; opening the manager again shows the window), stop every server safely and quit, or quit and leave them running (the manager reconnects to them when it is opened again)
+- Closing while only a task runs (an install, a backup, a cluster action) offers to **finish it in the background, then quit**: the window hides and the manager closes by itself once the task is done (or stays in the background if the task started a server). Opening the manager again, or a task needing an answer, brings the window back and keeps it open
 
 ### Clusters
 - **Set Up / Join Cluster...** (Advanced Start Args tab) turns an existing standalone server into the first map of a new cluster, or joins it to a cluster another profile already runs
