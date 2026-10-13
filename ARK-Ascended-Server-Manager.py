@@ -785,12 +785,13 @@ class HoverTooltip:
             self._tip_window = None
 
 
-def apply_min_window_size(root: tk.Tk, width: int, height: int) -> None:
+def apply_min_window_size(root: tk.Misc, width: int, height: int) -> None:
     scaled_w = _scaled_dimension(root, width)
     scaled_h = _scaled_dimension(root, height)
-    screen_w = root.winfo_screenwidth()
-    screen_h = root.winfo_screenheight()
-    root.minsize(min(scaled_w, screen_w), min(scaled_h, screen_h))
+    screen = (root.winfo_screenwidth(), root.winfo_screenheight())
+    # The usable area where the window is (not under a taskbar), less its title bar.
+    _left, _top, work_w, work_h = screen_work_area(root.winfo_x(), root.winfo_y(), screen)
+    root.minsize(min(scaled_w, work_w), min(scaled_h, max(200, work_h - _scaled_dimension(root, 40))))
 
 
 class _MonitorInfo(ctypes.Structure):
@@ -841,7 +842,7 @@ def apply_initial_window_geometry(root: tk.Misc, width: int, height: int) -> Non
     if parent is None:
         cx, cy = left + work_w // 2, top + work_h // 2
     # The frame's top-left is placed; leave room for the title bar and borders below it.
-    frame_h = 40
+    frame_h = _scaled_dimension(root, 40)
     x = max(left, min(cx - target_w // 2, left + work_w - target_w))
     y = max(top, min(cy - (target_h + frame_h) // 2, top + work_h - target_h - frame_h))
     root.geometry(f"{target_w}x{target_h}+{int(x)}+{int(y)}")
@@ -3839,8 +3840,10 @@ def cluster_health(
                 issues.append(HealthIssue("warning", f"{name}: {problem}", fix="same_folder", servers=[sid]))
 
     mods = {}
+    map_only = set(MAP_REQUIRED_MODS.values())  # a map's own mod (Club ARK) is not shared
     for sid, _name, cfg in members:
-        mods.setdefault(_mod_set(cfg.normalized_mods()), []).append(sid)
+        shared = ",".join(x for x in cfg.normalized_mods().split(",") if x and x not in map_only)
+        mods.setdefault(_mod_set(shared), []).append(sid)
     if len(mods) > 1:
         issues.append(HealthIssue(
             "warning",
@@ -5804,6 +5807,8 @@ class ServerRuntime:
         self.wild_wipe_sec: Optional[float] = None
         self.wild_wipe_tick: Optional[float] = None
         self.wild_wipe_saved: float = 0.0
+        self.wild_wipe_lock = threading.Lock()  # the scheduler adds, a wipe or a cancel resets
+        self.wild_wipe_no_rcon_logged = False
 
     def is_running(self) -> bool:
         with self.proc_lock:
@@ -7168,7 +7173,8 @@ class ClusterSetupDialog(tk.Toplevel):
         info = self._picked_cluster() if joining else None
         if info is not None:
             def mod_set(csv: str) -> Set[str]:
-                return {m for m in csv.split(",") if m}
+                # A map's own mod (Club ARK's) is not part of the list the maps must share.
+                return {m for m in csv.split(",") if m and m not in MAP_REQUIRED_MODS.values()}
             # Transfers only care which mods are present, not their order.
             mine = mod_set(self.cfg.normalized_mods())
             odd = [name for name, mods in zip(info.member_names, info.mods) if mod_set(mods) != mine]
@@ -8111,7 +8117,13 @@ class ServerManagerApp:
         self._autosave_guard = False
         self._in_background = False  # window hidden, servers still managed
         self._scroll_canvases: List[tk.Canvas] = []
+        self._wheel_rest: Dict[str, int] = {}  # wheel movement not scrolled yet, per page
+        self._scroll_pages: Dict[str, tk.Canvas] = {}
         self.root.bind_all("<MouseWheel>", self._on_wheel, add="+")
+        # The wheel over a dropdown or spinbox would pick another value (another profile, map
+        # or setting) while the user only meant to scroll the page: it scrolls the page instead.
+        for cls in ("TCombobox", "TSpinbox", "Spinbox"):
+            self.root.bind_class(cls, "<MouseWheel>", lambda _e: None)
         self._was_zoomed = False  # maximized when it went to the background
         self._close_asking = False
         self._closing_stop = False  # "stop the servers and quit" is under way
@@ -9175,7 +9187,7 @@ class ServerManagerApp:
             values=[*MAP_PRESETS, MAP_CUSTOM_SENTINEL],
         )
         self.cmb_map.grid(row=0, column=1, sticky="ew", padx=6)
-        self.cmb_map.bind("<<ComboboxSelected>>", lambda e: self._sync_map_mode())
+        self.cmb_map.bind("<<ComboboxSelected>>", lambda e: self._sync_map_mode(picked=True))
 
         ttk.Label(lf_server, text="Custom Map Name").grid(row=1, column=0, sticky="w")
         self.ent_map_custom = ttk.Entry(lf_server, textvariable=self.var_map_custom)
@@ -10111,7 +10123,9 @@ class ServerManagerApp:
         cfg.wild_wipe_interval_hours = clamp_wild_wipe_hours(self.var_wild_wipe_hours.get())
         raw_wipe_warn = self.var_wild_wipe_warning_minutes.get().strip()
         if raw_wipe_warn and not parse_warning_minutes(raw_wipe_warn):
-            raise ValueError("Wild dino wipe warnings must be whole minutes from 1 to 120, for example 10,5,1 (or empty for none).")
+            if cfg.wild_wipe_enabled:
+                raise ValueError("Wild dino wipe warnings must be whole minutes from 1 to 120, for example 10,5,1 (or empty for none).")
+            raw_wipe_warn = "10,5,1"  # off: not worth refusing the save over; the default comes back
         cfg.wild_wipe_warning_minutes = ",".join(map(str, parse_warning_minutes(raw_wipe_warn)))
 
         cfg.hide_gameanalytics_console_logs = bool(self.var_hide_gameanalytics_console_logs.get())
@@ -10477,7 +10491,7 @@ class ServerManagerApp:
         self.logger.info("Auto-start on launch enabled -> starting active server profile.")
         self.start_server()
 
-    def _sync_map_mode(self) -> None:
+    def _sync_map_mode(self, picked: bool = False) -> None:
         choice = self.var_map_preset.get()
         if choice == MAP_CUSTOM_SENTINEL:
             self.ent_map_custom.configure(state="normal")
@@ -10485,7 +10499,7 @@ class ServerManagerApp:
             self.var_map_custom.set(choice)
             self.ent_map_custom.configure(state="disabled")
         mod = MAP_REQUIRED_MODS.get(choice)
-        if mod:
+        if mod and picked:
             self._set_status(f"{pretty_map_name(choice)} needs mod {mod}; it is added to the start command automatically.")
 
     # ---------------------------------------------------------------------
@@ -11107,6 +11121,7 @@ class ServerManagerApp:
                 raise TaskCancelled("The server is no longer running; the planned update is skipped.")
             if not from_countdown and self._cancel_countdown(rt, kinds=("restart", "update")):
                 rt.logger.info("Update & Restart: the planned restart was cancelled; this replaces it.")
+            self._drop_wipe_countdown(rt)
             # Maps updating at the same time take turns here, while still running: stopping
             # first and then queueing for SteamCMD would keep every waiting map down.
             self._take_update_slot(rt)
@@ -11158,6 +11173,7 @@ class ServerManagerApp:
             # still has to update.
             if not from_countdown and self._cancel_countdown(rt, kinds=("restart",)):
                 rt.logger.info("Restart: the planned restart was cancelled; this restart replaces it.")
+            self._drop_wipe_countdown(rt)  # players are not left waiting through the restart
             # A running server restarts on the install it already shares (accepted when it
             # first started); only a stopped one is asked about siblings, before it starts.
             if not rt.is_running():
@@ -11963,8 +11979,9 @@ class ServerManagerApp:
         counting = [rt for rt in self._running_runtimes() if rt.countdown is not None]
         if counting and not messagebox.askyesno(
             "Countdown running",
-            "A restart countdown is running for " + ", ".join(self._display_name(rt.server_id) for rt in counting)
-            + ". Closing cancels it and tells the players the restart is off.\n\nClose anyway?",
+            "A countdown (a restart or a wild dino wipe) is running for "
+            + ", ".join(self._display_name(rt.server_id) for rt in counting)
+            + ". Closing cancels it and tells the players it is off.\n\nClose anyway?",
             icon="warning",
             default="no",
         ):
@@ -12303,13 +12320,14 @@ class ServerManagerApp:
         return next((c for c in self._cluster_views()[0] if c.cluster_id == cluster_id), None)
 
     # Widgets that scroll themselves with the wheel; a page under them is left alone.
-    _SELF_SCROLLING = {"Text", "Listbox", "Treeview", "TCombobox", "TSpinbox", "Spinbox"}
+    _SELF_SCROLLING = {"Text", "Listbox", "Treeview"}
 
     def _make_scroll_page(self, page: ttk.Frame, padding: int = 10) -> ttk.Frame:
         """A page that scrolls when it is taller than the window. Returns the frame to fill."""
         page.rowconfigure(0, weight=1)
         page.columnconfigure(0, weight=1)
         canvas = tk.Canvas(page, highlightthickness=0, borderwidth=0, background=THEME_COLORS["bg"])
+        self._scroll_pages[str(page)] = canvas  # the page's scrollbar sits beside the canvas
         vbar = ttk.Scrollbar(page, orient="vertical", command=canvas.yview)
         inner = ttk.Frame(canvas, padding=padding)
         win = canvas.create_window((0, 0), window=inner, anchor="nw")
@@ -12340,17 +12358,33 @@ class ServerManagerApp:
             w = self.root.winfo_containing(event.x_root, event.y_root)
         except Exception:
             return
+        try:
+            grab = self.root.grab_current()
+            if grab is not None and w is not None and w.winfo_toplevel() is not grab.winfo_toplevel():
+                return  # a modal dialog is open: the window behind it stays put
+        except Exception:
+            pass
         while w is not None:
             try:
                 if w.winfo_class() in self._SELF_SCROLLING:
-                    return  # a list or text box under the pointer scrolls itself
+                    first, last = w.yview()
+                    if first > 0.0 or last < 1.0:
+                        return  # a list or text box with more to show scrolls itself
             except Exception:
                 return
+            page_canvas = self._scroll_pages.get(str(w))
+            if page_canvas is not None:
+                w = page_canvas
             if w in self._scroll_canvases:
                 first, last = w.yview()
                 if first > 0.0 or last < 1.0:
-                    steps = max(1, abs(int(event.delta)) // 120)
-                    w.yview_scroll(-steps if event.delta > 0 else steps, "units")
+                    # A notch is 120; touchpads send many small steps, which add up to one.
+                    key = str(w)
+                    total = self._wheel_rest.get(key, 0) + int(event.delta)
+                    steps = int(total / 120)
+                    self._wheel_rest[key] = total - steps * 120
+                    if steps:
+                        w.yview_scroll(-steps, "units")
                 return
             w = getattr(w, "master", None)
 
@@ -13008,7 +13042,10 @@ class ServerManagerApp:
                     rt.logger.info("Restart All: skipped, a planned update restarts this map soon anyway.")
                 todo = [rt for rt in members if rt.is_running() and rt not in pending_update]
                 # Restart All replaces each map's own planned restart (it would restart the map a
-                # second time); a planned update stays, since it still has to update.
+                # second time); a planned update stays, since it still has to update. A wild dino
+                # wipe counting down gives way too, so the map gets the shared warnings.
+                for rt in todo:
+                    self._drop_wipe_countdown(rt)
                 for rt in todo:
                     if self._cancel_countdown(rt, kinds=("restart",)):
                         rt.logger.info("Restart All takes over the planned restart of this map.")
@@ -13330,9 +13367,10 @@ class ServerManagerApp:
                 # Never removes a mod (that would delete its dinos and structures from that map's
                 # world, or keep a mod map from loading): every map gets the mods any map has.
                 union: List[str] = []
+                map_only = set(MAP_REQUIRED_MODS.values())  # a map's own mod stays on that map
                 for rt in members:
                     for mod in rt.cfg.normalized_mods().split(","):
-                        if mod and mod not in union:
+                        if mod and mod not in union and mod not in map_only:
                             union.append(mod)
                 gains = []
                 for rt in members:
@@ -13550,10 +13588,14 @@ class ServerManagerApp:
             rt.wild_wipe_sec = load_wild_wipe_seconds(self.app_base, rt.server_id)
         return rt.wild_wipe_sec
 
+    def _set_wild_wipe_seconds(self, rt: ServerRuntime, seconds: float) -> None:
+        with rt.wild_wipe_lock:  # the file too: an older count must never land after a reset
+            rt.wild_wipe_sec = max(0.0, seconds)
+            rt.wild_wipe_saved = time.monotonic()
+            save_wild_wipe_seconds(self.app_base, rt.server_id, rt.wild_wipe_sec)
+
     def _reset_wild_wipe(self, rt: ServerRuntime) -> None:
-        rt.wild_wipe_sec = 0.0
-        rt.wild_wipe_saved = time.monotonic()
-        save_wild_wipe_seconds(self.app_base, rt.server_id, 0.0)
+        self._set_wild_wipe_seconds(rt, 0.0)
 
     def _wild_wipe_due_in(self, rt: ServerRuntime) -> Optional[float]:
         """Running seconds left until this server's next wild dino wipe (None when off)."""
@@ -13562,49 +13604,82 @@ class ServerManagerApp:
         interval = clamp_wild_wipe_hours(rt.cfg.wild_wipe_interval_hours) * 3600.0
         return max(0.0, interval - self._wild_wipe_seconds(rt))
 
+    WILD_WIPE_MIN_UPTIME_SEC = 300.0  # a server just started: its map may still be loading
+
+    def _wild_wipe_blocked(self, rt: ServerRuntime) -> bool:
+        """Something else has the server: a task (a stop, restart, update, the wipe itself), a
+        stop under way, a cluster sequence (Restart All), or a start minutes ago."""
+        if rt.is_busy() or rt.stop_requested.is_set():
+            return True
+        cfg = rt.live_cfg()
+        with self._runtimes_lock:
+            if effective_cluster_dir(cfg) is not None and cfg.cluster_id.strip() in self._group_ops:
+                return True
+        started = rt.started_at
+        return started is not None and (datetime.now() - started).total_seconds() < self.WILD_WIPE_MIN_UPTIME_SEC
+
     def _tick_wild_wipe(self, rt: ServerRuntime, now: float) -> None:
         cfg = rt.cfg
+        if not cfg.wild_wipe_enabled and rt.countdown_kind == "wipe":
+            self._drop_wipe_countdown(rt)  # turned off while counting down
         if not cfg.wild_wipe_enabled or not rt.is_running():
             rt.wild_wipe_tick = None  # counting starts afresh at the first tick it runs
             return
         last, rt.wild_wipe_tick = rt.wild_wipe_tick, now
         # Count the time it ran since the last tick; a gap far beyond the tick (the PC slept)
         # is not running time players had.
-        if last is not None:
-            rt.wild_wipe_sec = self._wild_wipe_seconds(rt) + min(max(0.0, now - last), 4 * AUTO_SAVE_TICK_SEC)
-        if now - rt.wild_wipe_saved >= self.WILD_WIPE_SAVE_EVERY_SEC:
-            rt.wild_wipe_saved = now
-            save_wild_wipe_seconds(self.app_base, rt.server_id, self._wild_wipe_seconds(rt))
+        with rt.wild_wipe_lock:  # a reset meanwhile (a wipe, a cancel) must not be undone
+            if last is not None:
+                rt.wild_wipe_sec = self._wild_wipe_seconds(rt) + min(max(0.0, now - last), 4 * AUTO_SAVE_TICK_SEC)
+            if now - rt.wild_wipe_saved >= self.WILD_WIPE_SAVE_EVERY_SEC:
+                rt.wild_wipe_saved = now
+                save_wild_wipe_seconds(self.app_base, rt.server_id, self._wild_wipe_seconds(rt))
         left = self._wild_wipe_due_in(rt)
         minutes = parse_warning_minutes(cfg.wild_wipe_warning_minutes)
         lead = (minutes[0] * self.COUNTDOWN_MINUTE_SEC) if minutes and rt.live_cfg().enable_rcon else 0.0
         if left is None or left > lead:
             return
         if not rt.live_cfg().enable_rcon:
-            if not getattr(rt, "_wild_wipe_no_rcon_logged", False):
-                rt._wild_wipe_no_rcon_logged = True  # type: ignore[attr-defined]
+            if not rt.wild_wipe_no_rcon_logged:
+                rt.wild_wipe_no_rcon_logged = True
                 rt.logger.info("Wild dino wipe is due, but RCON is off for this server; it needs RCON.")
             return
-        rt._wild_wipe_no_rcon_logged = False  # type: ignore[attr-defined]
-        if rt.countdown is not None:
-            return  # a restart or update countdown first; tried again on the next tick
+        rt.wild_wipe_no_rcon_logged = False
+        if rt.countdown is not None or self._wild_wipe_blocked(rt):
+            return  # tried again on the next tick
         if self._start_wild_wipe(rt):
             rt.logger.info("Wild dino wipe due.")
 
-    def _start_wild_wipe(self, rt: ServerRuntime) -> bool:
+    def _start_wild_wipe(self, rt: ServerRuntime, manual: bool = False) -> bool:
         """Warn the players, then clear the wild creatures. False if a countdown already runs."""
         minutes = parse_warning_minutes(rt.cfg.wild_wipe_warning_minutes)
         return self._countdown_then(
-            rt, "wild dino wipe", lambda: self._wild_wipe_now(rt), kind="wipe", minutes=minutes,
+            rt, "wild dino wipe", lambda: self._wild_wipe_now(rt, manual=manual), kind="wipe", minutes=minutes,
             message="Wild creatures will be cleared in {m} minute{s}. Tamed creatures are not affected.",
         )
 
-    def _wild_wipe_now(self, rt: ServerRuntime) -> bool:
+    WILD_WIPE_RETRY_SEC = 3600.0  # running time before a failed wipe is tried (and warned) again
+
+    def _wild_wipe_now(self, rt: ServerRuntime, manual: bool = False) -> bool:
         def job() -> None:
             if not rt.is_running():
                 raise TaskCancelled("The server is no longer running; the wild dino wipe is skipped.")
+            left = self._wild_wipe_due_in(rt)
+            if not manual and (left is None or left > 60.0):
+                raise TaskCancelled("The wild dino wipe is no longer due (it ran meanwhile, or was turned off).")
             rt.logger.info("Wild dino wipe: RCON DestroyWildDinos")
-            self._rcon_try("DestroyWildDinos", timeout=60.0, rt=rt)
+            try:
+                self._rcon_try("DestroyWildDinos", timeout=60.0, rt=rt)
+            except Exception:
+                if not manual:
+                    # Not again on the next tick (players would be warned over and over): an
+                    # hour of running time from now. A wipe started by hand leaves the schedule.
+                    interval = clamp_wild_wipe_hours(rt.cfg.wild_wipe_interval_hours) * 3600.0
+                    self._set_wild_wipe_seconds(rt, interval - min(interval, self.WILD_WIPE_RETRY_SEC))
+                    rt.logger.info("Wild dino wipe failed; it is tried again after another hour of running time.")
+                with contextlib.suppress(Exception):
+                    self._rcon_try("ServerChat The wild creature wipe did not go through; it is postponed.", timeout=5.0, rt=rt)
+                raise
             self._reset_wild_wipe(rt)
             with contextlib.suppress(Exception):
                 self._rcon_try("ServerChat Wild creatures were cleared; new ones are spawning.", timeout=5.0, rt=rt)
@@ -13632,7 +13707,7 @@ class ServerManagerApp:
             f"Clear all wild creatures on {self._display_name(rt.server_id)} {when}?\n\nTamed creatures are not affected.",
         ):
             return
-        if not self._start_wild_wipe(rt):
+        if not self._start_wild_wipe(rt, manual=True):
             messagebox.showwarning("Wild Dino Wipe", "A countdown is already running for this server. Try again when it is over.")
 
     def _warning_minutes(self, rt: ServerRuntime) -> List[int]:
@@ -13661,6 +13736,8 @@ class ServerManagerApp:
                 return False
             if on_step is not None:
                 on_step(m)
+            if cancel.is_set():
+                return False  # called off at this very moment: no warning after the "cancelled"
             plural = "s" if m != 1 else ""
             text = message.format(m=m, s=plural) if message else f"Server {reason} in {m} minute{plural}."
             for rt in runtimes:
@@ -13698,21 +13775,28 @@ class ServerManagerApp:
             rt.countdown_announced = False
 
         def step(m: int) -> None:
-            rt.countdown = f"{reason} in {m} min"
-            rt.countdown_announced = True
+            with rt.task_lock:
+                if rt.countdown_cancel is not cancel:
+                    return  # taken over meanwhile (a restart called the wipe off): not ours to label
+                rt.countdown = f"{reason} in {m} min"
+                rt.countdown_announced = True
             self._ui(self._refresh_buttons)
 
         def worker() -> None:
             try:
                 if minutes:
-                    rt.logger.info(f"Countdown started: the server {reason} in {minutes[0]} minute(s).")
+                    what = reason if kind == "wipe" else f"the server {reason}"
+                    rt.logger.info(f"Countdown started: {what} in {minutes[0]} minute(s).")
                 if not self._run_countdown([rt], reason, minutes, cancel, step, message=message):
                     rt.logger.info("Countdown cancelled.")
                     return
                 if minutes and not rt.is_running():
                     rt.logger.info("Countdown over, but the server was stopped meanwhile; nothing to do.")
                     return
-                rt.countdown = f"{reason} now"
+                with rt.task_lock:
+                    if rt.countdown_cancel is not cancel:
+                        return  # taken over meanwhile
+                    rt.countdown = f"{reason} now"
                 end = time.monotonic() + self.COUNTDOWN_RETRY_SEC
                 while not cancel.is_set():
                     self._wait_idle(rt, timeout=max(1.0, end - time.monotonic()), cancel=cancel)
@@ -13991,8 +14075,9 @@ class ServerManagerApp:
         if not rt.cfg.wild_wipe_enabled:
             return "Off. Tamed creatures are never touched."
         left = self._wild_wipe_due_in(rt)
-        if rt.countdown_kind == "wipe" and rt.countdown:
-            return f"Wipe {rt.countdown}."
+        countdown = rt.countdown
+        if rt.countdown_kind == "wipe" and countdown:
+            return f"{countdown[:1].upper()}{countdown[1:]}."
         if left is None:
             return ""
         when = describe_span(left) if left > 60 else "due now"
