@@ -2913,7 +2913,7 @@ def parse_list_players(raw: str) -> List[Tuple[str, str]]:
     for line in (raw or "").splitlines():
         text = line.strip()
         low = text.lower()
-        if not text or "no players" in low or (low.startswith("player") and "count" in low):
+        if not text or re.fullmatch(r"no players connected\.?", low) or re.fullmatch(r"player ?count\b.*", low):
             continue
         text = re.sub(r"^\d+\.\s*", "", text)
         name, sep, tail = text.rpartition(",")
@@ -2933,20 +2933,46 @@ def whitelist_path(server_dir: Path) -> Path:
     return Path(server_dir) / "ShooterGame" / "Binaries" / "Win64" / WHITELIST_FILE_NAME
 
 
+def _read_text_any(path: Path) -> Tuple[str, str, str]:
+    """(text, encoding, newline) of a small text file Notepad may have saved as UTF-16."""
+    raw = path.read_bytes()
+    if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
+        enc = "utf-16"
+    elif raw.startswith(b"\xef\xbb\xbf"):
+        enc = "utf-8-sig"
+    else:
+        try:
+            raw.decode("utf-8")
+            enc = "utf-8"
+        except UnicodeDecodeError:
+            enc = "mbcs" if os.name == "nt" else "latin-1"
+    text = raw.decode(enc, errors="replace")
+    return text, enc, "\r\n" if "\r\n" in text else "\n"
+
+
 def read_whitelist(server_dir: Path) -> List[str]:
     try:
-        text = whitelist_path(server_dir).read_text(encoding="utf-8-sig", errors="replace")
+        text = _read_text_any(whitelist_path(server_dir))[0]
     except OSError:
         return []
     return [ln.strip() for ln in text.splitlines() if ln.strip() and not ln.strip().startswith(("#", ";"))]
 
 
+def exclusive_join_on(cfg: AppConfig) -> bool:
+    """Whitelist only: the setting, or -exclusivejoin typed into the custom arguments."""
+    return bool(cfg.exclusive_join) or any(
+        t.strip().strip("\"'").lower() == "-exclusivejoin" for t in split_custom_start_args(cfg.custom_start_args)
+    )
+
+
 def write_whitelist(server_dir: Path, add: List[str] = (), remove: List[str] = ()) -> Tuple[int, int]:
-    """Add and remove player IDs (case does not matter), keeping every other line as it is.
-    Returns (added, removed)."""
+    """Add and remove player IDs (case does not matter), keeping every other line, the file's
+    encoding and its line endings as they are. Returns (added, removed)."""
     path = whitelist_path(server_dir)
+    enc, newline = "utf-8", "\r\n"
     try:
-        lines = path.read_text(encoding="utf-8-sig", errors="replace").splitlines()
+        text, enc, newline = _read_text_any(path)
+        lines = text.splitlines()
     except OSError:
         lines = []
     drop = {r.strip().lower() for r in remove if r.strip()}
@@ -2961,10 +2987,8 @@ def write_whitelist(server_dir: Path, add: List[str] = (), remove: List[str] = (
             have.add(pid.lower())
             added += 1
     if added or removed:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".tmp")
-        tmp.write_text("\n".join(kept) + ("\n" if kept else ""), encoding="utf-8")
-        os.replace(tmp, path)
+        out_enc = "utf-8" if enc == "mbcs" else enc
+        atomic_write_text(path, newline.join(kept) + (newline if kept else ""), encoding=out_enc)
     return added, removed
 
 
@@ -2975,44 +2999,75 @@ class KnownPlayersStore:
     """Everyone seen on this PC's servers (name, when, where), the bans made from the manager,
     and ban/unban commands waiting for a map that was not running."""
 
-    def __init__(self, app_base: Path) -> None:
+    SEEN_SAVE_EVERY_SEC = 300.0  # "last seen" alone is written down at most this often
+
+    def __init__(self, app_base: Path, logger: Optional[logging.Logger] = None) -> None:
         self.path = Path(app_base) / KNOWN_PLAYERS_FILE_NAME
+        self.logger = logger or logging.getLogger(__name__)
         self._lock = threading.Lock()
         self._data: Dict[str, Any] = {"players": {}, "pending": {}}
-        try:
-            loaded = json.loads(self.path.read_text(encoding="utf-8"))
-            if isinstance(loaded, dict):
-                self._data["players"] = dict(loaded.get("players") or {})
+        self._saved_at = 0.0
+        self._read_only = False  # the file could not be read nor set aside: never write over it
+        if self.path.exists():
+            try:
+                text = self.path.read_text(encoding="utf-8")
+            except OSError as e:
+                self._read_only = True  # locked or unreadable for now: nothing is lost by waiting
+                self.logger.error(f"Players: {self.path} could not be read ({e}); changes to it are not saved this session.")
+                return
+            try:
+                loaded = json.loads(text)
+                if not isinstance(loaded, dict):
+                    raise ValueError("not a JSON object")
+                self._data["players"] = {k.lower(): v for k, v in dict(loaded.get("players") or {}).items()}
                 self._data["pending"] = dict(loaded.get("pending") or {})
-        except Exception:
-            pass
+            except Exception as e:
+                aside = self.path.with_name(f"{self.path.stem}.unreadable-{datetime.now():%Y%m%d-%H%M%S}.json")
+                try:
+                    os.replace(self.path, aside)
+                    self.logger.error(f"Players: {self.path.name} could not be read ({e}); kept as {aside.name}, starting a new list.")
+                except OSError as move_error:
+                    self._read_only = True
+                    self.logger.error(
+                        f"Players: {self.path.name} could not be read ({e}) nor set aside ({move_error}); "
+                        "it is left as it is and changes are not saved this session."
+                    )
 
     def _save(self) -> None:
-        with contextlib.suppress(Exception):
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = self.path.with_suffix(".tmp")
-            tmp.write_text(json.dumps(self._data, indent=2), encoding="utf-8")
-            os.replace(tmp, self.path)
+        if self._read_only:
+            return
+        try:
+            atomic_write_text(self.path, json.dumps(self._data, indent=2))
+            self._saved_at = time.monotonic()
+        except Exception as e:
+            self.logger.error(f"Players: could not save {self.path}: {e}")
 
     def seen(self, server_id: str, players: List[Tuple[str, str]]) -> None:
         if not players:
             return
         now = datetime.now().isoformat(timespec="seconds")
         with self._lock:
+            changed = False
             for name, pid in players:
                 if not pid:
                     continue
+                pid = pid.lower()
                 entry = self._data["players"].setdefault(pid, {"bans": []})
+                if entry.get("name") != (name or entry.get("name", "")) or entry.get("server_id") != server_id:
+                    changed = True
                 entry["name"] = name or entry.get("name", "")
                 entry["last_seen"] = now
                 entry["server_id"] = server_id
-            self._save()
+            # A new player or a move is saved now; only "last seen" changing, every few minutes.
+            if changed or time.monotonic() - self._saved_at >= self.SEEN_SAVE_EVERY_SEC:
+                self._save()
 
     def players(self) -> Dict[str, Dict[str, Any]]:
         with self._lock:
             return copy.deepcopy(self._data["players"])
 
     def remember(self, pid: str, name: str = "") -> None:
+        pid = pid.lower()
         with self._lock:
             entry = self._data["players"].setdefault(pid, {"bans": []})
             if name and not entry.get("name"):
@@ -3020,6 +3075,7 @@ class KnownPlayersStore:
             self._save()
 
     def set_banned(self, pid: str, server_ids: List[str], banned: bool) -> None:
+        pid = pid.lower()
         with self._lock:
             entry = self._data["players"].setdefault(pid, {"bans": []})
             bans = set(entry.get("bans") or [])
@@ -3028,13 +3084,35 @@ class KnownPlayersStore:
             self._save()
 
     def forget(self, pid: str) -> None:
+        pid = pid.lower()
         with self._lock:
             self._data["players"].pop(pid, None)
             self._save()
 
+    def clear(self, server_id: str, pid: str) -> None:
+        """Nothing waiting for this player on this map: a newer action replaces it."""
+        pid = pid.lower()
+        with self._lock:
+            items = [x for x in self._data["pending"].get(server_id, []) if x[1] != pid]
+            if items:
+                self._data["pending"][server_id] = items
+            else:
+                self._data["pending"].pop(server_id, None)
+            self._save()
+
+    def prune(self, server_ids: Set[str]) -> None:
+        """Forget commands waiting for maps whose profiles are gone."""
+        with self._lock:
+            gone = [sid for sid in self._data["pending"] if sid not in server_ids]
+            for sid in gone:
+                self._data["pending"].pop(sid, None)
+            if gone:
+                self._save()
+
     def queue(self, server_id: str, action: str, pid: str) -> None:
         """A ban or unban for a map that is not running: sent when it next runs. The later
         of a ban and an unban for one player wins."""
+        pid = pid.lower()
         with self._lock:
             items = [x for x in self._data["pending"].get(server_id, []) if x[1] != pid]
             items.append([action, pid])
@@ -3069,45 +3147,11 @@ class PlayerListProvider:
         raw = self.rcon_fn("ListPlayers", 6.0)
         if not raw:
             return {}
-
         players: Dict[str, Dict[str, str]] = {}
-        parsed = parse_list_players(raw)
-        if parsed and all(pid for _n, pid in parsed):
-            # ASA's 32-character IDs (and Steam's digits): the general parser below only knew digits.
-            return {pid: {"name": name, "id": pid, "raw": f"{name}, {pid}"} for name, pid in parsed}
-        lines = [line.strip() for line in raw.splitlines() if line.strip()]
-        for line in lines:
-            if line.lower().startswith("player") and "count" in line.lower():
-                continue
-            if "no players" in line.lower():
-                continue
-
-            cleaned = re.sub(r"^\s*\d+\.\s*", "", line).strip()
-            name = ""
-            player_id = ""
-            for pat in self._patterns:
-                m = pat.match(cleaned)
-                if m:
-                    name = m.group("name").strip()
-                    player_id = m.group("id").strip()
-                    break
-
-            if not player_id:
-                m = re.search(r"\d{6,20}", cleaned)
-                if m:
-                    player_id = m.group(0)
-                    name = cleaned.replace(player_id, "").strip(" ,;-")
-
-            if not name:
-                name = cleaned
-
-            if player_id:
-                key = player_id
-            else:
-                key = hashlib.sha1(name.encode("utf-8", errors="ignore")).hexdigest()
-
-            players[key] = {"name": name, "id": player_id, "raw": line}
-
+        for name, pid in parse_list_players(raw):
+            # A line without an ID still counts as a player, keyed by its name.
+            key = pid or hashlib.sha1(name.encode("utf-8", errors="ignore")).hexdigest()
+            players[key] = {"name": name, "id": pid, "raw": f"{name}, {pid}" if pid else name}
         return players
 
 
@@ -3314,6 +3358,11 @@ class DiscordNotificationCoordinator:
             previous = state.get("last_players", {})
             if not isinstance(previous, dict):
                 previous = {}
+            if state.get("player_keys") != "eos":
+                # Kept by an older version under other keys (digit fragments of the IDs):
+                # comparing would announce everyone online as having left and joined again.
+                state["player_keys"] = "eos"
+                previous = current
 
             current_ids = set(current.keys())
             previous_ids = set(previous.keys())
@@ -4183,6 +4232,15 @@ def cluster_health(
             servers=[sid for sid, _n, _c in members],
         ))
 
+    for sid, name, cfg in members:
+        if exclusive_join_on(cfg) and not read_whitelist(Path(cfg.server_dir)):
+            issues.append(HealthIssue(
+                "warning",
+                f"{name}: Whitelist only is on but its whitelist is empty, so nobody can join "
+                "(add players on the Players tab, or turn it off on Advanced Start Args).",
+                servers=[sid],
+            ))
+
     addresses = {effective_public_ip(cfg) for _s, _n, cfg in members}
     if len(addresses) > 1:
         issues.append(HealthIssue(
@@ -4276,6 +4334,7 @@ EXPORT_LEFT_OUT_FIELDS = {
     "server_dir", "backup_dir", "cluster_dir_override", "admin_password", "join_password",
     "discord_webhook_url", "discord_webhook_url_enc", "schema_version", "rcon_host",
     "public_ip_for_epic",  # an address of this network, not of the next machine
+    "exclusive_join",  # its whitelist file does not travel: on, nobody could join the imported maps
 }
 
 
@@ -6143,6 +6202,7 @@ class ServerRuntime:
         self.launched_by_us = False
         self.players: Optional[int] = None  # last ListPlayers count while running, None if unknown
         self.online_players: List[Tuple[str, str]] = []  # (name, id) from the last ListPlayers
+        self.whitelist_ids: Set[str] = set()  # this install's whitelist, as of the last poll (lower case)
         # CPU (percent of the whole machine) and memory of the running process, sampled.
         self.cpu_percent: Optional[float] = None
         self.memory_bytes: Optional[int] = None
@@ -6164,6 +6224,8 @@ class ServerRuntime:
 
     def end_run(self) -> None:
         """The process is gone: its settings stay readable until its stop is reported."""
+        self.online_players = []  # a later run starts with nobody listed
+        self.players = None
         if self.run_cfg is not None:
             self.ended_run_cfg = self.run_cfg
         self.run_cfg = None
@@ -8463,7 +8525,8 @@ class ServerManagerApp:
         self._autosave_after_id: Optional[str] = None
         self._autosave_guard = False
         self._in_background = False  # window hidden, servers still managed
-        self.known_players = KnownPlayersStore(app_base)
+        self.known_players = KnownPlayersStore(app_base, logging.getLogger("asa_manager"))
+        self._players_poll_lock = threading.Lock()
         self._scroll_canvases: List[tk.Canvas] = []
         self._wheel_rest: Dict[str, int] = {}  # wheel movement not scrolled yet, per page
         self._scroll_pages: Dict[str, tk.Canvas] = {}
@@ -12949,17 +13012,13 @@ class ServerManagerApp:
                 self._poll_players_once()
             finally:
                 self._players_refreshing = False
-                self._ui(lambda: (self._players_render(),
-                                  self.var_players_status.set(f"Updated {datetime.now():%H:%M:%S}")))
+                def done() -> None:
+                    self._players_updated = f", updated {datetime.now():%H:%M:%S}"
+                    self._players_render()
+
+                self._ui(done)
 
         threading.Thread(target=work, daemon=True, name="players-refresh").start()
-
-    def _whitelisted(self, server_id: str, pid: str) -> bool:
-        try:
-            ids = {x.lower() for x in read_whitelist(Path(self._runtime(server_id).cfg.server_dir))}
-        except Exception:
-            return False
-        return pid.lower() in ids
 
     def _players_render(self) -> None:
         wanted = self.var_players_find.get().strip().lower()
@@ -12973,12 +13032,12 @@ class ServerManagerApp:
         count = 0
         for rt in self._running_runtimes():
             server = self._display_name(rt.server_id)
-            wl = {x.lower() for x in read_whitelist(Path(rt.cfg.server_dir))}
-            for name, pid in rt.online_players:
+            wl = rt.whitelist_ids
+            for i, (name, pid) in enumerate(rt.online_players):
                 count += 1
                 if not match(name, pid, server):
                     continue
-                iid = f"{rt.server_id}|{pid or name}"
+                iid = f"{rt.server_id}|{pid or ''}|{i}"
                 tree.insert("", "end", iid=iid, values=(name, pid or "(no ID)", server, "Yes" if pid and pid.lower() in wl else "No"))
         still = [i for i in keep if tree.exists(i)]
         if still:
@@ -12999,7 +13058,8 @@ class ServerManagerApp:
         still = [i for i in keep if tree.exists(i)]
         if still:
             tree.selection_set(still)
-        self.var_players_status.set(f"{count} online, {len(rows)} known")
+        self._players_counts = f"{count} online, {len(rows)} known"
+        self.var_players_status.set(self._players_counts + getattr(self, "_players_updated", ""))
 
     def _players_selected(self, which: str) -> List[Tuple[str, str, Optional[str]]]:
         """[(id, name, server id or None)] for the selected rows."""
@@ -13010,12 +13070,13 @@ class ServerManagerApp:
                 sid, _sep, _rest = iid.partition("|")
                 name, pid = tree.item(iid, "values")[0], tree.item(iid, "values")[1]
                 if PLAYER_ID_RE.match(str(pid)):
-                    out.append((str(pid), str(name), sid))
+                    out.append((str(pid).lower(), str(name), sid))
         else:
             tree = self.players_known_tree
             known = self.known_players.players()
             for pid in tree.selection():
-                out.append((pid, known.get(pid, {}).get("name", ""), known.get(pid, {}).get("server_id")))
+                if PLAYER_ID_RE.match(pid):
+                    out.append((pid, known.get(pid, {}).get("name", ""), known.get(pid, {}).get("server_id")))
         return out
 
     def _players_copy_id(self, which: str) -> None:
@@ -13030,8 +13091,6 @@ class ServerManagerApp:
         cluster; without a map (a known player never seen), every server profile."""
         all_ids = [r.id for r in self.global_cfg.servers]
         if server_id is None or server_id not in all_ids:
-            if not messagebox.askyesno(title, f"{what} on every server ({len(all_ids)})?"):
-                return None
             return all_ids
         view = self._cluster_of(server_id)
         if view is None or len(view.members) < 2:
@@ -13052,47 +13111,80 @@ class ServerManagerApp:
             return
         titles = {"kick": "Kick", "ban": "Ban", "unban": "Unban", "wl_add": "Whitelist", "wl_remove": "Whitelist"}
         title = titles[action]
-        names = ", ".join(n or pid for pid, n, _s in picked)
         if action == "kick":
             targets = [(pid, n, s) for pid, n, s in picked if s]
+            names = ", ".join(n or pid for pid, n, _s in targets)
             if not targets or not messagebox.askyesno("Kick", f"Kick {names}? They can join again right away."):
                 return
-            self._players_send([(s, f"KickPlayer {pid}", n or pid) for pid, n, s in targets], "Kick")
+            self._players_send([(s, f"KickPlayer {pid}", n or pid, None) for pid, n, s in targets], "Kick")
             return
-        what = {"ban": f"Ban {names}", "unban": f"Unban {names}",
-                "wl_add": f"Add {names} to the whitelist", "wl_remove": f"Remove {names} from the whitelist"}[action]
-        scopes: Dict[str, List[str]] = {}
-        for pid, _n, sid in picked:
-            key = sid or ""
-            if key not in scopes:
-                scope = self._players_scope(title, sid, what)
-                if scope is None:
-                    return
-                scopes[key] = scope
+        verb = {"ban": "Ban", "unban": "Unban", "wl_add": "Add to the whitelist", "wl_remove": "Remove from the whitelist"}[action]
+        # Where each player's action goes: an unban where the manager banned them; else their
+        # map (and, if asked, its cluster), one question per map naming only its players.
+        known = self.known_players.players()
+        all_ids = {r.id for r in self.global_cfg.servers}
+        targets: Dict[str, List[str]] = {}
+        by_server: Dict[str, List[Tuple[str, str]]] = {}
+        for pid, n, sid in picked:
+            recorded = [x for x in known.get(pid, {}).get("bans") or [] if x in all_ids]
+            if action == "unban" and recorded:
+                targets[pid] = recorded
+            else:
+                by_server.setdefault(sid or "", []).append((pid, n))
+        for sid, players in by_server.items():
+            names = ", ".join(n or pid for pid, n in players)
+            scope = self._players_scope(title, sid or None, f"{verb}: {names},")
+            if scope is None:
+                return
+            for pid, _n in players:
+                targets[pid] = scope
+        summary = "\n".join(
+            f"- {next((n for p, n, _s in picked if p == pid), '') or pid}: "
+            + ", ".join(self._display_name(t) for t in servers)
+            for pid, servers in targets.items()
+        )
+        if not messagebox.askyesno(title, f"{verb}?\n\n{summary}"):
+            return
         if action in ("ban", "unban"):
-            sends: List[Tuple[str, str, str]] = []
+            sends: List[Tuple[str, str, str, Optional[Tuple[str, str]]]] = []
             queued: List[str] = []
-            for pid, n, sid in picked:
-                servers = scopes[sid or ""]
+            unreachable: List[str] = []
+            command = "BanPlayer" if action == "ban" else "UnbanPlayer"
+            for pid, n, _sid in picked:
                 self.known_players.remember(pid, n)
-                self.known_players.set_banned(pid, servers, action == "ban")
-                command = "BanPlayer" if action == "ban" else "UnbanPlayer"
-                for target in servers:
-                    rt = self._runtime(target)
-                    if rt.is_running() and rt.live_cfg().enable_rcon:
-                        sends.append((target, f"{command} {pid}", n or pid))
+                handled: List[str] = []
+                for target in targets.get(pid, []):
+                    try:
+                        rt = self._runtime(target)
+                    except KeyError:
+                        continue  # removed meanwhile
+                    cfg = rt.live_cfg() if rt.is_running() else rt.cfg
+                    if not cfg.enable_rcon or not (cfg.admin_password or "").strip():
+                        unreachable.append(self._display_name(target))  # never reachable: said, not queued
+                        continue
+                    # A newer action for this player here replaces anything still waiting.
+                    self.known_players.clear(target, pid)
+                    if rt.is_running() and not self._players_too_fresh(rt):
+                        sends.append((target, f"{command} {pid}", n or pid, (action, pid)))
                     else:
                         self.known_players.queue(target, action, pid)
                         queued.append(self._display_name(target))
-            self._players_send(sends, title, queued=sorted(set(queued)))
+                    handled.append(target)
+                # Recorded only where it was sent or is waiting to be sent.
+                self.known_players.set_banned(pid, handled, action == "ban")
+            self._players_send(sends, title, queued=sorted(set(queued)), unreachable=sorted(set(unreachable)), verb=verb)
             return
-        # whitelist: the files of the chosen servers' installs (a shared install, one file)
+        # whitelist: the files of the chosen servers' installs (the one a running map uses)
         done: Dict[str, Tuple[int, int]] = {}
         off: List[str] = []
         errors: List[str] = []
-        for pid, _n, sid in picked:
-            for target in scopes[sid or ""]:
-                cfg = self._runtime(target).cfg
+        for pid, _n, _sid in picked:
+            for target in targets.get(pid, []):
+                try:
+                    rt = self._runtime(target)
+                except KeyError:
+                    continue
+                cfg = rt.live_cfg() if rt.is_running() else rt.cfg
                 try:
                     a, r = write_whitelist(Path(cfg.server_dir), add=[pid] if action == "wl_add" else [],
                                            remove=[pid] if action == "wl_remove" else [])
@@ -13101,7 +13193,7 @@ class ServerManagerApp:
                     continue
                 prev = done.get(target, (0, 0))
                 done[target] = (prev[0] + a, prev[1] + r)
-                if not cfg.exclusive_join:
+                if not exclusive_join_on(rt.cfg):
                     off.append(self._display_name(target))
         msg = f"Whitelist updated on {len(done)} server(s). It applies when each server next starts."
         if off:
@@ -13110,36 +13202,63 @@ class ServerManagerApp:
         if errors:
             msg += "\n\nNot changed:\n" + "\n".join(errors)
         (messagebox.showwarning if errors else messagebox.showinfo)("Whitelist", msg)
-        self._players_render()
+        self._players_refresh()
 
-    def _players_send(self, sends: List[Tuple[str, str, str]], title: str, queued: Optional[List[str]] = None) -> None:
-        """Send RCON commands (server id, command, who) off the Tk thread; report once done."""
+    def _players_too_fresh(self, rt: ServerRuntime) -> bool:
+        started = rt.started_at
+        return started is not None and (datetime.now() - started).total_seconds() < self.PLAYER_ACTION_MIN_UPTIME_SEC
+
+    def _players_send(
+        self, sends: List[Tuple[str, str, str, Optional[Tuple[str, str]]]], title: str,
+        queued: Optional[List[str]] = None, unreachable: Optional[List[str]] = None, quiet: bool = False,
+        verb: str = "",
+    ) -> None:
+        """Send RCON commands (server id, command, who, retry) off the Tk thread; report once
+        done. A ban or unban that fails is kept and sent again later (retry: (action, id))."""
         def work() -> None:
             ok: List[str] = []
             failed: List[str] = []
-            for sid, command, who in sends:
-                rt = self._runtime(sid)
+            retried: List[str] = []
+            for sid, command, who, retry in sends:
+                try:
+                    rt = self._runtime(sid)
+                except KeyError:
+                    failed.append(f"- {who}: that server profile was removed")
+                    continue
                 try:
                     reply = self._rcon_try(command, timeout=8.0, rt=rt)
                     rt.logger.info(f"Players: {command} -> {(reply or '').strip()}")
                     ok.append(f"{who} on {self._display_name(sid)}")
                 except Exception as e:
-                    failed.append(f"- {who} on {self._display_name(sid)}: {e}")
+                    rt.logger.info(f"Players: {command} failed: {e}")
+                    if retry is not None:
+                        self.known_players.queue(sid, retry[0], retry[1])
+                        retried.append(f"- {who} on {self._display_name(sid)}: {e}")
+                    else:
+                        failed.append(f"- {who} on {self._display_name(sid)}: {e}")
+            if quiet:
+                return
             parts = []
             if ok:
                 parts.append(f"{title}: done for " + "; ".join(ok) + ".")
             if queued:
-                parts.append("Not running, so sent when they next run: " + ", ".join(queued) + ".")
+                parts.append("Not running (or just started), so sent when ready: " + ", ".join(queued) + ".")
+            if retried:
+                parts.append("Did not go through; tried again on the next player check:\n" + "\n".join(retried))
+            if unreachable:
+                parts.append("RCON is off (or has no admin password), so the manager cannot reach: "
+                             + ", ".join(unreachable) + f". Turn RCON on there (Advanced Start Args), or {verb.lower() or 'do it'} in game.")
             if failed:
                 parts.append("Failed:\n" + "\n".join(failed))
             text = "\n\n".join(parts) or "Nothing to do."
-            self._ui(lambda: ((messagebox.showwarning if failed else messagebox.showinfo)(title, text),
+            warn = bool(failed or retried or unreachable)
+            self._ui(lambda: ((messagebox.showwarning if warn else messagebox.showinfo)(title, text),
                               self._players_refresh()))
 
         threading.Thread(target=work, daemon=True, name="players-action").start()
 
     def _players_add_by_id(self) -> None:
-        pid = (simpledialog.askstring("Add Player", "Player ID (EOS ID, 32 characters):", parent=self.root) or "").strip()
+        pid = (simpledialog.askstring("Add Player", "Player ID (EOS ID, 32 characters):", parent=self.root) or "").strip().lower()
         if not pid:
             return
         if not PLAYER_ID_RE.match(pid):
@@ -13155,7 +13274,8 @@ class ServerManagerApp:
     def _players_forget(self) -> None:
         picked = self._players_selected("known")
         if picked and messagebox.askyesno(
-            "Forget", f"Remove {len(picked)} player(s) from the known list? Bans and whitelists stay as they are."
+            "Forget", f"Remove {len(picked)} player(s) from the known list? Bans already sent stay on the servers, "
+            "and whitelists stay as they are, but the list no longer remembers where the manager banned them."
         ):
             for pid, _n, _s in picked:
                 self.known_players.forget(pid)
@@ -13474,8 +13594,20 @@ class ServerManagerApp:
 
     def _poll_players_once(self) -> None:
         """Ask every running server who is on (ListPlayers), remember them, and send bans or
-        unbans that were waiting for that map to run."""
+        unbans that were waiting for that map to run. One pass at a time."""
+        if not self._players_poll_lock.acquire(blocking=False):
+            return  # another pass is under way (the timer and the Players tab)
+        try:
+            self._poll_players_pass()
+        finally:
+            self._players_poll_lock.release()
+
+    def _poll_players_pass(self) -> None:
+        with contextlib.suppress(Exception):
+            self.known_players.prune({r.id for r in self.global_cfg.servers})
         for rt in self._running_runtimes():
+            with contextlib.suppress(Exception):
+                rt.whitelist_ids = {x.lower() for x in read_whitelist(Path(rt.live_cfg().server_dir))}
             if rt.removed or not rt.live_cfg().enable_rcon:
                 rt.players = None
                 rt.online_players = []
@@ -13493,6 +13625,9 @@ class ServerManagerApp:
             if started is not None and (datetime.now() - started).total_seconds() < self.PLAYER_ACTION_MIN_UPTIME_SEC:
                 continue
             for action, pid in self.known_players.pending(rt.server_id):
+                if not PLAYER_ID_RE.match(pid):
+                    self.known_players.done(rt.server_id, action, pid)  # never a command built from it
+                    continue
                 command = "BanPlayer" if action == "ban" else "UnbanPlayer"
                 try:
                     reply = self._rcon_try(f"{command} {pid}", timeout=8.0, rt=rt)
@@ -13990,6 +14125,13 @@ class ServerManagerApp:
                 cfg.cluster_custom_path_enable = True
                 cfg.cluster_dir_override = cluster["cluster_dir"]
                 cfg.alt_save_directory_name = ""  # each map has its own install, so its own saves
+                if exclusive_join_on(cfg):
+                    # A new install has no whitelist: with whitelist only on, nobody could join.
+                    ids = read_whitelist(Path(template.server_dir)) if template.server_dir else []
+                    if ids:
+                        write_whitelist(Path(cfg.server_dir), add=ids)
+                    else:
+                        cfg.exclusive_join = False
                 if re.search(r"(?i)(-clusterid|clusterdiroverride|[?-]port=|queryport|sessionname|altsavedirectoryname)",
                              cfg.custom_start_args or ""):
                     cfg.custom_start_args = ""  # they would override this map's own ports, name or cluster
