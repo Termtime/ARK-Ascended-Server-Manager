@@ -683,6 +683,9 @@ START_OPTION_HELP: Dict[str, str] = {
                  "Empty: the internet address Epic sees, which only works with the game port forwarded.\n"
                  "Set it to the address your players can reach (for example a VPN or LAN address)\n"
                  "to let them join straight from the server browser. Applies on the next start.",
+    "exclusive_join": "-exclusivejoin\nOnly players on this server's whitelist can join (the Players tab adds and\n"
+                      "removes them; the list is ShooterGame\\Binaries\\Win64\\PlayersExclusiveJoinList.txt).\n"
+                      "The server reads the list when it starts: restart after changing it.",
     "battleye": "BattlEye anti-cheat. Off starts the server with -NoBattlEye\n(players then join without BattlEye running).",
     "dino_default": "Wild creatures spawn as usual.",
     "NoDinos": "-NoDinos\nNo wild creatures spawn.",
@@ -1434,6 +1437,8 @@ class AppConfig:
     # The address the in-game server browser gives players for this server
     # (-PublicIPForEpic). Empty: the internet address Epic sees, as usual.
     public_ip_for_epic: str = ""
+    # Only players on the whitelist (PlayersExclusiveJoinList.txt) can join (-exclusivejoin).
+    exclusive_join: bool = False
 
     discord_enable: bool = False
     discord_webhook_url: str = ""
@@ -2897,6 +2902,159 @@ class DiscordWebhookClient:
             )
 
 
+# An ASA player's ID (EOS): 32 hex characters. Older (ASE) servers used Steam's 17 digits.
+PLAYER_ID_RE = re.compile(r"^(?:[0-9a-fA-F]{32}|\d{6,20})$")
+
+
+def parse_list_players(raw: str) -> List[Tuple[str, str]]:
+    """ListPlayers output -> [(name, id)]. Lines look like "0. Some Name, 0002ab...ef"; a
+    name may hold commas, so the ID is what follows the last one."""
+    out: List[Tuple[str, str]] = []
+    for line in (raw or "").splitlines():
+        text = line.strip()
+        low = text.lower()
+        if not text or "no players" in low or (low.startswith("player") and "count" in low):
+            continue
+        text = re.sub(r"^\d+\.\s*", "", text)
+        name, sep, tail = text.rpartition(",")
+        pid = tail.strip()
+        if sep and PLAYER_ID_RE.match(pid):
+            out.append((name.strip(), pid))
+        else:
+            out.append((text, ""))
+    return out
+
+
+WHITELIST_FILE_NAME = "PlayersExclusiveJoinList.txt"
+
+
+def whitelist_path(server_dir: Path) -> Path:
+    """The list -exclusivejoin lets in: one player ID per line, read when the server starts."""
+    return Path(server_dir) / "ShooterGame" / "Binaries" / "Win64" / WHITELIST_FILE_NAME
+
+
+def read_whitelist(server_dir: Path) -> List[str]:
+    try:
+        text = whitelist_path(server_dir).read_text(encoding="utf-8-sig", errors="replace")
+    except OSError:
+        return []
+    return [ln.strip() for ln in text.splitlines() if ln.strip() and not ln.strip().startswith(("#", ";"))]
+
+
+def write_whitelist(server_dir: Path, add: List[str] = (), remove: List[str] = ()) -> Tuple[int, int]:
+    """Add and remove player IDs (case does not matter), keeping every other line as it is.
+    Returns (added, removed)."""
+    path = whitelist_path(server_dir)
+    try:
+        lines = path.read_text(encoding="utf-8-sig", errors="replace").splitlines()
+    except OSError:
+        lines = []
+    drop = {r.strip().lower() for r in remove if r.strip()}
+    kept = [ln for ln in lines if ln.strip().lower() not in drop]
+    removed = len(lines) - len(kept)
+    have = {ln.strip().lower() for ln in kept}
+    added = 0
+    for pid in add:
+        pid = pid.strip()
+        if pid and pid.lower() not in have:
+            kept.append(pid)
+            have.add(pid.lower())
+            added += 1
+    if added or removed:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text("\n".join(kept) + ("\n" if kept else ""), encoding="utf-8")
+        os.replace(tmp, path)
+    return added, removed
+
+
+KNOWN_PLAYERS_FILE_NAME = "known_players.json"
+
+
+class KnownPlayersStore:
+    """Everyone seen on this PC's servers (name, when, where), the bans made from the manager,
+    and ban/unban commands waiting for a map that was not running."""
+
+    def __init__(self, app_base: Path) -> None:
+        self.path = Path(app_base) / KNOWN_PLAYERS_FILE_NAME
+        self._lock = threading.Lock()
+        self._data: Dict[str, Any] = {"players": {}, "pending": {}}
+        try:
+            loaded = json.loads(self.path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                self._data["players"] = dict(loaded.get("players") or {})
+                self._data["pending"] = dict(loaded.get("pending") or {})
+        except Exception:
+            pass
+
+    def _save(self) -> None:
+        with contextlib.suppress(Exception):
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(self._data, indent=2), encoding="utf-8")
+            os.replace(tmp, self.path)
+
+    def seen(self, server_id: str, players: List[Tuple[str, str]]) -> None:
+        if not players:
+            return
+        now = datetime.now().isoformat(timespec="seconds")
+        with self._lock:
+            for name, pid in players:
+                if not pid:
+                    continue
+                entry = self._data["players"].setdefault(pid, {"bans": []})
+                entry["name"] = name or entry.get("name", "")
+                entry["last_seen"] = now
+                entry["server_id"] = server_id
+            self._save()
+
+    def players(self) -> Dict[str, Dict[str, Any]]:
+        with self._lock:
+            return copy.deepcopy(self._data["players"])
+
+    def remember(self, pid: str, name: str = "") -> None:
+        with self._lock:
+            entry = self._data["players"].setdefault(pid, {"bans": []})
+            if name and not entry.get("name"):
+                entry["name"] = name
+            self._save()
+
+    def set_banned(self, pid: str, server_ids: List[str], banned: bool) -> None:
+        with self._lock:
+            entry = self._data["players"].setdefault(pid, {"bans": []})
+            bans = set(entry.get("bans") or [])
+            bans = bans | set(server_ids) if banned else bans - set(server_ids)
+            entry["bans"] = sorted(bans)
+            self._save()
+
+    def forget(self, pid: str) -> None:
+        with self._lock:
+            self._data["players"].pop(pid, None)
+            self._save()
+
+    def queue(self, server_id: str, action: str, pid: str) -> None:
+        """A ban or unban for a map that is not running: sent when it next runs. The later
+        of a ban and an unban for one player wins."""
+        with self._lock:
+            items = [x for x in self._data["pending"].get(server_id, []) if x[1] != pid]
+            items.append([action, pid])
+            self._data["pending"][server_id] = items
+            self._save()
+
+    def pending(self, server_id: str) -> List[Tuple[str, str]]:
+        with self._lock:
+            return [(a, p) for a, p in self._data["pending"].get(server_id, [])]
+
+    def done(self, server_id: str, action: str, pid: str) -> None:
+        with self._lock:
+            items = [x for x in self._data["pending"].get(server_id, []) if x != [action, pid]]
+            if items:
+                self._data["pending"][server_id] = items
+            else:
+                self._data["pending"].pop(server_id, None)
+            self._save()
+
+
 class PlayerListProvider:
     def __init__(self, rcon_fn: Callable[[str, float], str], logger: logging.Logger):
         self.rcon_fn = rcon_fn
@@ -2913,6 +3071,10 @@ class PlayerListProvider:
             return {}
 
         players: Dict[str, Dict[str, str]] = {}
+        parsed = parse_list_players(raw)
+        if parsed and all(pid for _n, pid in parsed):
+            # ASA's 32-character IDs (and Steam's digits): the general parser below only knew digits.
+            return {pid: {"name": name, "id": pid, "raw": f"{name}, {pid}"} for name, pid in parsed}
         lines = [line.strip() for line in raw.splitlines() if line.strip()]
         for line in lines:
             if line.lower().startswith("player") and "count" in line.lower():
@@ -3547,6 +3709,8 @@ def build_server_command(cfg: AppConfig) -> List[str]:
 
     if cfg.automanaged_mods:
         flags.append("-automanagedmods")
+    if cfg.exclusive_join:
+        flags.append("-exclusivejoin")
 
     mods = cfg.normalized_mods()
     required = next((mod for m, mod in MAP_REQUIRED_MODS.items() if m.lower() == map_name.lower()), None)
@@ -5978,6 +6142,7 @@ class ServerRuntime:
         # run state it found). Only then are the install's INIs its to restore on stop.
         self.launched_by_us = False
         self.players: Optional[int] = None  # last ListPlayers count while running, None if unknown
+        self.online_players: List[Tuple[str, str]] = []  # (name, id) from the last ListPlayers
         # CPU (percent of the whole machine) and memory of the running process, sampled.
         self.cpu_percent: Optional[float] = None
         self.memory_bytes: Optional[int] = None
@@ -8298,6 +8463,7 @@ class ServerManagerApp:
         self._autosave_after_id: Optional[str] = None
         self._autosave_guard = False
         self._in_background = False  # window hidden, servers still managed
+        self.known_players = KnownPlayersStore(app_base)
         self._scroll_canvases: List[tk.Canvas] = []
         self._wheel_rest: Dict[str, int] = {}  # wheel movement not scrolled yet, per page
         self._scroll_pages: Dict[str, tk.Canvas] = {}
@@ -9302,6 +9468,7 @@ class ServerManagerApp:
 
         self.var_custom_start_args = tk.StringVar(master=m)
         self.var_public_ip_for_epic = tk.StringVar(master=m)
+        self.var_exclusive_join = tk.BooleanVar(master=m)
         self.var_public_ip_note = tk.StringVar(master=m, value="")
         self.var_public_ip_for_epic.trace_add(
             "write", lambda *_: self.var_public_ip_note.set(public_ip_note(self.var_public_ip_for_epic.get()))
@@ -9353,6 +9520,7 @@ class ServerManagerApp:
         ttk.Label(header, textvariable=self.var_status, anchor="e").grid(row=0, column=1, sticky="e", padx=(6, 0))
 
         self.tab_dash = ttk.Frame(self.nb, padding=10)
+        self.tab_players = ttk.Frame(self.nb, padding=10)
         # Taller than many screens: these two pages scroll.
         self.page_server = ttk.Frame(self.nb)
         self.tab_server = self._make_scroll_page(self.page_server)
@@ -9363,6 +9531,7 @@ class ServerManagerApp:
         self.tab_ini = ttk.Frame(self.nb, padding=10)
 
         self.nb.add(self.tab_dash, text="Dashboard")
+        self.nb.add(self.tab_players, text="Players")
         self.nb.add(self.page_server, text="Server")
         self.nb.add(self.page_adv, text="Advanced Start Args")
         self.nb.add(self.tab_rcon, text="RCON")
@@ -9370,6 +9539,7 @@ class ServerManagerApp:
         self.nb.add(self.tab_ini, text="INI Editor")
 
         self._build_dashboard_tab()
+        self._build_players_tab()
 
         # ---------------- Server tab ----------------
         self.tab_server.columnconfigure(0, weight=1)
@@ -9763,6 +9933,8 @@ class ServerManagerApp:
             variable=self.var_enable_battleye
         ), "battleye").grid(row=1, column=0, sticky="w", pady=(6, 0))
         lf_platform.columnconfigure(0, weight=1)
+        tip(ttk.Checkbutton(lf_platform, text="Whitelist only (-exclusivejoin)", variable=self.var_exclusive_join),
+            "exclusive_join").grid(row=6, column=0, sticky="w", pady=(10, 0))
         tip(ttk.Label(lf_platform, text="Address shown in the server browser (optional)"), "public_ip") \
             .grid(row=2, column=0, sticky="w", pady=(10, 0))
         ip_row = ttk.Frame(lf_platform)
@@ -10311,6 +10483,7 @@ class ServerManagerApp:
 
         self.var_custom_start_args.set(cfg.custom_start_args)
         self.var_public_ip_for_epic.set(cfg.public_ip_for_epic)
+        self.var_exclusive_join.set(bool(cfg.exclusive_join))
 
         self._rcon_refresh_saved(cfg)
 
@@ -10327,6 +10500,7 @@ class ServerManagerApp:
         cfg.max_players = safe_int(self.var_max_players.get(), DEFAULT_MAX_PLAYERS) or DEFAULT_MAX_PLAYERS
 
         cfg.server_platform = "PC+XSX+WINGDK" if bool(self.var_server_platform_crossplay.get()) else ""
+        cfg.exclusive_join = bool(self.var_exclusive_join.get())
         try:
             cfg.public_ip_for_epic = normalize_public_ip(self.var_public_ip_for_epic.get())
         except ValueError:
@@ -10472,7 +10646,7 @@ class ServerManagerApp:
             self.var_steamcmd_dir, self.var_auto_start_on_launch, self.var_server_dir,
             self.var_map_preset, self.var_map_custom, self.var_server_name,
             self.var_port, self.var_query_port, self.var_max_players,
-            self.var_server_platform_crossplay, self.var_public_ip_for_epic,
+            self.var_server_platform_crossplay, self.var_public_ip_for_epic, self.var_exclusive_join,
             self.var_join_password, self.var_admin_password,
             self.var_enable_battleye, self.var_automanaged_mods, self.var_validate_on_update,
             self.var_enable_rcon, self.var_rcon_host, self.var_rcon_port,
@@ -12662,6 +12836,331 @@ class ServerManagerApp:
                 return
             w = getattr(w, "master", None)
 
+    # ---------------------------------------------------------------------
+    # Players: who is on, who was seen, kick, ban, whitelist
+    # ---------------------------------------------------------------------
+    PLAYERS_REFRESH_MS = 30000
+
+    def _players_visible(self) -> bool:
+        try:
+            return str(self.nb.select()) == str(self.tab_players) and not self._in_background
+        except Exception:
+            return False
+
+    def _build_players_tab(self) -> None:
+        theme = THEME_COLORS
+        tab = self.tab_players
+        tab.columnconfigure(0, weight=1)
+        tab.rowconfigure(1, weight=1)
+        tab.rowconfigure(2, weight=1)
+
+        top = ttk.Frame(tab)
+        top.grid(row=0, column=0, sticky="ew")
+        top.columnconfigure(3, weight=1)
+        ttk.Button(top, text="Refresh", command=self._players_refresh).grid(row=0, column=0)
+        ttk.Label(top, text="Find:").grid(row=0, column=1, padx=(12, 4))
+        self.var_players_find = tk.StringVar(master=self.root, value="")
+        ttk.Entry(top, textvariable=self.var_players_find, width=28).grid(row=0, column=2, sticky="w")
+        self.var_players_find.trace_add("write", lambda *_: self._players_render())
+        self.var_players_status = tk.StringVar(master=self.root, value="")
+        ttk.Label(top, textvariable=self.var_players_status, foreground=theme["muted"]).grid(row=0, column=3, sticky="e")
+
+        def table(parent: Any, cols: Tuple[Tuple[str, str, int], ...], height: int) -> ttk.Treeview:
+            frame = ttk.Frame(parent)
+            frame.grid(row=0, column=0, sticky="nsew")
+            frame.columnconfigure(0, weight=1)
+            frame.rowconfigure(0, weight=1)
+            tree = ttk.Treeview(frame, columns=[c for c, _t, _w in cols], show="headings", height=height, selectmode="extended")
+            for col, text, width in cols:
+                tree.heading(col, text=text)
+                tree.column(col, width=width, stretch=col in ("player", "eos"))
+            tree.grid(row=0, column=0, sticky="nsew")
+            sb = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
+            sb.grid(row=0, column=1, sticky="ns")
+            tree.configure(yscrollcommand=sb.set)
+            return tree
+
+        online = ttk.LabelFrame(tab, text="Online now", padding=8)
+        online.grid(row=1, column=0, sticky="nsew", pady=(8, 0))
+        online.columnconfigure(0, weight=1)
+        online.rowconfigure(0, weight=1)
+        self.players_online_tree = table(online, (
+            ("player", "Player", 220), ("eos", "Player ID (EOS)", 300), ("server", "Server", 220), ("wl", "Whitelisted", 90),
+        ), 9)
+        ob = ttk.Frame(online)
+        ob.grid(row=1, column=0, sticky="w", pady=(6, 0))
+        for i, (text, cmd) in enumerate((
+            ("Kick...", lambda: self._players_action("kick", "online")),
+            ("Ban...", lambda: self._players_action("ban", "online")),
+            ("Add to Whitelist...", lambda: self._players_action("wl_add", "online")),
+            ("Remove from Whitelist...", lambda: self._players_action("wl_remove", "online")),
+            ("Copy ID", lambda: self._players_copy_id("online")),
+        )):
+            ttk.Button(ob, text=text, command=cmd).grid(row=0, column=i, padx=(0, 6))
+
+        known = ttk.LabelFrame(tab, text="Known players (seen on this PC's servers)", padding=8)
+        known.grid(row=2, column=0, sticky="nsew", pady=(8, 0))
+        known.columnconfigure(0, weight=1)
+        known.rowconfigure(0, weight=1)
+        self.players_known_tree = table(known, (
+            ("player", "Player", 220), ("eos", "Player ID (EOS)", 300), ("seen", "Last seen", 150),
+            ("server", "Last server", 200), ("banned", "Banned (by the manager)", 200),
+        ), 9)
+        kb = ttk.Frame(known)
+        kb.grid(row=1, column=0, sticky="w", pady=(6, 0))
+        for i, (text, cmd) in enumerate((
+            ("Ban...", lambda: self._players_action("ban", "known")),
+            ("Unban...", lambda: self._players_action("unban", "known")),
+            ("Add to Whitelist...", lambda: self._players_action("wl_add", "known")),
+            ("Remove from Whitelist...", lambda: self._players_action("wl_remove", "known")),
+            ("Copy ID", lambda: self._players_copy_id("known")),
+            ("Add by ID...", self._players_add_by_id),
+            ("Forget", self._players_forget),
+        )):
+            ttk.Button(kb, text=text, command=cmd).grid(row=0, column=i, padx=(0, 6))
+        ttk.Label(
+            tab,
+            text="Kick and ban go over RCON (a ban for a map that is not running is sent when it next runs). "
+                 "The whitelist only has effect on servers with Whitelist only on (Advanced Start Args), "
+                 "and the server reads it when it starts: restart after changing it.",
+            foreground=theme["muted"], wraplength=1100, justify="left",
+        ).grid(row=3, column=0, sticky="w", pady=(6, 0))
+
+        self.nb.bind("<<NotebookTabChanged>>", lambda _e: self._players_refresh() if self._players_visible() else None, add="+")
+        self.root.after(self.PLAYERS_REFRESH_MS, self._players_tick)
+
+    def _players_tick(self) -> None:
+        try:
+            if self._players_visible():
+                self._players_refresh()
+        finally:
+            with contextlib.suppress(Exception):
+                self.root.after(self.PLAYERS_REFRESH_MS, self._players_tick)
+
+    def _players_refresh(self) -> None:
+        """Ask the running servers now (off the Tk thread), then redraw."""
+        if getattr(self, "_players_refreshing", False):
+            return
+        self._players_refreshing = True
+        self.var_players_status.set("Asking the running servers...")
+
+        def work() -> None:
+            try:
+                self._poll_players_once()
+            finally:
+                self._players_refreshing = False
+                self._ui(lambda: (self._players_render(),
+                                  self.var_players_status.set(f"Updated {datetime.now():%H:%M:%S}")))
+
+        threading.Thread(target=work, daemon=True, name="players-refresh").start()
+
+    def _whitelisted(self, server_id: str, pid: str) -> bool:
+        try:
+            ids = {x.lower() for x in read_whitelist(Path(self._runtime(server_id).cfg.server_dir))}
+        except Exception:
+            return False
+        return pid.lower() in ids
+
+    def _players_render(self) -> None:
+        wanted = self.var_players_find.get().strip().lower()
+
+        def match(*fields: str) -> bool:
+            return not wanted or any(wanted in (f or "").lower() for f in fields)
+
+        tree = self.players_online_tree
+        keep = set(tree.selection())
+        tree.delete(*tree.get_children())
+        count = 0
+        for rt in self._running_runtimes():
+            server = self._display_name(rt.server_id)
+            wl = {x.lower() for x in read_whitelist(Path(rt.cfg.server_dir))}
+            for name, pid in rt.online_players:
+                count += 1
+                if not match(name, pid, server):
+                    continue
+                iid = f"{rt.server_id}|{pid or name}"
+                tree.insert("", "end", iid=iid, values=(name, pid or "(no ID)", server, "Yes" if pid and pid.lower() in wl else "No"))
+        still = [i for i in keep if tree.exists(i)]
+        if still:
+            tree.selection_set(still)
+
+        tree = self.players_known_tree
+        keep = set(tree.selection())
+        tree.delete(*tree.get_children())
+        names = {r.id: r.display_name or r.id for r in self.global_cfg.servers}
+        rows = sorted(self.known_players.players().items(), key=lambda kv: kv[1].get("last_seen", ""), reverse=True)
+        for pid, info in rows:
+            name = info.get("name", "")
+            last = names.get(info.get("server_id", ""), "")
+            if not match(name, pid, last):
+                continue
+            banned = ", ".join(names.get(s, s) for s in info.get("bans") or [])
+            tree.insert("", "end", iid=pid, values=(name, pid, (info.get("last_seen") or "").replace("T", " "), last, banned))
+        still = [i for i in keep if tree.exists(i)]
+        if still:
+            tree.selection_set(still)
+        self.var_players_status.set(f"{count} online, {len(rows)} known")
+
+    def _players_selected(self, which: str) -> List[Tuple[str, str, Optional[str]]]:
+        """[(id, name, server id or None)] for the selected rows."""
+        out: List[Tuple[str, str, Optional[str]]] = []
+        if which == "online":
+            tree = self.players_online_tree
+            for iid in tree.selection():
+                sid, _sep, _rest = iid.partition("|")
+                name, pid = tree.item(iid, "values")[0], tree.item(iid, "values")[1]
+                if PLAYER_ID_RE.match(str(pid)):
+                    out.append((str(pid), str(name), sid))
+        else:
+            tree = self.players_known_tree
+            known = self.known_players.players()
+            for pid in tree.selection():
+                out.append((pid, known.get(pid, {}).get("name", ""), known.get(pid, {}).get("server_id")))
+        return out
+
+    def _players_copy_id(self, which: str) -> None:
+        ids = [pid for pid, _n, _s in self._players_selected(which)]
+        if ids:
+            self.root.clipboard_clear()
+            self.root.clipboard_append("\n".join(ids))
+            self._set_status(f"Copied {len(ids)} player ID(s).")
+
+    def _players_scope(self, title: str, server_id: Optional[str], what: str) -> Optional[List[str]]:
+        """The servers an action goes to: the player's map and, if asked, the rest of its
+        cluster; without a map (a known player never seen), every server profile."""
+        all_ids = [r.id for r in self.global_cfg.servers]
+        if server_id is None or server_id not in all_ids:
+            if not messagebox.askyesno(title, f"{what} on every server ({len(all_ids)})?"):
+                return None
+            return all_ids
+        view = self._cluster_of(server_id)
+        if view is None or len(view.members) < 2:
+            return [server_id]
+        choice = messagebox.askyesnocancel(
+            title,
+            f"{what} on every map of {view.name} ({len(view.members)} maps)?\n\n"
+            f"Yes: every map of the cluster.\nNo: only {self._display_name(server_id)}.",
+        )
+        if choice is None:
+            return None
+        return list(view.members) if choice else [server_id]
+
+    def _players_action(self, action: str, which: str) -> None:
+        picked = self._players_selected(which)
+        if not picked:
+            messagebox.showinfo("Players", "Select one or more players with an ID first.")
+            return
+        titles = {"kick": "Kick", "ban": "Ban", "unban": "Unban", "wl_add": "Whitelist", "wl_remove": "Whitelist"}
+        title = titles[action]
+        names = ", ".join(n or pid for pid, n, _s in picked)
+        if action == "kick":
+            targets = [(pid, n, s) for pid, n, s in picked if s]
+            if not targets or not messagebox.askyesno("Kick", f"Kick {names}? They can join again right away."):
+                return
+            self._players_send([(s, f"KickPlayer {pid}", n or pid) for pid, n, s in targets], "Kick")
+            return
+        what = {"ban": f"Ban {names}", "unban": f"Unban {names}",
+                "wl_add": f"Add {names} to the whitelist", "wl_remove": f"Remove {names} from the whitelist"}[action]
+        scopes: Dict[str, List[str]] = {}
+        for pid, _n, sid in picked:
+            key = sid or ""
+            if key not in scopes:
+                scope = self._players_scope(title, sid, what)
+                if scope is None:
+                    return
+                scopes[key] = scope
+        if action in ("ban", "unban"):
+            sends: List[Tuple[str, str, str]] = []
+            queued: List[str] = []
+            for pid, n, sid in picked:
+                servers = scopes[sid or ""]
+                self.known_players.remember(pid, n)
+                self.known_players.set_banned(pid, servers, action == "ban")
+                command = "BanPlayer" if action == "ban" else "UnbanPlayer"
+                for target in servers:
+                    rt = self._runtime(target)
+                    if rt.is_running() and rt.live_cfg().enable_rcon:
+                        sends.append((target, f"{command} {pid}", n or pid))
+                    else:
+                        self.known_players.queue(target, action, pid)
+                        queued.append(self._display_name(target))
+            self._players_send(sends, title, queued=sorted(set(queued)))
+            return
+        # whitelist: the files of the chosen servers' installs (a shared install, one file)
+        done: Dict[str, Tuple[int, int]] = {}
+        off: List[str] = []
+        errors: List[str] = []
+        for pid, _n, sid in picked:
+            for target in scopes[sid or ""]:
+                cfg = self._runtime(target).cfg
+                try:
+                    a, r = write_whitelist(Path(cfg.server_dir), add=[pid] if action == "wl_add" else [],
+                                           remove=[pid] if action == "wl_remove" else [])
+                except Exception as e:
+                    errors.append(f"- {self._display_name(target)}: {e}")
+                    continue
+                prev = done.get(target, (0, 0))
+                done[target] = (prev[0] + a, prev[1] + r)
+                if not cfg.exclusive_join:
+                    off.append(self._display_name(target))
+        msg = f"Whitelist updated on {len(done)} server(s). It applies when each server next starts."
+        if off:
+            msg += "\n\nWhitelist only is off for: " + ", ".join(sorted(set(off))) + \
+                   ". The list has no effect there until it is turned on (Advanced Start Args)."
+        if errors:
+            msg += "\n\nNot changed:\n" + "\n".join(errors)
+        (messagebox.showwarning if errors else messagebox.showinfo)("Whitelist", msg)
+        self._players_render()
+
+    def _players_send(self, sends: List[Tuple[str, str, str]], title: str, queued: Optional[List[str]] = None) -> None:
+        """Send RCON commands (server id, command, who) off the Tk thread; report once done."""
+        def work() -> None:
+            ok: List[str] = []
+            failed: List[str] = []
+            for sid, command, who in sends:
+                rt = self._runtime(sid)
+                try:
+                    reply = self._rcon_try(command, timeout=8.0, rt=rt)
+                    rt.logger.info(f"Players: {command} -> {(reply or '').strip()}")
+                    ok.append(f"{who} on {self._display_name(sid)}")
+                except Exception as e:
+                    failed.append(f"- {who} on {self._display_name(sid)}: {e}")
+            parts = []
+            if ok:
+                parts.append(f"{title}: done for " + "; ".join(ok) + ".")
+            if queued:
+                parts.append("Not running, so sent when they next run: " + ", ".join(queued) + ".")
+            if failed:
+                parts.append("Failed:\n" + "\n".join(failed))
+            text = "\n\n".join(parts) or "Nothing to do."
+            self._ui(lambda: ((messagebox.showwarning if failed else messagebox.showinfo)(title, text),
+                              self._players_refresh()))
+
+        threading.Thread(target=work, daemon=True, name="players-action").start()
+
+    def _players_add_by_id(self) -> None:
+        pid = (simpledialog.askstring("Add Player", "Player ID (EOS ID, 32 characters):", parent=self.root) or "").strip()
+        if not pid:
+            return
+        if not PLAYER_ID_RE.match(pid):
+            messagebox.showwarning("Add Player", "That is not a player ID: an ASA player ID is 32 letters and digits (0-9, a-f).")
+            return
+        name = (simpledialog.askstring("Add Player", "Name (optional, for your list):", parent=self.root) or "").strip()
+        self.known_players.remember(pid, name)
+        self._players_render()
+        with contextlib.suppress(Exception):
+            self.players_known_tree.selection_set(pid)
+            self.players_known_tree.see(pid)
+
+    def _players_forget(self) -> None:
+        picked = self._players_selected("known")
+        if picked and messagebox.askyesno(
+            "Forget", f"Remove {len(picked)} player(s) from the known list? Bans and whitelists stay as they are."
+        ):
+            for pid, _n, _s in picked:
+                self.known_players.forget(pid)
+            self._players_render()
+
     def _build_dashboard_tab(self) -> None:
         theme = THEME_COLORS
         tab = self.tab_dash
@@ -12971,21 +13470,44 @@ class ServerManagerApp:
 
         threading.Thread(target=loop, daemon=True, name="stats").start()
 
+    PLAYER_ACTION_MIN_UPTIME_SEC = 120.0  # a map just started may not take RCON commands yet
+
+    def _poll_players_once(self) -> None:
+        """Ask every running server who is on (ListPlayers), remember them, and send bans or
+        unbans that were waiting for that map to run."""
+        for rt in self._running_runtimes():
+            if rt.removed or not rt.live_cfg().enable_rcon:
+                rt.players = None
+                rt.online_players = []
+                continue
+            try:
+                online = parse_list_players(self._rcon_try("ListPlayers", timeout=6.0, rt=rt))
+                rt.online_players = online
+                rt.players = len(online)
+                self.known_players.seen(rt.server_id, online)
+            except Exception:
+                rt.players = None
+                rt.online_players = []
+                continue
+            started = rt.started_at
+            if started is not None and (datetime.now() - started).total_seconds() < self.PLAYER_ACTION_MIN_UPTIME_SEC:
+                continue
+            for action, pid in self.known_players.pending(rt.server_id):
+                command = "BanPlayer" if action == "ban" else "UnbanPlayer"
+                try:
+                    reply = self._rcon_try(f"{command} {pid}", timeout=8.0, rt=rt)
+                    rt.logger.info(f"Players: {command} {pid} (waiting until this map ran): {(reply or '').strip()}")
+                    self.known_players.done(rt.server_id, action, pid)
+                except Exception as e:
+                    rt.logger.info(f"Players: {command} {pid} failed ({e}); tried again later.")
+
     def _start_player_poll(self) -> None:
         def loop() -> None:
             # Its own event: closing pauses the scheduler, and must not end this for good.
             while not self._player_poll_stop.wait(self.PLAYER_POLL_SEC):
-                for rt in self._running_runtimes():
-                    if rt.removed or not rt.live_cfg().enable_rcon:
-                        rt.players = None
-                        continue
-                    try:
-                        provider = PlayerListProvider(
-                            lambda cmd, timeout, _rt=rt: self._rcon_try(cmd, timeout=timeout, rt=_rt), rt.logger
-                        )
-                        rt.players = len(provider.get_players())
-                    except Exception:
-                        rt.players = None
+                with contextlib.suppress(Exception):
+                    self._poll_players_once()
+                self._ui(lambda: self._players_render() if self._players_visible() else None)
 
         threading.Thread(target=loop, daemon=True, name="player-poll").start()
 

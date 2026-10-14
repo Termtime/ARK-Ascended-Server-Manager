@@ -86,6 +86,13 @@ This manager separates *edit time* and *runtime*:
 - Other settings (backups, auto-saves, updates, Discord, advanced start options) are copied from a template profile you pick; game rates stay per map in each map's INI Editor
 - Cluster names and start delays are stored in the global config; which profiles belong to a cluster still comes from each profile's own cluster settings, so existing clusters show up without any migration
 
+### Players
+- **Players** tab: everyone online on every running server (name, player ID, server, whether whitelisted), refreshed while the tab is open, and a list of every player seen on this PC's servers (last seen, where, bans made from the manager), with Find
+- **Kick** (RCON `KickPlayer`), **Ban** and **Unban** (`BanPlayer` / `UnbanPlayer` with the player's EOS ID) on the player's map or every map of its cluster; a map that is not running gets the ban or unban when it next runs
+- **Whitelist**: add or remove players in each server's `ShooterGame\Binaries\Win64\PlayersExclusiveJoinList.txt` (one map or the whole cluster). It only has effect with **Whitelist only** on (Advanced Start Args, `-exclusivejoin`), and the server reads it when it starts, so restart after changing it
+- **Add by ID** lists a player never seen yet, to ban or whitelist ahead of time; **Copy ID** copies the selected players' IDs
+- Player IDs are read from ASA's `ListPlayers` (32-character EOS IDs), which also fixes player IDs in Discord join and leave messages
+
 ### Planned restarts, warnings, moving clusters, resource use
 - **Wild dino wipe** (Server tab, Update Options): clears every wild creature over RCON (`DestroyWildDinos`) after a set number of hours the server has been running (24 by default), counted across restarts and manager restarts; fresh ones spawn and tamed creatures are never touched. Players get in-game warnings first (default 10, 5 and 1 minutes), timed so the wipe happens when due. **Wipe Now...** runs the same warned wipe by hand. Stopping the server calls the countdown off (the wipe follows after the next start), a daily restart or nightly update coming due takes precedence over it, and **Cancel Countdown** on the Dashboard skips that wipe until the next interval. Needs RCON
 - **Daily restart** (Server tab, Update Options): restarts a running server every day at a set time (safe: save, stop, start); it never starts a stopped one, and is skipped when the nightly update restarts the server at that same time
